@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickLaunch</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- 自定义标题栏（整条可拖拽） -->
+  <header class="titlebar" id="titlebar">
+    <div class="brand">
+      <span class="logo">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/>
+        </svg>
+      </span>
+      <span class="brand-name">QuickLaunch</span>
+      <span class="badge" id="badge">AHK + WebView2</span>
+    </div>
+    <div class="winbtns">
+      <button class="wbtn" id="btnHide" title="隐藏 (Esc)" aria-label="隐藏">
+        <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2.5 6h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+      <button class="wbtn wbtn-close" id="btnExit" title="关闭窗口（隐藏到托盘，程序继续运行）" aria-label="关闭窗口">
+        <svg width="12" height="12" viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- 搜索 -->
+  <div class="searchwrap">
+    <div class="searchbox">
+      <svg class="sicon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+        <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+      </svg>
+      <input id="q" type="text" placeholder="搜索应用、命令或关键词…" autocomplete="off" spellcheck="false">
+      <kbd class="esc" id="kbHint">Esc</kbd>
+    </div>
+  </div>
+
+  <!-- 内容 -->
+  <main class="body">
+    <section class="section" id="pinnedSection">
+      <div class="stitle"><span>常用</span><span class="muted" id="pinnedHint"></span></div>
+      <div class="cards" id="pinned"></div>
+    </section>
+
+    <section class="section grow">
+      <div class="stitle"><span id="listTitle">全部应用</span><span class="muted" id="listCount"></span></div>
+      <div class="list" id="list"></div>
+      <div class="empty" id="empty" hidden>
+        <div class="empty-ic">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+            <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+          </svg>
+        </div>
+        <p id="emptyText">没有匹配的结果</p>
+        <span>换个关键词试试，或在 config.json 中添加条目</span>
+      </div>
+    </section>
+  </main>
+
+  <!-- 底部状态栏 -->
+  <footer class="footer">
+    <span class="hint"><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
+    <span class="hint"><kbd>Enter</kbd> 启动</span>
+    <span class="hint"><kbd>Esc</kbd> 隐藏</span>
+    <span class="spacer"></span>
+    <button class="linkbtn" id="btnReload" title="重新读取 config.json">重载配置</button>
+    <button class="linkbtn" id="btnOpenCfg" title="用默认编辑器打开 config.json">编辑配置</button>
+  </footer>
+
+  <div class="toast" id="toast"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

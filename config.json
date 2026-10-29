@@ -1,0 +1,187 @@
+{
+  "name": "QuickLaunch",
+  "version": 1,
+  "items": [
+    {
+      "id": "notepad",
+      "name": "记事本",
+      "subtitle": "快速记录文本",
+      "keywords": [
+        "notepad",
+        "txt",
+        "文本",
+        "记事"
+      ],
+      "icon": "C:\\Windows\\System32\\notepad.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\notepad.exe",
+      "pinned": true,
+      "accent": "#4f8cff"
+    },
+    {
+      "id": "cmd",
+      "name": "命令提示符",
+      "subtitle": "cmd.exe",
+      "keywords": [
+        "cmd",
+        "terminal",
+        "终端",
+        "命令行"
+      ],
+      "icon": "C:\\Windows\\System32\\cmd.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\cmd.exe",
+      "pinned": true,
+      "accent": "#22c55e"
+    },
+    {
+      "id": "powershell",
+      "name": "PowerShell",
+      "subtitle": "Windows PowerShell 5.1",
+      "keywords": [
+        "ps",
+        "shell",
+        "脚本"
+      ],
+      "icon": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "pinned": true,
+      "accent": "#3b82f6"
+    },
+    {
+      "id": "mspaint",
+      "name": "画图",
+      "subtitle": "mspaint.exe",
+      "keywords": [
+        "paint",
+        "draw",
+        "绘图"
+      ],
+      "icon": "C:\\Windows\\System32\\mspaint.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\mspaint.exe",
+      "pinned": true,
+      "accent": "#f59e0b"
+    },
+    {
+      "id": "explorer",
+      "name": "文件资源管理器",
+      "subtitle": "打开此电脑",
+      "keywords": [
+        "explorer",
+        "files",
+        "文件",
+        "目录"
+      ],
+      "icon": "C:\\Windows\\explorer.exe",
+      "type": "app",
+      "target": "C:\\Windows\\explorer.exe",
+      "pinned": true,
+      "accent": "#eab308"
+    },
+    {
+      "id": "taskmgr",
+      "name": "任务管理器",
+      "subtitle": "查看进程与性能",
+      "keywords": [
+        "task",
+        "process",
+        "进程"
+      ],
+      "icon": "C:\\Windows\\System32\\Taskmgr.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\Taskmgr.exe",
+      "accent": "#8b5cf6"
+    },
+    {
+      "id": "edge",
+      "name": "Edge 浏览器",
+      "subtitle": "Microsoft Edge",
+      "keywords": [
+        "browser",
+        "web",
+        "浏览器",
+        "上网"
+      ],
+      "icon": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "type": "app",
+      "target": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "accent": "#06b6d4"
+    },
+    {
+      "id": "calc",
+      "name": "计算器",
+      "subtitle": "UWP 应用（shell 协议）",
+      "keywords": [
+        "calc",
+        "calculator",
+        "算"
+      ],
+      "icon": "",
+      "type": "url",
+      "target": "ms-calculator:",
+      "accent": "#22d3ee"
+    },
+    {
+      "id": "control",
+      "name": "控制面板",
+      "subtitle": "control.exe",
+      "keywords": [
+        "panel",
+        "设置",
+        "系统设置"
+      ],
+      "icon": "C:\\Windows\\System32\\control.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\control.exe",
+      "accent": "#64748b"
+    },
+    {
+      "id": "tool-dir",
+      "name": "本工具目录",
+      "subtitle": "在资源管理器中打开",
+      "keywords": [
+        "workdir",
+        "folder",
+        "目录"
+      ],
+      "icon": "C:\\Windows\\explorer.exe",
+      "type": "folder",
+      "target": ".",
+      "accent": "#f97316"
+    },
+    {
+      "id": "edit-config",
+      "name": "编辑配置 config.json",
+      "subtitle": "带自定义参数启动记事本",
+      "keywords": [
+        "config",
+        "设置",
+        "json",
+        "配置"
+      ],
+      "icon": "C:\\Windows\\System32\\notepad.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\notepad.exe",
+      "args": "config.json",
+      "workdir": ".",
+      "accent": "#94a3b8"
+    },
+    {
+      "id": "ip-config",
+      "name": "查看本机 IP",
+      "subtitle": "在 cmd 中执行 ipconfig /all",
+      "keywords": [
+        "cmd",
+        "ip",
+        "网络",
+        "命令"
+      ],
+      "icon": "⚙",
+      "type": "cmd",
+      "target": "ipconfig /all",
+      "accent": "#10b981"
+    }
+  ]
+}

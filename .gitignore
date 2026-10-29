@@ -1,0 +1,19 @@
+# ── WebView2 运行时数据（缓存 / Cookie / 用户数据，首次运行自动生成，70MB+） ──
+.webview2/
+
+# ── 调试与测试临时产物 ──
+_*.log
+_*.err
+_*.bmp
+_*.tmp
+
+# ── AutoHotkey 官方帮助文档（2MB，非运行必需，需要时从官网取） ──
+runtime/AutoHotkey.chm
+
+# ── 系统与编辑器噪音 ──
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
