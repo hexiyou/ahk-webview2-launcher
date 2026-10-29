@@ -37,15 +37,37 @@
 
   /* ---------------------------------------------------------- 工具函数 */
 
-  function isProtocol(s) { return /^[a-z][a-z0-9+.-]*:/i.test(s); }
+  /* 协议头：http: / ms-xxx: / shell: ……（排除 C:\ 这类盘符） */
+  function isProtocol(s) { return /^(?![a-z]:[\\/])[a-z][a-z0-9+.-]*:/i.test(s); }
 
+  function isAbsPath(s) {
+    return /^[a-zA-Z]:[\\/]/.test(s) || s.startsWith('\\\\') || s.startsWith('//');
+  }
+
+  /* 纯"路径语义"的字段（workdir / icon / 已判定为路径的 target）：相对路径按脚本目录解析 */
   function absPath(p) {
     if (!p) return '';
-    let s = String(p).replace(/\//g, '\\');
+    const s = String(p).replace(/\//g, '\\');
     if (isProtocol(s)) return s;
-    if (/^[a-zA-Z]:\\/.test(s) || s.startsWith('\\\\')) return s;
+    if (isAbsPath(s)) return s;
     const rel = s.replace(/^[.\\]+/, '');
     return scriptDir ? (rel ? scriptDir + '\\' + rel : scriptDir) : s;
+  }
+
+  /* target 的语义取决于 type：只有"路径型"条目才拼脚本目录。
+     cmd 是一整条命令行（`ipconfig /all`），url 是协议串，都不能当路径改写，
+     否则会被拼成 `C:\...\ipconfig /all` 交给 cmd，报"不是内部或外部命令"。 */
+  function resolveTarget(type, p) {
+    const s = (p == null ? '' : String(p)).trim();
+    if (!s) return '';
+    if (type === 'cmd' || type === 'url') return s;
+    if (isProtocol(s) || isAbsPath(s)) return s;
+    // folder / ahk 的 target 天然是路径，裸名也按脚本目录解析
+    if (type === 'folder' || type === 'ahk') return absPath(s);
+    // app：明确的相对路径（. / .. 开头或带分隔符）才拼脚本目录，
+    // 裸命令名（notepad.exe / explorer）留给 PATH 解析
+    if (/^\.{1,2}(?:[\\/]|$)/.test(s) || /[\\/]/.test(s)) return absPath(s);
+    return s;
   }
 
   function fileUrl(p) {
@@ -114,7 +136,7 @@
       keywords: Array.isArray(it.keywords) ? it.keywords : [],
       icon: it.icon || '',
       type: it.type || 'app',
-      target: absPath(it.target || ''),
+      target: resolveTarget(it.type || 'app', it.target),
       args: it.args || '',
       workdir: absPath(it.workdir || '') || scriptDir,
       pinned: it.pinned === true,

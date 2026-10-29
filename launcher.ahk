@@ -456,7 +456,10 @@ Launch(kind, target, args, workdir) {
         case 'folder':
             Run('explorer.exe "' target '"')
         case 'cmd':
-            Run(A_ComSpec ' /k ' target, workdir)
+            ; target 是"一整条命令行"（如 ipconfig /all），不能当路径改写。
+            ; 外面包一层引号并用 /s：cmd 只剥掉首尾两个引号，命令里自带的引号
+            ; （带空格的 exe 路径、重定向文件名）能原样保留。
+            Run(A_ComSpec ' /s /k "' target '"', workdir)
         case 'ahk':
             Run('"' A_AhkPath '" "' target '"' (args != '' ? ' ' args : ''), workdir)
         default:                                  ; app
@@ -464,7 +467,11 @@ Launch(kind, target, args, workdir) {
                 Run(target)
                 return
             }
-            if !FileExist(target)
+            ; 相对路径：先按原样找，再按脚本目录兜一次
+            if !FileExist(target) && FileExist(SCRIPT_DIR '\' target)
+                target := SCRIPT_DIR '\' target
+            ; 带分隔符却找不到 → 真错；裸命令名（notepad.exe）放行，交给 PATH
+            if !FileExist(target) && InStr(target, '\')
                 throw Error('文件不存在：' target)
             Run('"' target '"' (args != '' ? ' ' args : ''), workdir)
     }
@@ -632,7 +639,7 @@ JsonUnescape(s) {
             out .= Chr(8)
         else if (d = 'f')
             out .= Chr(12)
-        else if (d = 'u') {
+        else if (d = 'u' && RegExMatch(SubStr(s, i + 1, 4), '^[0-9a-fA-F]{4}$')) {
             out .= Chr(Integer('0x' SubStr(s, i + 1, 4)))
             i += 4
         } else

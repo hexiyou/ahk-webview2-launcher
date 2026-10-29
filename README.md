@@ -144,10 +144,23 @@ wv2-launcher/
 `type` 语义：
 
 - `app` —— 启动 exe，`target` 支持 `shell:` / `ms-` 协议（如 `ms-calculator:`）
-- `cmd` —— `cmd /k <target>`，适合 `ipconfig /all` 这类命令
+- `cmd` —— `cmd /s /k "<target>"`，`target` 是**一整条命令行**，如 `ipconfig /all`、`ping 127.0.0.1 -t`
 - `url` —— ShellExecute 打开（网址、自定义协议）
 - `folder` —— 用资源管理器打开目录
 - `ahk` —— 用当前 AHK 运行另一个 .ahk 脚本
+
+### `target` 的解析规则（按 type 区分）
+
+| type | `target` 怎么处理 | 例子 |
+|---|---|---|
+| `cmd` | **原样**交给 cmd，绝不按路径改写 | `ipconfig /all` → `ipconfig /all` |
+| `url` | 原样 | `ms-calculator:`、`https://…` |
+| `folder` / `ahk` | 一律当路径，相对路径按脚本目录解析 | `docs` → `<脚本目录>\docs` |
+| `app` | 绝对路径/协议原样；`.`、`..` 或带分隔符的相对路径按脚本目录解析；**裸命令名**交给 PATH | `.\tool.exe` → `<脚本目录>\tool.exe`；`notepad.exe` → 交给 PATH |
+
+> 早期版本这里有个 bug：所有 `target` 都被无条件当成相对路径拼上了脚本目录，
+> 于是 `cmd` 类型的 `ipconfig /all` 变成 `C:\…\wv2-launcher\ipconfig /all`，
+> cmd 报「`C:\…\ipconfig` 不是内部或外部命令」。见下方踩坑 11。
 
 `icon` 留空时，会自动从 `target` 的 exe 里提取图标（`SHGetFileInfo` → GDI+ → PNG 缓存到 `%TEMP%\quicklaunch-icons`）；
 提取不到就退化成"首字 + 渐变色"头像（截图里的"计算器"就是这种）。
@@ -226,6 +239,18 @@ wv2-launcher/
 
 8. **图标路径用 `file:///` 加载**：`<img src="file:///C:/...png">` 在 `file://` 页面里是允许的
    （图片不受 CORS 限制，但 `fetch` 受限）。
+
+11. **⭐ `target` 不能一刀切当路径解析**：原 `normalizeItem()` 对每个条目都做了 `absPath(it.target)`，
+    本意是支持 `target: "."` / `args: "config.json"` 这类相对写法，结果把 `cmd` 类型的
+    `ipconfig /all` 也拼成了 `C:\…\wv2-launcher\ipconfig /all`，cmd 报
+    「`C:\…\ipconfig` 不是内部或外部命令，也不是可运行的程序」。
+    修法：把"路径解析"从归一化阶段拆出来按 type 判定（`resolveTarget(type, p)`）——
+    `cmd`/`url` 原样、`folder`/`ahk` 一律当路径、`app` 只解析明确的相对路径，
+    裸命令名留给 PATH。AHK 侧同步补了两处：`cmd` 用 `A_ComSpec ' /s /k "' target '"'`
+    （`/s` 让 cmd 只剥掉首尾引号，命令里自带的引号能保住）；`app` 在 `FileExist` 失败时
+    先按脚本目录兜一次，裸命令名不报"文件不存在"、放行给 PATH。
+    顺带收紧了 `isProtocol()`：原正则 `/^[a-z][a-z0-9+.-]*:/i` 会把 `C:` 也匹配成协议
+    （结果凑巧一致，但语义是错的），现已排除盘符形式。
 
 ---
 
