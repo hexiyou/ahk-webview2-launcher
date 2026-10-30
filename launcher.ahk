@@ -25,6 +25,8 @@ global UI_PATH    := SCRIPT_DIR '\ui\index.html'
 global DLL_PATH   := SCRIPT_DIR '\lib\WebView2Loader.dll'
 global DATA_DIR   := SCRIPT_DIR '\.webview2'
 global ICON_DIR   := A_Temp '\quicklaunch-icons'
+global HTTP_DIR   := A_Temp '\quicklaunch-http'
+global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
 
 ; ---------------------------- 运行时状态 ------------------------------------
 global g := ""
@@ -34,6 +36,7 @@ global uiReady := false
 global lastNavOK := -1        ; 最近一次导航结果（-1 = 还没导航过）
 global lastNavErr := -1
 global ncDrag := false        ; WebView2 原生非客户区拖拽是否可用
+global httpJobs := Map()      ; 进行中的 webhook 请求：id -> {dir, pid, deadline}
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
@@ -45,6 +48,9 @@ if !FileExist(UI_PATH) {
     MsgBox('找不到界面文件：`n' UI_PATH, 'QuickLaunch', 'Icon!')
     ExitApp()
 }
+
+; 清掉上次运行留下的 webhook 临时目录（响应正文可能不小，不清理会越积越多）
+try DirDelete(HTTP_DIR, true)
 
 BuildUi(settings)
 RegisterHotkey(settings.hotkey)
@@ -421,6 +427,8 @@ OnWebMessage(sender, args) {
             StopDrag()
         case 'run':
             DoRun(raw)
+        case 'http':
+            DoWebhook(raw)
         case 'reload':
             DoReload()
         case 'open-config':
@@ -462,6 +470,8 @@ Launch(kind, target, args, workdir) {
             Run(A_ComSpec ' /s /k "' target '"', workdir)
         case 'ahk':
             Run('"' A_AhkPath '" "' target '"' (args != '' ? ' ' args : ''), workdir)
+        case 'webhook':
+            throw Error('webhook 类型由前端直接发请求，不应走到 Launch')
         default:                                  ; app
             if RegExMatch(target, '^(shell:|ms-|https?:|mailto:)') {
                 Run(target)
@@ -484,6 +494,124 @@ DoReload() {
         wv.ExecuteScriptAsync('window.__applyConfig&&window.__applyConfig(' cfgText ')')
         Notify('配置已重新加载')
     }
+}
+
+; ============================================================================
+;  Webhook：请求交给子进程跑，主进程只轮询结果
+;  ---------------------------------------------------------------------------
+;  WinHttp 是同步的，直接在脚本线程里调会冻住整个窗口（超时 10 秒就是 10 秒假死）。
+;  所以：主进程写 spec.ini -> 起 webhook.ahk 子进程 -> 定时看 meta.ini 是否出现。
+; ============================================================================
+
+DoWebhook(raw) {
+    global HTTP_DIR, SCRIPT_DIR, httpJobs
+
+    id := JsonStr(raw, 'id')
+    url := JsonStr(raw, 'url')
+    if (url = '') {
+        Notify('webhook 没有配置请求地址')
+        return
+    }
+    if (id = '')
+        id := 'r' A_TickCount
+
+    method := JsonStr(raw, 'method')
+    if (method = '')
+        method := 'GET'
+    timeout := JsonNum(raw, 'timeout', 15)
+    timeout := (timeout > 0) ? Min(timeout, 120) : 15
+
+    dir := HTTP_DIR '\' id
+    try DirCreate(dir)
+    ; 上一次的产物必须先清掉，否则轮询会立刻读到旧结果
+    for f in ['meta.ini', 'body.txt', 'spec.ini', 'h.txt', 'b.txt']
+        try FileDelete(dir '\' f)
+
+    ; 请求头由前端给成 "Name: Value" 的字符串数组 —— 避免在这里解析嵌套 JSON
+    hs := ''
+    for h in JsonStrArray(raw, 'headers')
+        hs .= h '`n'
+    try FileAppend(hs, dir '\h.txt', 'UTF-8-RAW')
+
+    body := JsonStr(raw, 'body')
+    try FileAppend(body, dir '\b.txt', 'UTF-8-RAW')
+
+    spec := dir '\spec.ini'
+    IniWrite(method, spec, 'req', 'Method')
+    IniWrite(url, spec, 'req', 'Url')
+    IniWrite(timeout, spec, 'req', 'Timeout')
+    IniWrite(dir '\h.txt', spec, 'req', 'HeadersFile')
+    IniWrite(dir '\b.txt', spec, 'req', 'BodyFile')
+    IniWrite(dir, spec, 'req', 'OutDir')
+
+    pid := 0
+    try {
+        Run('"' A_AhkPath '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
+            , SCRIPT_DIR, 'Hide', &pid)
+    } catch as e {
+        JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
+            ',"truncated":0,"error":' JsonQuote('无法启动请求进程：' e.Message) ',"body":""}')
+        return
+    }
+
+    httpJobs[id] := {dir: dir, pid: pid, timeout: timeout
+        , deadline: A_TickCount + (timeout + 1) * 1000}
+    SetTimer(CheckHttp, 120)          ; SetTimer 幂等，重复调用只是重置间隔
+}
+
+CheckHttp() {
+    global httpJobs, HTTP_MAX_BODY
+    for id, job in httpJobs.Clone() {
+        metaPath := job.dir '\meta.ini'
+        err := ''
+
+        if FileExist(metaPath) {
+            ; 子进程先写 body 再写 meta，看到 meta 说明整套产物都齐了
+        } else if !ProcessExist(job.pid) {
+            err := '请求进程异常退出（webhook.ahk 可能报错，检查一下语法）'
+        } else if (A_TickCount > job.deadline) {
+            try ProcessClose(job.pid)
+            err := '请求超时（超过 ' job.timeout ' 秒）'
+        } else {
+            continue
+        }
+
+        status := 0, ms := 0, body := ''
+        if FileExist(metaPath) {
+            sTxt := IniRead(metaPath, 'resp', 'Status', '0')
+            mTxt := IniRead(metaPath, 'resp', 'Ms', '0')
+            status := IsNumber(sTxt) ? Integer(sTxt) : 0
+            ms := IsNumber(mTxt) ? Integer(mTxt) : 0
+            mErr := IniRead(metaPath, 'resp', 'Error', '')
+            if (mErr != '' && err = '')
+                err := mErr
+            bodyPath := job.dir '\body.txt'
+            if FileExist(bodyPath)
+                try body := FileRead(bodyPath, 'UTF-8')
+        }
+
+        truncated := 0
+        if (StrLen(body) > HTTP_MAX_BODY) {
+            body := SubStr(body, 1, HTTP_MAX_BODY)
+            truncated := 1
+        }
+
+        try {
+            JsSend('{"type":"http-result","id":' JsonQuote(id)
+                ',"ok":' (err = '' ? 1 : 0)
+                ',"status":' status
+                ',"ms":' ms
+                ',"truncated":' truncated
+                ',"error":' JsonQuote(err)
+                ',"body":' JsonQuote(body) '}')
+        }
+        ; 请求载荷（请求头/请求体/spec）用完就删，响应留在原处方便排查
+        for f in ['h.txt', 'b.txt', 'spec.ini']
+            try FileDelete(job.dir '\' f)
+        httpJobs.Delete(id)
+    }
+    if !httpJobs.Count
+        SetTimer(CheckHttp, 0)
 }
 
 OpenConfig() {
@@ -586,7 +714,7 @@ Notify(text) {
 }
 
 ; ============================================================================
-;  极简 JSON 工具（只处理扁平字符串字段，够本工具用）
+;  极简 JSON 工具（只处理扁平字段，够本工具用）
 ; ============================================================================
 
 JsonQuote(s) {
@@ -595,6 +723,14 @@ JsonQuote(s) {
     s := StrReplace(s, "`n", '\n')
     s := StrReplace(s, "`r", '\r')
     s := StrReplace(s, "`t", '\t')
+    ; 剩下的控制字符（0x00-0x1F）必须转成 \u00XX：
+    ; 否则 PostWebMessageAsJson 会因为"不是合法 JSON"整个消息被丢掉（响应体里带 BEL/ESC 就会中招）
+    if RegExMatch(s, '[\x00-\x1f]') {
+        out := ''
+        Loop Parse, s
+            out .= (Ord(A_LoopField) < 0x20) ? Format('\u{:04x}', Ord(A_LoopField)) : A_LoopField
+        s := out
+    }
     return '"' s '"'
 }
 
@@ -602,6 +738,16 @@ JsonStr(text, key) {
     if RegExMatch(text, '"' key '"\s*:\s*"((?:\\u[0-9a-fA-F]{4}|\\.|[^"\\])*)"', &m)
         return JsonUnescape(m[1])
     return ''
+}
+
+; 数字/布尔字段：前端 postMessage 过来的是真正的 JSON 数字（不是字符串），
+; 用 JsonStr 取不到，必须单独匹配一次
+JsonNum(text, key, def := 0) {
+    if RegExMatch(text, '"' key '"\s*:\s*(-?\d+(?:\.\d+)?)', &m)
+        return Number(m[1])
+    if RegExMatch(text, '"' key '"\s*:\s*"(-?\d+(?:\.\d+)?)"', &m)   ; 兼容写成字符串的情况
+        return Number(m[1])
+    return def
 }
 
 JsonStrArray(text, key) {

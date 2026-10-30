@@ -36,9 +36,16 @@
       <svg class="sicon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
         <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
       </svg>
-      <input id="q" type="text" placeholder="搜索应用、命令或关键词…" autocomplete="off" spellcheck="false">
+      <span class="scope" id="scopeTag" hidden>
+        <span id="scopeText">命令</span>
+        <button id="scopeClear" title="退出这个作用域（保留关键词）" aria-label="退出作用域">
+          <svg width="9" height="9" viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+      </span>
+      <input id="q" type="text" placeholder="搜索应用、命令或关键词…（> 命令 · @ 分组）" autocomplete="off" spellcheck="false">
       <kbd class="esc" id="kbHint">Esc</kbd>
     </div>
+    <div class="chips" id="chips"></div>
   </div>
 
   <!-- 内容 -->
@@ -49,7 +56,7 @@
     </section>
 
     <section class="section grow">
-      <div class="stitle"><span id="listTitle">全部应用</span><span class="muted" id="listCount"></span></div>
+      <div class="stitle"><span id="listTitle">全部条目</span><span class="muted" id="listCount"></span></div>
       <div class="list" id="list"></div>
       <div class="empty" id="empty" hidden>
         <div class="empty-ic">
@@ -61,13 +68,29 @@
         <span>换个关键词试试，或在 config.json 中添加条目</span>
       </div>
     </section>
+
+    <!-- Webhook 响应面板（覆盖在内容区上） -->
+    <section class="result" id="result" hidden>
+      <header class="rhead">
+        <span class="rmethod" id="rMethod">GET</span>
+        <span class="rurl" id="rUrl"></span>
+        <span class="rstat" id="rStatus"></span>
+        <span class="rgap"></span>
+        <button class="rbtn" id="rToggle" hidden>完整响应</button>
+        <button class="rbtn" id="rCopy">复制</button>
+        <button class="rbtn rbtn-close" id="rClose" title="关闭 (Esc)">✕</button>
+      </header>
+      <div class="rmeta" id="rMeta" hidden></div>
+      <pre class="rpre" id="rPre"></pre>
+    </section>
   </main>
 
   <!-- 底部状态栏 -->
   <footer class="footer">
     <span class="hint"><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
     <span class="hint"><kbd>Enter</kbd> 启动</span>
-    <span class="hint"><kbd>Esc</kbd> 隐藏</span>
+    <span class="hint"><kbd>Tab</kbd> 命令模式</span>
+    <span class="hint"><kbd>Esc</kbd> 返回</span>
     <span class="spacer"></span>
     <button class="linkbtn" id="btnReload" title="重新读取 config.json">重载配置</button>
     <button class="linkbtn" id="btnOpenCfg" title="用默认编辑器打开 config.json">编辑配置</button>

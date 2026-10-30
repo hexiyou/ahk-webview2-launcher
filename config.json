@@ -16,7 +16,8 @@
       "type": "app",
       "target": "C:\\Windows\\System32\\notepad.exe",
       "pinned": true,
-      "accent": "#4f8cff"
+      "accent": "#4f8cff",
+      "group": "sys"
     },
     {
       "id": "cmd",
@@ -32,7 +33,8 @@
       "type": "app",
       "target": "C:\\Windows\\System32\\cmd.exe",
       "pinned": true,
-      "accent": "#22c55e"
+      "accent": "#22c55e",
+      "group": "sys"
     },
     {
       "id": "powershell",
@@ -47,7 +49,8 @@
       "type": "app",
       "target": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
       "pinned": true,
-      "accent": "#3b82f6"
+      "accent": "#3b82f6",
+      "group": "sys"
     },
     {
       "id": "mspaint",
@@ -62,7 +65,8 @@
       "type": "app",
       "target": "C:\\Windows\\System32\\mspaint.exe",
       "pinned": true,
-      "accent": "#f59e0b"
+      "accent": "#f59e0b",
+      "group": "sys"
     },
     {
       "id": "explorer",
@@ -78,7 +82,8 @@
       "type": "app",
       "target": "C:\\Windows\\explorer.exe",
       "pinned": true,
-      "accent": "#eab308"
+      "accent": "#eab308",
+      "group": "sys"
     },
     {
       "id": "taskmgr",
@@ -92,7 +97,8 @@
       "icon": "C:\\Windows\\System32\\Taskmgr.exe",
       "type": "app",
       "target": "C:\\Windows\\System32\\Taskmgr.exe",
-      "accent": "#8b5cf6"
+      "accent": "#8b5cf6",
+      "group": "sys"
     },
     {
       "id": "edge",
@@ -107,7 +113,8 @@
       "icon": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
       "type": "app",
       "target": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-      "accent": "#06b6d4"
+      "accent": "#06b6d4",
+      "group": "net"
     },
     {
       "id": "calc",
@@ -121,7 +128,8 @@
       "icon": "",
       "type": "url",
       "target": "ms-calculator:",
-      "accent": "#22d3ee"
+      "accent": "#22d3ee",
+      "group": "sys"
     },
     {
       "id": "control",
@@ -135,7 +143,8 @@
       "icon": "C:\\Windows\\System32\\control.exe",
       "type": "app",
       "target": "C:\\Windows\\System32\\control.exe",
-      "accent": "#64748b"
+      "accent": "#64748b",
+      "group": "sys"
     },
     {
       "id": "tool-dir",
@@ -149,7 +158,8 @@
       "icon": "C:\\Windows\\explorer.exe",
       "type": "folder",
       "target": ".",
-      "accent": "#f97316"
+      "accent": "#f97316",
+      "group": "tool"
     },
     {
       "id": "edit-config",
@@ -166,7 +176,8 @@
       "target": "C:\\Windows\\System32\\notepad.exe",
       "args": "config.json",
       "workdir": ".",
-      "accent": "#94a3b8"
+      "accent": "#94a3b8",
+      "group": "tool"
     },
     {
       "id": "ip-config",
@@ -181,7 +192,94 @@
       "icon": "⚙",
       "type": "cmd",
       "target": "ipconfig /all",
+      "accent": "#10b981",
+      "group": "net"
+    },
+    {
+      "id": "http-ip",
+      "name": "查公网 IP",
+      "subtitle": "api.ipify.org · GET 后取 ip 字段",
+      "keywords": [
+        "ip",
+        "公网",
+        "地址",
+        "webhook"
+      ],
+      "icon": "",
+      "type": "webhook",
+      "group": "net",
+      "target": "https://api.ipify.org",
+      "method": "GET",
+      "query": {
+        "format": "json"
+      },
+      "timeout": 10,
+      "jsonPath": "ip",
+      "pinned": true,
       "accent": "#10b981"
+    },
+    {
+      "id": "http-github",
+      "name": "GitHub 仓库信息",
+      "subtitle": "api.github.com · 完整 JSON 格式化",
+      "keywords": [
+        "github",
+        "repo",
+        "仓库",
+        "api"
+      ],
+      "icon": "",
+      "type": "webhook",
+      "group": "net",
+      "target": "https://api.github.com/repos/hexiyou/ahk-webview2-launcher",
+      "method": "GET",
+      "headers": {
+        "Accept": "application/vnd.github+json"
+      },
+      "timeout": 15,
+      "pinned": false,
+      "accent": "#6366f1"
+    },
+    {
+      "id": "http-post",
+      "name": "POST 回显测试",
+      "subtitle": "httpbin.org · 带请求头 + JSON 体 + 取 json.from",
+      "keywords": [
+        "post",
+        "httpbin",
+        "回显",
+        "json"
+      ],
+      "icon": "",
+      "type": "webhook",
+      "group": "net",
+      "target": "https://httpbin.org/anything",
+      "method": "POST",
+      "headers": {
+        "X-Demo": "quicklaunch"
+      },
+      "body": {
+        "hello": "world",
+        "from": "QuickLaunch"
+      },
+      "timeout": 20,
+      "jsonPath": "json.from",
+      "pinned": false,
+      "accent": "#f59e0b"
+    }
+  ],
+  "groups": [
+    {
+      "id": "sys",
+      "name": "系统"
+    },
+    {
+      "id": "net",
+      "name": "网络"
+    },
+    {
+      "id": "tool",
+      "name": "工具"
     }
   ]
 }

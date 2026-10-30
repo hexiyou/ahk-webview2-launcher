@@ -6,6 +6,10 @@
 
 ![screenshot](docs/screenshot.png)
 
+> 分组胶囊 + `>` 命令模式 + webhook 响应面板（真实 GitHub API 返回，JSON 自动着色）：
+>
+> ![webhook](docs/screenshot-webhook.png)
+
 ---
 
 ## 一、结论
@@ -77,8 +81,13 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 |---|---|
 | `Ctrl+Alt+Space` | 全局显隐（热键由 `launcher.ini` 的 `Hotkey` 决定） |
 | 输入关键词 | 实时过滤；`↑` `↓` 选择，`Enter` 启动 |
-| `Esc` / 标题栏 `—` | 隐藏窗口，进程继续在托盘 |
-| 标题栏 `✕` | **只隐藏，不退出**（否则全局热键就唤不出来了） |
+| `>` 开头 | **命令模式**：只搜 `cmd` / `ahk` / `webhook` 这三类「动作」条目 |
+| `@分组` | 只看某个分组；支持前缀匹配（`@n` 命中 `net`），`term` 为空就是列出整组 |
+| `@net>ip` | 分组 + 命令模式，可叠加 |
+| `Tab` | 在当前范围里开关命令模式（`ip` ⇄ `>ip`，`@net ip` ⇄ `@net>ip`） |
+| 点分组胶囊 | 等价于输入 `@分组`，会自动保留关键词与命令模式 |
+| `Esc` | 逐层退：关结果面板 → 清空查询 → 隐藏窗口 |
+| 标题栏 `—` / `✕` | **只隐藏，不退出**（否则全局热键就唤不出来了） |
 | 托盘图标右键 | 编辑配置 / 重载配置 / 重启软件 / 退出软件 |
 | 托盘 → 退出软件 | **唯一真正退出程序的入口** |
 
@@ -91,6 +100,7 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 ```
 wv2-launcher/
 ├─ launcher.ahk          主程序：无边框窗口 + WebView2 宿主 + 热键 + 启动逻辑 + 图标提取
+├─ webhook.ahk           HTTP 执行器（子进程）：webhook 类型的请求都在这里跑，避免阻塞界面
 ├─ launcher.ini          AHK 侧设置：热键/尺寸/圆角/行为
 ├─ config.json           数据源：应用条目（前端读取解析）
 ├─ ui/
@@ -132,7 +142,7 @@ wv2-launcher/
   "subtitle": "代码编辑器",     // 副标题
   "keywords": ["code", "vsc"], // 额外搜索词（支持中英文）
   "icon": "C:\\...\\Code.exe", // 图标：exe 路径 / png|ico|svg 路径 / http(s) 地址 / emoji
-  "type": "app",               // app | cmd | url | folder | ahk
+  "type": "app",               // app | cmd | url | folder | ahk | webhook
   "target": "C:\\...\\Code.exe",
   "args": "",                  // 启动参数
   "workdir": "",               // 工作目录，相对路径按脚本目录解析
@@ -148,6 +158,66 @@ wv2-launcher/
 - `url` —— ShellExecute 打开（网址、自定义协议）
 - `folder` —— 用资源管理器打开目录
 - `ahk` —— 用当前 AHK 运行另一个 .ahk 脚本
+- `webhook` —— 发 HTTP 请求，把响应显示在面板里（见下方「webhook 类型」）
+
+### 分组（`groups` + 条目的 `group`）
+
+```json
+{
+  "groups": [
+    { "id": "sys",  "name": "系统" },
+    { "id": "net",  "name": "网络" },
+    { "id": "tool", "name": "工具" }
+  ],
+  "items": [
+    { "id": "ip-config", "group": "net", "name": "查看本机 IP", "...": "..." }
+  ]
+}
+```
+
+- 分组**只影响过滤**，不影响启动；空分组不会显示胶囊。
+- 条目没有 `group` 字段就归「未分组」；`groups` 不写也能跑（老配置直接兼容，只是没有胶囊栏）。
+- 搜索框里的 `@net` 就是点这颗胶囊的等价写法，`@n` 也能命中（前缀匹配）。
+
+### webhook 类型
+
+请求由 AHK 侧用 `WinHttp.WinHttpRequest.5.1` 发出（不是页面 `fetch` —— `file://` 页面直连外部 API 会被 CORS 拦），
+在**独立子进程**里执行，所以请求期间窗口照样能拖、能按 Esc。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `target` | — | 请求地址，必填 |
+| `method` | `GET` | `GET` / `POST` / `PUT` / `PATCH` / `DELETE` / `HEAD` |
+| `query` | — | 对象 `{"a":"1"}` 或数组 `["a=1"]`，自动 URL 编码后拼到地址上 |
+| `headers` | — | 对象 `{"X-Token":"abc"}` 或数组 `["Name: Value"]` |
+| `body` | — | 字符串原样发；写对象/数组会自动 `JSON.stringify`。`GET`/`HEAD` 时忽略 |
+| `timeout` | `15` | 秒，上限 120 |
+| `jsonPath` | — | 从响应 JSON 里取值，如 `data.items[0].name`；取到就只显示这个值，按钮可切回「完整响应」 |
+| `group` | — | 归到哪个分组 |
+
+带请求体又没指定 `Content-Type` 时，默认加 `application/json; charset=utf-8`。
+
+```json
+{
+  "id": "http-post",
+  "name": "POST 回显测试",
+  "type": "webhook",
+  "group": "net",
+  "target": "https://httpbin.org/anything",
+  "method": "POST",
+  "headers": { "X-Demo": "quicklaunch" },
+  "body": { "hello": "world" },
+  "timeout": 20,
+  "jsonPath": "json.from"
+}
+```
+
+结果面板会显示 **方法 / URL / 状态码 / 耗时**，JSON 自动格式化 + 语法着色，
+可以「复制」或切「完整响应」；`jsonPath` 取不到值时会把原因写在正文里（比如"数组下标越界""没有字段 xxx"）。
+非 JSON 响应按原文显示，不做 HTML 渲染。
+
+> 自带的三条示例（`http-ip` / `http-github` / `http-post`）分别演示「取值」「完整 JSON」「POST + 自定义头」，
+> 需要能访问对应域名；不通可以换成内网接口或删掉。
 
 ### `target` 的解析规则（按 type 区分）
 
@@ -252,6 +322,27 @@ wv2-launcher/
     顺带收紧了 `isProtocol()`：原正则 `/^[a-z][a-z0-9+.-]*:/i` 会把 `C:` 也匹配成协议
     （结果凑巧一致，但语义是错的），现已排除盘符形式。
 
+12. **⭐ webhook 请求必须丢给子进程**：`WinHttp.WinHttpRequest` 是同步调用，
+    在主脚本线程里发就是"整个窗口假死到请求结束"（超时 10 秒 = 10 秒拖不动、Esc 也按不了）。
+    现在主进程写 `spec.ini` → 起 `webhook.ahk` 子进程 → 每 120ms 看 `meta.ini` 出没出现。
+    顺带发现：**WinHttp 的 `SetTimeouts` 有 ~4 秒地板**——配 1 秒、3 秒都在 4015ms 才报错，
+    配 5 秒却能正常等到 6 秒的响应，说明它并不按你给的值精确生效。
+    所以真正的超时改成主进程兜底：`deadline = timeout + 1s`，到点直接杀子进程并回「请求超时」。
+
+13. **`JsonStr` 取不到数字**：前端 `postMessage` 过去的 `timeout` 是真正的 JSON 数字（不是字符串），
+    而 `JsonStr` 的正则只匹配 `"key":"value"` 这种带引号的形式，取出来是空串，
+    接着 `Integer('')` 就抛 `Parameter #1 of Integer.Call requires a Number`。
+    补了个 `JsonNum(text, key, default)` 专门吃数字，同时兼容写成字符串的老写法。
+
+14. **AHK 的变量名不能和内置函数撞**：写日志临时用了 `log`，而 `Log()` 是内置数学函数
+    （AHK 标识符不区分大小写），赋值时直接报 "This Func cannot be used as an output variable"。
+    更阴的是：发生在定时器线程里时表现为**静默失败**（文件根本没写出来，也没有任何提示）。
+    排查这类问题建议一开始就挂 `OnError` 把错误写进日志文件。
+
+15. **控制字符会让整条消息被丢掉**：响应正文里万一带 `\x00-\x1F`（BEL/ESC 之类），
+    `PostWebMessageAsJson` 会因为"不是合法 JSON"整条丢弃，前端什么也收不到。
+    `JsonQuote` 里补了把剩余控制字符转成 `\u00XX` 的处理。
+
 ---
 
 ## 六、已知限制
@@ -262,11 +353,16 @@ wv2-launcher/
 - 图标按 32×32 提取，4K 屏上放大到 30px 显示会略糊。
 - UWP 应用（如计算器）没有 exe 路径，只能用 `ms-xxx:` 协议启动，拿不到真实图标。
 - 搜索是"子串 + 关键词前缀"匹配，没有拼音首字母（要加得引一个拼音表）。
+- webhook 只处理**文本**响应：二进制（图片/文件）会被当作文本读，得到乱码。
+- webhook 响应超过 400KB 会被截断（面板会标「响应过大已截断」）。
+- 每个请求起一个子进程，没有连接复用；高频连续点会有点开销（单次约 30~80ms 启动成本）。
+- 请求只能同步等待，没有"取消请求"按钮（Esc 只是关面板，进程会跑到超时）。
 
 ## 七、可以继续加的东西
 
 - 拼音搜索、模糊匹配打分（fzf 风格）
 - 历史使用频率排序（记录到 JSON）
-- 多分组 / 二级菜单（`>` 前缀切到命令模式）
+- webhook：请求历史、把常用请求存成条目、`{{ENV}}` 占位符（密钥不写死在配置里）
+- webhook：响应里可搜索/折叠大 JSON、支持复制单个字段
 - 窗口出现动画、亚克力背景（`DwmSetWindowAttribute` + `WS_EX_LAYERED`）
 - 用 `A_Args` 支持从命令行直接搜索

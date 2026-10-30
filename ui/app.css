@@ -158,6 +158,7 @@ body {
 
 /* ---------------- 内容区 ---------------- */
 .body {
+  position: relative;
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
@@ -394,3 +395,196 @@ kbd {
 }
 ::-webkit-scrollbar-thumb:hover { background: #c3c8d1; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================
+   作用域 / 分组（查询串语法：> 命令模式，@ 分组）
+   ============================================================ */
+
+.scope {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 4px 0 8px;
+  border-radius: 999px;
+  background: #eef2ff;
+  border: 1px solid #d7e0ff;
+  color: #3b5bdb;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.scope[hidden] { display: none; }
+.scope button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px; height: 15px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #7089d8;
+  cursor: pointer;
+}
+.scope button:hover { background: #dde5ff; color: #2f4bc0; }
+
+.chips {
+  display: flex;
+  gap: 6px;
+  padding: 8px 2px 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.chips::-webkit-scrollbar { display: none; }
+.chips[hidden] { display: none; }
+
+.chip {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: #6b7280;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.chip:hover { background: #f4f6fa; color: #374151; }
+.chip.on {
+  background: var(--accent-soft);
+  border-color: #cfdaff;
+  color: #2f4bc0;
+  font-weight: 600;
+}
+
+/* 行尾的请求方法徽标 */
+.row-kind-http {
+  color: #2f6f4f;
+  background: #eefaf3;
+  border-color: #cdeedd;
+  font-weight: 600;
+  letter-spacing: .3px;
+  opacity: 1;          /* 方法名一眼能看见，不用等 hover */
+}
+
+/* ============================================================
+   Webhook 响应面板
+   ============================================================ */
+
+.result {
+  position: absolute;
+  inset: 0 6px 6px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(17, 24, 39, .13);
+  overflow: hidden;
+}
+.result[hidden] { display: none; }
+
+.rhead {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfcfe;
+}
+
+.rmethod {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .4px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  color: #fff;
+  background: #22c55e;
+}
+.rmethod.m-post { background: #3b82f6; }
+.rmethod.m-put,
+.rmethod.m-patch { background: #f59e0b; }
+.rmethod.m-delete { background: #ef4444; }
+.rmethod.m-head,
+.rmethod.m-options { background: #8b5cf6; }
+
+.rurl {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  color: #4b5563;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rstat {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.rstat.st-ok { color: #067647; background: #ecfdf3; border-color: #bbf0d0; }
+.rstat.st-warn { color: #93370d; background: #fffaeb; border-color: #fde7bf; }
+.rstat.st-err { color: #b42318; background: #fef3f2; border-color: #fcd9d6; }
+.rstat.st-wait { color: #475467; background: #f2f4f7; border-color: #e4e7ec; }
+
+.rgap { flex: 1 1 auto; }
+
+.rbtn {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: #fff;
+  color: #4b5563;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.rbtn:hover { background: #f4f6fa; color: #111; border-color: #cfd6e0; }
+.rbtn[hidden] { display: none; }
+.rbtn-close { width: 26px; padding: 0; color: #9aa0aa; }
+.rbtn-close:hover { background: #ffe9e9; color: #d92d20; border-color: #ffd5d5; }
+
+.rmeta {
+  flex: 0 0 auto;
+  padding: 6px 12px 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.rmeta[hidden] { display: none; }
+
+.rpre {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 10px 12px 14px;
+  overflow: auto;
+  font-family: "Cascadia Mono", "Consolas", "Segoe UI Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #24292f;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
+/* JSON 语法着色 */
+.jt-key { color: #8250df; }
+.jt-str { color: #0a7c42; }
+.jt-num { color: #b45309; }
+.jt-lit { color: #1d4ed8; }
+.jt-p { color: #6b7280; }
