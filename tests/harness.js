@@ -38,15 +38,17 @@ const DEFAULT_NAMES = [
 ];
 
 /* state: 需要预置 groups / all；PY: 拼音模块（可传 null 验证降级）
-   extra: 额外要抽出来的函数名 */
-function build(state, PY, extra) {
+   extra: 额外要抽出来的函数名
+   prelude: 额外的变量声明（有些函数要读 scriptDir / els 这类模块级变量） */
+function build(state, PY, extra, prelude) {
   const src = readSrc();
   const names = DEFAULT_NAMES.concat(extra || []);
 
   const consts = [
     grabConst(src, /const CMD_TYPES = \{[^}]*\};/, 'CMD_TYPES'),
     grabConst(src, /const TPL_RE = .*;/, 'TPL_RE'),
-    grabConst(src, /const FIELD_W = \{[\s\S]*?\n  \};/, 'FIELD_W')
+    grabConst(src, /const FIELD_W = \{[\s\S]*?\n  \};/, 'FIELD_W'),
+    prelude || ''
   ].join('\n');
 
   const code = consts + '\n' + names.map(n => grab(src, n)).join('\n') +

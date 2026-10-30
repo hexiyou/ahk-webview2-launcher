@@ -850,9 +850,23 @@
 
   /* ---------------------------------------------------------- 参数态渲染 */
 
-  /* Windows 命令行里给单个 token 加引号（app / ahk 用；cmd 类型不加，原样拼） */
+  /* Windows 命令行里给单个 token 加引号（app / ahk 用；cmd 类型不加，原样拼）。
+     规则和 launcher.ahk 的 QuoteArgv1 一致：反斜杠只在引号前面特殊，
+     所以结尾的反斜杠必须翻倍，否则 `\\nas\share\` 会变成 `\\nas\share"`，
+     把引号连同下一个参数一起吃掉（UNC 目录几乎都以反斜杠结尾）。 */
   function quoteWin(s) {
-    return '"' + String(s == null ? '' : s).replace(/"/g, '\\"') + '"';
+    const t = String(s == null ? '' : s);
+    if (!t) return '""';
+    if (!/[\s"]/.test(t)) return t;            /* 没有空白和引号就不用包 */
+    let out = '', n = 0;
+    for (const c of t) {
+      if (c === '\\') { n++; continue; }
+      if (c === '"') out += '\\'.repeat(2 * n) + '\\"';
+      else out += '\\'.repeat(n) + c;
+      n = 0;
+    }
+    out += '\\'.repeat(2 * n);
+    return '"' + out + '"';
   }
 
   function baseName(p) {

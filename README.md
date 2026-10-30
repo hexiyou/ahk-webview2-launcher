@@ -64,11 +64,13 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 | 参数态 `Tab` 补目录 | ✅ 真窗口里输入 `C:\Win` 按 Tab → `C:\Windows\` |
 | 参数态 `→` 补历史 | ✅ 先跑一次 `8.8.8.8`，再输入 `8.8` 按 `→` → `8.8.8.8` |
 | 使用频率落盘 | ✅ `usage.json` 出现 `{"http-geo":{"n":1,...}}`，空查询时该条目排到第一 |
+| UNC 共享上的 exe / bat / 图标 / 参数 | ✅ 真去 `\\localhost\…` 跑（`node tools/unc-check.js`），见「局域网共享」一节 |
 | 点击条目 → 真的启动程序 | ✅ 通过 `cmd /c echo ok>…` 生成了目标文件 |
 | 全局热键 `Ctrl+Alt+Space` 显隐 | ✅ 用 `keybd_event` 模拟真实按键，窗口 visible 1→0→1 |
 
 > 后面四项不是"看起来对"，是 `node tools/e2e.js` 用真窗口、真 WebView2、真 AHK 桥接跑出来的
-> （13 步，日志见 `_e2e.log`，跑完自动退出）。
+> （15 步，日志见 `_e2e.log`，跑完自动退出）。UNC 那几项由 `node tools/unc-check.js` 单独跑，
+> 它会真的启动共享上的进程。
 
 ---
 
@@ -127,10 +129,13 @@ wv2-launcher/
 ├─ tests/
 │  ├─ args.test.js       参数/查询语义用例（38 条）
 │  ├─ search.test.js     拼音/打分/频率/补全用例（58 条）
+│  ├─ unc.test.js        UNC 路径用例（45 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
 │  ├─ gen-pinyin.ps1     从 pinyin-data 重新生成 ui/pinyin.js
-│  └─ e2e.js             端到端冒烟：真窗口 + 真桥接跑一遍，跑完自己退出
+│  ├─ e2e.js             端到端冒烟：真窗口 + 真桥接跑一遍，跑完自己退出
+│  ├─ unc-check.js       UNC 专项实测：真去跑共享上的 exe/bat，读一遍 _unc.log
+│  └─ unc-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 ├─ docs/screenshot.png
 └─ run.bat
 ```
@@ -141,7 +146,9 @@ wv2-launcher/
 > ```
 > node tests/args.test.js      # 38 条
 > node tests/search.test.js    # 58 条
-> node tools/e2e.js            # 会弹一个真窗口跑 13 步，跑完自动关
+> node tests/unc.test.js       # 45 条
+> node tools/e2e.js            # 会弹一个真窗口跑 15 步，跑完自动关
+> node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > ```
 
 ---
@@ -425,8 +432,61 @@ vs code src/app.js           → Code.exe "src/app.js"
 > 于是 `cmd` 类型的 `ipconfig /all` 变成 `C:\…\wv2-launcher\ipconfig /all`，
 > cmd 报「`C:\…\ipconfig` 不是内部或外部命令」。见下方踩坑 11。
 
+UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：不会被拼上脚本目录，
+`workdir` / `icon` 也一样（会先把 `//` 归一成 `\\`）。细节见「局域网共享」一节。
+
 `icon` 留空时，会自动从 `target` 的 exe 里提取图标（`SHGetFileInfo` → GDI+ → PNG 缓存到 `%TEMP%\quicklaunch-icons`）；
 提取不到就退化成"首字 + 渐变色"头像（截图里的"计算器"就是这种）。
+
+### 局域网共享（UNC 路径 `\\服务器\共享`）
+
+开了 SMB 共享之后，UNC 路径可以直接写进配置，**不需要映射盘符**：
+
+```jsonc
+{
+  "name": "共享上的工具",
+  "type": "app",
+  "target": "\\\\nas01\\工具\\tool.exe",      // JSON 里反斜杠要写两遍
+  "workdir": "\\\\nas01\\工具",                // 可选
+  "args": "",
+  "icon": "\\\\nas01\\工具\\tool.png"          // 可选
+}
+```
+
+前面几节记的是 `\\nas01\…` 这种**视觉效果**，写进 JSON 时必须转义成 `"\\\\nas01\\…"`。
+`folder` / `ahk` / `cmd` 类型同样支持；`cmd` 的 `target` 是一整条命令行，UNC 出现在哪里都不会被改写。
+
+**能用的部分（都实测过）**
+
+| 场景 | 结果 |
+|---|---|
+| UNC 上的 exe 启动 | ✅ 原样 `CreateProcess`，工作目录不受影响 |
+| `workdir` 设成 UNC | ✅ 普通程序直接生效（子进程 cwd 就是共享目录） |
+| 运行时参数是 UNC 路径（含空格、中文、结尾反斜杠） | ✅ 引号翻倍处理，见踩坑 27 |
+| UNC 上的 `.bat` / `.cmd` | ✅ 自动改成 `cmd /c pushd "…" && …` |
+| `cmd` 类型 + UNC `workdir` | ✅ 自动改成 `pushd "…" && 命令` |
+| 从共享上的 exe 提图标 | ✅（首次会多等几百毫秒，走网络） |
+| `icon` 指向共享上的 png | ✅ `file://///服务器/共享/x.png` WebView2 认 |
+| 参数态按 `Tab` 补全 | ✅ `\\服务器\` 后面能列出共享名（`NetShareEnum`），共享目录里照常列子目录 |
+| `\\?\UNC\服务器\共享\…` 长路径前缀 | ✅ 原样透传 |
+
+**几个要留意的地方**
+
+- **首次访问会顿一下**：第一次用 UNC 路径时 Windows 要建 SMB 会话、Defender 也要扫一遍，
+  实测冷启动一个 exe 要 8 秒、热启动 130ms。这段卡顿发生在 `Run` 之前（`FileExist` 查目标），
+  属于系统行为，不是程序在等。
+- **共享掉线时**：`FileExist` 大约 2 秒后返回失败，界面会卡这 2 秒，然后提示「文件不存在：…」。
+  提示是对的，只是要等。别把热键和共享盘配在一起当救命工具。
+- **凭据**：用的是当前 Windows 登录身份。共享需要别的账号时，先在资源管理器里连一次并勾选
+  「记住凭据」，程序这边就通了（不然 `FileExist` 直接失败）。
+- **`\\服务器` 单独一层不是目录**：Windows 的 `DirExist` 对它永远返回假，所以补全单独走了
+  `NetShareEnum`；这一步只查这一台机器，不会去"浏览网络"，也不会弹认证框。
+- **`pushd` 要占一个盘符**：`cmd` 类型 / 批处理用 UNC 工作目录时，靠 `pushd` 临时映射一个盘符
+  来绕过「cmd 不认 UNC 工作目录」。进程退出会释放，但如果**盘符全被占满**（映射的网盘、
+  WebDAV 一大堆），`pushd` 会失败，命令就不执行了（控制台会留下系统报错）。
+  实测踩过：连续跑测试留下的几个 `cmd /k` 窗口各占一个盘符，26 个字母耗尽之后连
+  `dir \\服务器\共享` 都开始报「指定的路径无效」，`net use` 显示还有 6 个映射指向同一条共享。
+  遇到"明明共享还在却访问不了"，先 `net use` 看看是不是这个。
 
 ---
 
@@ -602,6 +662,42 @@ vs code src/app.js           → Code.exe "src/app.js"
     立刻返回，结果由页面用 `{type:'log'}` 一条条回传。
     （同一类问题还坑过 `CapturePreviewAsync().await()`：截图任务永远不完成，只能被超时杀掉。）
 
+27. **⭐ 反斜杠只在引号前面"特殊"，所以结尾的 `\` 会吃掉引号**：给 exe 传参数时，
+    早期写法是每个 token 直接包一层 `"`，`\\nas\share\` 就变成 `"\\nas\share\"` ——
+    Windows 的 CRT 解析规则里 `\"` 是**一个字面引号**，于是参数变成 `\\nas\share"`，
+    还顺手把后面的 `"` 吞掉，下一个参数跟着黏上来：
+    ```
+    传  ["\\nas\share\", "a b", "C:\Windows\"]
+    收  ["\\nas\share\" a", "b C:\Windows\"", …]     ← 全乱了
+    ```
+    `C:\Windows\`、`D:\我的项目\`、任何"以反斜杠结尾的目录"都中招，不只是 UNC。
+    正确做法（MS 文档 *Parsing C++ command-line arguments*）：引号前的反斜杠数 `n` 要写成
+    `2n+1`，结尾的反斜杠写成 `2n`；换个说法就是**结尾反斜杠翻倍**。
+    现在 `QuoteArgv1()`（AHK）和 `quoteWin()`（前端预览）都按这个规则来，
+    而且"没有空格也没有引号就干脆不加引号"，歧义直接消失。
+    注意 `cmd` 和 `.bat` 走的是 cmd 自己的解析（反斜杠不转义），所以那边不受影响 —— 
+    两套规则不一样，这也是它容易被忽略的原因。
+
+28. **`cmd.exe` 不认 UNC 工作目录，但它不报错，只是默默换到 `C:\Windows` 执行**：
+    `cmd /c "cd > out.txt"` 配 `workdir = \\nas\share`，`out.txt` 里写着 `C:\Windows`，
+    相对路径的读写全都落到系统目录，看起来"什么都没发生"。
+    `.bat` 也一样（批处理本质就是 cmd 跑的）。
+    正确做法是先 `pushd "\\nas\share"`（它会临时映射一个盘符，进程退出自动释放），
+    现在 `Launch()` 检测到 `workdir` 是 UNC 且目标走 cmd（`cmd` 类型、`.bat`/`.cmd`）时
+    自动加这一层 —— 实测 cwd 变成 `Q:\…`，相对路径就对上了。
+    普通 exe **不需要**这层：`CreateProcess` 接受 UNC 工作目录（`pushd` 反而会让路径变形）。
+
+29. **`Loop read` 是语法错误，不是循环**：写 `NetShareEnum` 时把计数变量命名成 `read`，
+    `Loop read {` 直接被判成 "Parameter #1 required" —— 整个脚本加载失败。
+    AHK 里 `read` 八成撞了什么内置标识符，改名 `nRead` 就好了。
+    同类坑还有变量名 `log`（撞内置 `Log()`，见踩坑 5）。
+
+30. **`FileDelete()` 删不存在的文件会抛异常（v2.0.31）**：不是返回 0。
+    写测试脚本时 `FileDelete(x)` 前面忘了 `try`，异常直接弹错误框 ——
+    而脚本是在定时器线程里跑的，窗口一挂，整个 E2E 就"卡住不动"了（现象极具迷惑性：
+    日志停在上一行，进程不退，也没有 stderr）。
+    程序里所有 `FileDelete` 本来就包了 `try`，但写测试脚本时很容易漏。
+
 ---
 
 ## 六、已知限制
@@ -622,7 +718,10 @@ vs code src/app.js           → Code.exe "src/app.js"
 - webhook 响应超过 400KB 会被截断（面板会标「响应过大已截断」）。
 - 每个请求起一个子进程，没有连接复用；高频连续点会有点开销（单次约 30~80ms 启动成本）。
 - 运行时参数只做"空白切分 + 引号"，不解析 `%VAR%`、管道、通配符。
-  `app` / `ahk` 的每个参数都会被加引号，所以 `cmd.exe` 这类 shell 语义请用 `cmd` 类型条目（原样拼接）。
+  `app` / `ahk` 的每个参数按需加引号（含空白或引号才加），所以 `cmd.exe` 这类 shell 语义请用 `cmd` 类型条目（原样拼接）。
+- **UNC 路径**：只有 `workdir` 是 UNC 时才需要特殊照顾（已自动 `pushd`），但共享掉线时
+  `FileExist` 会阻塞约 2 秒才失败；首次访问共享的冷启动也可能要好几秒（系统 SMB + 杀软扫描）。
+  补全 `\\服务器` 只列共享，**不列网络上的服务器名**（那要靠"浏览网络"，会慢且可能弹框）。
 - 参数态一次只能运行一条，不能批量（要做批量得先在 `cmd` 里写循环）。
 - 请求只能同步等待，没有"取消请求"按钮（Esc 只是关面板，进程会跑到超时）。
 - `WinHttp` 走**系统代理设置**（IE/系统级代理），没有单独的代理配置项。代理只在浏览器里生效、

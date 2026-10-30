@@ -297,9 +297,27 @@ DoFs(raw) {
     if (SubStr(d, -1) != ':\')
         d := RTrim(d, '\ /')
 
+    ; \\server 这种"服务器根"在 Windows 里不是目录，DirExist 永远为假，
+    ; 但用户在这里按 Tab 想看的正是共享名 —— 单独走 NetShareEnum。
+    if RegExMatch(d, '^\\\\[^\\]+$') {
+        sh := ListShares(d)
+        if !IsObject(sh) {
+            JsSend('{"type":"fs-result","id":' JsonQuote(id) ',"ok":0,"dir":' JsonQuote(d)
+                . ',"err":' JsonQuote('连不上这台服务器：' d) ',"entries":[]}')
+            return
+        }
+        s := ''
+        for nm in sh
+            s .= (s = '' ? '' : ',') '{"n":' JsonQuote(nm) ',"d":1}'
+        JsSend('{"type":"fs-result","id":' JsonQuote(id) ',"ok":1,"dir":' JsonQuote(d)
+            . ',"err":"","entries":[' s ']}')
+        return
+    }
+
     if (d = '' || !DirExist(d)) {
+        err := (d = '') ? '先输入服务器名，例如 \\nas01\共享' : '目录不存在：' d
         JsSend('{"type":"fs-result","id":' JsonQuote(id) ',"ok":0,"dir":' JsonQuote(d)
-            . ',"err":' JsonQuote('目录不存在：' d) ',"entries":[]}')
+            . ',"err":' JsonQuote(err) ',"entries":[]}')
         return
     }
 
@@ -323,6 +341,29 @@ DoFs(raw) {
     all := (nd && nf) ? dirs ',' files : dirs files
     JsSend('{"type":"fs-result","id":' JsonQuote(id) ',"ok":1,"dir":' JsonQuote(d)
         . ',"err":"","entries":[' all ']}')
+}
+
+/* 列出 \\server 下的共享（NetShareEnum level 1）。失败返回 ''，成功返回共享名数组。
+   用 NetShareEnum 而不是"浏览网络"：只查这一台，快且不会弹认证框。 */
+ListShares(server) {
+    buf := 0, nRead := 0, nTotal := 0
+    r := DllCall('netapi32\NetShareEnum', 'wstr', server, 'uint', 1, 'ptr*', &buf
+        , 'uint', -1, 'uint*', &nRead, 'uint*', &nTotal, 'ptr', 0, 'uint')
+    if (r != 0 || !buf)
+        return ''
+
+    out := []
+    ; SHARE_INFO_1：netname(ptr) type(uint) [pad] remark(ptr)，步长 A_PtrSize * 3
+    Loop nRead {
+        p := buf + (A_Index - 1) * A_PtrSize * 3
+        nm := StrGet(NumGet(p, 0, 'ptr'), 'UTF-16')
+        typ := NumGet(p, A_PtrSize, 'uint')
+        ; 只要磁盘共享（STYPE_DISKTREE = 0；高位 STYPE_SPECIAL 的管理共享 C$ 也留着）
+        if ((typ & 0xFFFF) = 0 && nm != '')
+            out.Push(nm)
+    }
+    DllCall('netapi32\NetApiBufferFree', 'ptr', buf)
+    return out
 }
 
 ShowLauncher() {
@@ -544,12 +585,52 @@ DoRun(raw) {
     }
 }
 
-/* 每个 token 单独包一对引号 —— 参数里的空格、中文路径都不会把命令行拆散 */
+/* 每个 token 单独加引号 —— 参数里的空格、中文路径都不会把命令行拆散。
+   不能简单包一层 '"' t '"'：Windows 的规则是"反斜杠只在引号前面特殊"，
+   t 以 \ 结尾时末尾的 \" 会被解析成一个字面引号，参数连同后面的引号一起吃掉。
+   UNC 目录（\\nas\share\）几乎都以反斜杠结尾，所以这里是必踩的坑：
+       QuoteArgv(['\\nas\share\'])  ->  "\\nas\share\"  ->  exe 收到 \\nas\share"
+   正确做法：反斜杠要翻倍，引号本身写成 \"（MS 文档 "Parsing C++ command-line arguments"）。 */
 QuoteArgv(tokens) {
-    q := Chr(34), bs := Chr(92)
     s := ''
     for t in tokens
-        s .= ' ' q StrReplace(t, q, bs q) q
+        s .= ' ' QuoteArgv1(t)
+    return s
+}
+
+QuoteArgv1(t) {
+    q := Chr(34), bs := Chr(92)
+    t := String(t)
+    if (t = '')
+        return q q
+    ; 既没有空白也没有引号 → 不用加引号，反斜杠也就没有歧义（尾随反斜杠也无所谓）
+    if !InStr(t, q) && !RegExMatch(t, '\s')
+        return t
+
+    out := '', n := 0, i := 1, len := StrLen(t)
+    while (i <= len) {
+        c := SubStr(t, i, 1)
+        if (c = bs) {
+            n++                       ; 反斜杠先攒着，看后面跟什么
+            i++
+            continue
+        }
+        if (c = q)
+            out .= Pad(bs, 2 * n) . bs . q      ; 2n 个 \ + \" → 一个字面引号
+        else
+            out .= Pad(bs, n) . c
+        n := 0
+        i++
+    }
+    ; 收尾的反斜杠要翻倍，否则紧挨着闭合引号又会被当成转义
+    out .= Pad(bs, 2 * n)
+    return q . out . q
+}
+
+Pad(ch, n) {
+    s := ''
+    Loop n
+        s .= ch
     return s
 }
 
@@ -572,7 +653,14 @@ Launch(kind, target, args, workdir, argv := [], argvRaw := '') {
             ; 外面包一层引号并用 /s：cmd 只剥掉首尾两个引号，命令里自带的引号
             ; （带空格的 exe 路径、重定向文件名）能原样保留。
             ; 运行时参数按用户原文追加 —— cmd 自己会解析引号和重定向。
-            Run(A_ComSpec ' /s /k "' target (argvRaw != '' ? ' ' argvRaw : '') '"', workdir)
+            line := target . (argvRaw != '' ? ' ' argvRaw : '')
+            ; cmd.exe 不认 UNC 工作目录（会退回 C:\Windows 再执行，等于在错的地方跑），
+            ; 用 pushd 先把共享映射成临时盘再进去。
+            if IsUncPath(workdir) {
+                Run(A_ComSpec ' /s /k "pushd "' workdir '" && ' line '"')
+                return
+            }
+            Run(A_ComSpec ' /s /k "' line '"', workdir)
         case 'ahk':
             Run('"' A_AhkPath '" "' target '"' (args != '' ? ' ' args : '') extra, workdir)
         case 'webhook':
@@ -588,8 +676,21 @@ Launch(kind, target, args, workdir, argv := [], argvRaw := '') {
             ; 带分隔符却找不到 → 真错；裸命令名（notepad.exe）放行，交给 PATH
             if !FileExist(target) && InStr(target, '\')
                 throw Error('文件不存在：' target)
+            ; 批处理是 cmd 跑的，同样吃不了 UNC 工作目录：改由 cmd 自己 pushd 过去
+            if IsUncPath(workdir) && RegExMatch(target, 'i)\.(bat|cmd)$') {
+                line := 'pushd "' workdir '" && "' target '"' (args != '' ? ' ' args : '') extra
+                Run(A_ComSpec ' /s /c "' line '"')
+                return
+            }
             Run('"' target '"' (args != '' ? ' ' args : '') extra, workdir)
     }
+}
+
+/* UNC 共享路径（\\server\share）—— \\?\ 长路径前缀不算 */
+IsUncPath(p) {
+    if (SubStr(p, 1, 2) != '\\')
+        return false
+    return (SubStr(p, 1, 4) != '\\?\')
 }
 
 DoReload() {

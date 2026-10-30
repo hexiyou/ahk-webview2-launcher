@@ -82,6 +82,23 @@ const PAGE_JS = String.raw`
     log('T11 行布局              -> 溢出=' + (row.scrollWidth > row.clientWidth + 1) +
         ' 角标=' + (badge ? badge.textContent : '(无)'));
 
+    /* UNC：Tab 在 \\服务器\ 后面应该列出共享，而不是报"目录不存在" */
+    setQ('记事本 '); await wait(120);
+    setTail('\\\\localhost\\'); await wait(60);
+    key('Tab'); await wait(1600);
+    log('T12 Tab 补 UNC 共享     -> 输入=' + JSON.stringify(q.value) +
+        ' 提示=' + JSON.stringify((document.getElementById('toast').textContent || '').slice(0, 48)));
+
+    /* UNC 图标走 file://///… 这种五斜杠写法，浏览器认不认 */
+    const imgRes = await new Promise(r => {
+      const im = new Image();
+      im.onload = () => r('ok ' + im.naturalWidth + 'x' + im.naturalHeight);
+      im.onerror = () => r('FAIL 加载失败');
+      setTimeout(() => r('超时'), 4000);
+      im.src = 'file://///localhost/Users/Administrator/AppData/Local/Temp/unctest/icon%20test.png';
+    });
+    log('T13 file:///// UNC 图标  -> ' + imgRes);
+
     await wait(900);                      /* 等 usage.json 落盘（写盘有 400ms 防抖） */
     log('DONE');
   } catch (e) {
