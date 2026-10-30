@@ -79,17 +79,35 @@ try {
     status := req.Status
     body := req.ResponseText
 } catch as e {
-    errMsg := e.Message
-    ; 常见 COM 错误码翻译成人话，比 0x80072EE2 好懂
-    if InStr(errMsg, '0x80072EE2')
-        errMsg := '连接超时或网络不可达（' timeout 's）'
-    else if InStr(errMsg, '0x80072EFD')
-        errMsg := '无法连接到服务器（DNS 或网络问题）'
-    else if InStr(errMsg, '0x80072F8F')
-        errMsg := 'TLS/SSL 握手失败（系统可能缺少 TLS 1.2 支持）'
-    else if InStr(errMsg, '0x800C0005')
-        errMsg := '无法解析域名或连接被拒绝'
+    errMsg := CleanComError(e.Message)
+
+    ; 常见 WinHttp / WinINET 错误码翻译成人话，比 0x80072EE2 好懂。
+    ; 这些错误都在"还没拿到 HTTP 响应"的阶段抛出，和 4xx/5xx（限流、鉴权失败）是两回事。
+    codeMap := Map(
+        '0x80072EE2', '连接超时：服务器没有在 ' timeout ' 秒内响应',
+        '0x80072EE7', '域名解析失败：DNS 查不到这个主机',
+        '0x80072EFD', '无法连接到服务器：端口不可达或被防火墙拦截',
+        '0x80072EFE', '连接被对方中断：TCP 已连上但 TLS 握手被重置。多为网络干扰、代理或目标站点封禁，不是请求参数问题',
+        '0x80072EF3', '服务器返回了无法识别的响应',
+        '0x80072F78', '服务器返回的响应无效',
+        '0x80072F8F', 'TLS/SSL 握手失败：系统可能未启用 TLS 1.2',
+        '0x80090308', 'TLS 握手失败：证书或加密套件不被接受',
+        '0x800B0109', '证书链不受信任：目标站点证书有问题或系统根证书缺失',
+        '0x800C0005', '无法解析域名或连接被拒绝',
+        '0x800C0008', '下载失败：连接被中途断开'
+    )
+    for code, text in codeMap {
+        if InStr(errMsg, code) {
+            errMsg := text '（' code '）'
+            break
+        }
+    }
 }
+
+; AHK 的 COM 异常 Message 后面会挂一串 "Source: ... Description: ... HelpFile: ..."，
+; 直接丢给用户看既长又没用，只留前半句人话。
+; 注意：函数定义放在文件末尾 —— AHK v2 执行到第一个函数定义就结束自动执行段，
+; 插在中间会让后面的写结果代码变成死代码。
 
 elapsed := A_TickCount - t0
 
@@ -107,3 +125,14 @@ IniWrite(elapsed, meta, 'resp', 'Ms')
 IniWrite(StrLen(body), meta, 'resp', 'Len')
 
 ExitApp(0)
+
+; ----------------------------------------------------------------------------
+;  ↓ 以下必须留在自动执行段之后
+; ----------------------------------------------------------------------------
+CleanComError(msg) {
+    p := InStr(msg, 'Source:')
+    if p
+        msg := SubStr(msg, 1, p - 1)
+    msg := Trim(StrReplace(StrReplace(msg, "`r", ' '), "`n", ' '))
+    return msg
+}

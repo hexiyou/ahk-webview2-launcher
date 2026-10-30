@@ -747,6 +747,47 @@
     return 'st-err';
   }
 
+  /* 连接层失败（一个字节的响应都没拿到）时的提示。
+     关键是要和 4xx/5xx 区分开：限流会返回状态码和正文，不会走到这里。 */
+  function netErrorText(res) {
+    const err = String(res.error || '请求失败').trim();
+    const lines = ['请求没有完成，没有拿到任何 HTTP 响应。', '', '  ' + err, ''];
+
+    if (/超时/.test(err)) {
+      lines.push('目标没有在限定时间内响应，可能是服务太慢，也可能链路根本不通。');
+      lines.push('先把 timeout 调大再试；若仍超时，按下面的网络问题排查。');
+      return lines.join('\n');
+    }
+
+    lines.push('这类错误发生在「还没拿到响应」的阶段（DNS / 连接 / TLS 握手），');
+    lines.push('不是服务端限流——限流会返回 429、503 这样的状态码和响应正文。');
+    lines.push('');
+    lines.push('常见原因');
+    lines.push('  1. 目标域名在当前网络被阻断：TCP 能连上，TLS 握手一发出去就被断开');
+    lines.push('  2. 需要代理才能访问，而代理没启动、端口不通或规则没覆盖这个域名');
+    lines.push('  3. 域名拼错、DNS 被污染，或目标服务临时故障');
+    lines.push('');
+    lines.push('可以试');
+    lines.push('  · 用浏览器直接打开这个地址，确认本机网络到底能不能访问');
+    lines.push('  · 换一个功能等价、网络可达的接口（例如 api.ipify.org → api64.ipify.org）');
+    lines.push('  · 需要代理时先确认系统代理已开启，本工具走 WinHttp 的默认代理设置');
+    return lines.join('\n');
+  }
+
+  /* 状态徽标只放短标签，长句交给正文和 title —— 一行 80 字的错误会把 URL 挤成 "htt..." */
+  function shortErrLabel(err) {
+    const s = String(err || '');
+    const code = (s.match(/0x[0-9A-Fa-f]{8}/) || [''])[0];
+    let label = '请求失败';
+    if (/超时/.test(s)) label = '请求超时';
+    else if (/解析|DNS/.test(s)) label = '域名解析失败';
+    else if (/中断|重置/.test(s)) label = '连接被中断';
+    else if (/无法连接|端口不可达/.test(s)) label = '连接失败';
+    else if (/TLS|SSL|证书/.test(s)) label = 'TLS 握手失败';
+    else if (/进程/.test(s)) label = '请求进程异常';
+    return code ? label + ' ' + code : label;
+  }
+
   function renderResult() {
     const res = state.result;
     const box = els.result;
@@ -760,8 +801,10 @@
     const item = res.item || {};
     els.rMethod.textContent = (item.method || 'GET').toUpperCase();
     els.rMethod.className = 'rmethod m-' + (item.method || 'GET').toLowerCase();
-    els.rUrl.textContent = item.target || '';
-    els.rUrl.title = buildUrl(item) || '';
+    /* 显示最终请求地址（含 query 串），否则用户会以为 query 没生效 */
+    const fullUrl = buildUrl(item) || '';
+    els.rUrl.textContent = fullUrl;
+    els.rUrl.title = fullUrl;
 
     /* 状态行 */
     if (res.loading) {
@@ -769,7 +812,8 @@
       els.rStatus.textContent = '请求中…';
     } else if (!res.ok) {
       els.rStatus.className = 'rstat st-err';
-      els.rStatus.textContent = res.error || '请求失败';
+      els.rStatus.textContent = shortErrLabel(res.error);
+      els.rStatus.title = res.error || '';
     } else {
       const txt = (STATUS_TEXT[res.status] ? res.status + ' ' + STATUS_TEXT[res.status] : res.status ? String(res.status) : '无状态码');
       els.rStatus.className = 'rstat ' + statusClass(res);
@@ -796,7 +840,7 @@
     if (res.loading) {
       els.rPre.innerHTML = '<span class="jt-p">等待响应…</span>';
     } else if (!res.ok && !res.body) {
-      els.rPre.innerHTML = '<span class="jt-lit">' + esc(res.error || '请求失败') + '</span>';
+      els.rPre.textContent = netErrorText(res);
     } else if (isJsonView) {
       els.rPre.innerHTML = highlightJson(text);
     } else {

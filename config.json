@@ -198,7 +198,7 @@
     {
       "id": "http-ip",
       "name": "查公网 IP",
-      "subtitle": "api.ipify.org · GET 后取 ip 字段",
+      "subtitle": "api64.ipify.org · GET 后取 ip 字段",
       "keywords": [
         "ip",
         "公网",
@@ -208,7 +208,7 @@
       "icon": "",
       "type": "webhook",
       "group": "net",
-      "target": "https://api.ipify.org",
+      "target": "https://api64.ipify.org",
       "method": "GET",
       "query": {
         "format": "json"

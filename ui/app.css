@@ -518,7 +518,7 @@ kbd {
 
 .rurl {
   flex: 0 1 auto;
-  min-width: 0;
+  min-width: 9em;               /* 别让长状态文字把地址压成 "htt..." */
   font-size: 11.5px;
   color: #4b5563;
   overflow: hidden;
@@ -527,12 +527,16 @@ kbd {
 }
 
 .rstat {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 52%;
   font-size: 11px;
   padding: 2px 7px;
   border-radius: 999px;
   border: 1px solid transparent;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rstat.st-ok { color: #067647; background: #ecfdf3; border-color: #bbf0d0; }
 .rstat.st-warn { color: #93370d; background: #fffaeb; border-color: #fde7bf; }
