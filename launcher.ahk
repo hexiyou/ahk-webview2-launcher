@@ -443,7 +443,10 @@ OnWebMessage(sender, args) {
 DoRun(raw) {
     global settings
     try {
-        Launch(JsonStr(raw, 'kind'), JsonStr(raw, 'target'), JsonStr(raw, 'args'), JsonStr(raw, 'workdir'))
+        ; argv 是"本次运行"的参数（app/ahk 用 token 数组，逐个加引号）；
+        ; argvRaw 是用户在参数区敲的原文（cmd 类型直接拼在命令行末尾）
+        Launch(JsonStr(raw, 'kind'), JsonStr(raw, 'target'), JsonStr(raw, 'args')
+            , JsonStr(raw, 'workdir'), JsonStrArray(raw, 'argv'), JsonStr(raw, 'argvRaw'))
         if settings.hideAfterLaunch
             HideLauncher()
     } catch as e {
@@ -451,12 +454,23 @@ DoRun(raw) {
     }
 }
 
-Launch(kind, target, args, workdir) {
+/* 每个 token 单独包一对引号 —— 参数里的空格、中文路径都不会把命令行拆散 */
+QuoteArgv(tokens) {
+    q := Chr(34), bs := Chr(92)
+    s := ''
+    for t in tokens
+        s .= ' ' q StrReplace(t, q, bs q) q
+    return s
+}
+
+Launch(kind, target, args, workdir, argv := [], argvRaw := '') {
     global SCRIPT_DIR
     if (target = '')
         throw Error('目标为空')
     if (workdir = '')
         workdir := SCRIPT_DIR
+
+    extra := (argv.Length ? QuoteArgv(argv) : '')
 
     switch kind {
         case 'url':
@@ -467,9 +481,10 @@ Launch(kind, target, args, workdir) {
             ; target 是"一整条命令行"（如 ipconfig /all），不能当路径改写。
             ; 外面包一层引号并用 /s：cmd 只剥掉首尾两个引号，命令里自带的引号
             ; （带空格的 exe 路径、重定向文件名）能原样保留。
-            Run(A_ComSpec ' /s /k "' target '"', workdir)
+            ; 运行时参数按用户原文追加 —— cmd 自己会解析引号和重定向。
+            Run(A_ComSpec ' /s /k "' target (argvRaw != '' ? ' ' argvRaw : '') '"', workdir)
         case 'ahk':
-            Run('"' A_AhkPath '" "' target '"' (args != '' ? ' ' args : ''), workdir)
+            Run('"' A_AhkPath '" "' target '"' (args != '' ? ' ' args : '') extra, workdir)
         case 'webhook':
             throw Error('webhook 类型由前端直接发请求，不应走到 Launch')
         default:                                  ; app
@@ -483,7 +498,7 @@ Launch(kind, target, args, workdir) {
             ; 带分隔符却找不到 → 真错；裸命令名（notepad.exe）放行，交给 PATH
             if !FileExist(target) && InStr(target, '\')
                 throw Error('文件不存在：' target)
-            Run('"' target '"' (args != '' ? ' ' args : ''), workdir)
+            Run('"' target '"' (args != '' ? ' ' args : '') extra, workdir)
     }
 }
 
@@ -752,7 +767,9 @@ JsonNum(text, key, def := 0) {
 
 JsonStrArray(text, key) {
     out := []
-    if !RegExMatch(text, '"' key '"\s*:\s*\[(.*?)\]', &arr)
+    ; 只认"由字符串元素组成"的数组：老写法 \[(.*?)\] 遇到参数里带 ] 会提前截断
+    if !RegExMatch(text
+        , '"' key '"\s*:\s*\[((?:\s*"(?:\\u[0-9a-fA-F]{4}|\\.|[^"\\])*"\s*,?)*)\s*\]', &arr)
         return out
     pos := 1
     while RegExMatch(arr[1], '"((?:\\u[0-9a-fA-F]{4}|\\.|[^"\\])*)"', &s, pos) {

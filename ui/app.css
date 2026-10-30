@@ -19,6 +19,10 @@
 
 * { box-sizing: border-box; }
 
+/* hidden 属性必须压得住组件自己的 display，否则 .section.grow{display:flex}
+   这类规则会把 hidden 悄悄失效（参数面板和列表就会同时显示） */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -592,3 +596,130 @@ kbd {
 .jt-num { color: #b45309; }
 .jt-lit { color: #1d4ed8; }
 .jt-p { color: #6b7280; }
+
+/* ---------------- 参数态 ---------------- */
+
+/* 搜索框里的「主体」胶囊：进入参数态后，前半截被固化在这里 */
+.subj {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  max-width: 44%;
+  height: 23px;
+  padding: 0 3px 0 9px;
+  border-radius: 999px;
+  background: #e9f9f1;
+  border: 1px solid #bfeeda;
+  color: #08694a;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.subj[hidden] { display: none; }
+.subj > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.subj button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px; height: 15px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #5aa78a;
+  cursor: pointer;
+}
+.subj button:hover { background: #cdeedd; color: #08694a; }
+
+/* 参数面板（占掉列表区） */
+.params {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 4px 6px;
+  overflow: auto;
+}
+.params[hidden] { display: none; }
+
+.phead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px 0;
+}
+.pname { font-size: 13px; font-weight: 600; color: var(--text); }
+.pkind {
+  font-size: 10.5px;
+  padding: 1.5px 6px;
+  border-radius: 5px;
+  background: #f2f4f7;
+  color: #475467;
+  letter-spacing: .2px;
+}
+.pkind-http { background: #ecfdf3; color: #067647; font-weight: 600; }
+
+.ptable { display: flex; flex-direction: column; gap: 4px; }
+
+.pitem {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr) minmax(0, 1.1fr) 36px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+  font-size: 12px;
+}
+.pitem.miss { border-color: #fcd9d6; background: #fffbfa; }
+.pkey {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11.5px;
+  color: #3b5bdb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.plbl { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pval { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pval.ph { color: #a7acb5; }
+.pstate { font-size: 10.5px; color: #98a2b3; text-align: right; }
+.pitem.miss .pstate { color: #b42318; font-weight: 600; }
+
+/* 自由参数（app/cmd 没声明 params）时的说明行 */
+.pfree {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 8px 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+/* 即将执行的命令行 / 请求地址 */
+.pline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f7f9fc;
+  border: 1px dashed var(--line-strong);
+}
+.plabel2 { flex: 0 0 auto; font-size: 11px; color: var(--muted); }
+.pcode {
+  font-family: "Cascadia Mono", "Consolas", "Segoe UI Mono", monospace;
+  font-size: 12px;
+  color: #334155;
+  word-break: break-all;
+  user-select: text;
+}
+.pline.bad { border-color: #fcd9d6; background: #fff7f6; }
+.pline.bad .pcode { color: #b42318; }
+
+.pnote { font-size: 11.5px; color: var(--muted); line-height: 1.6; }

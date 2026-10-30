@@ -266,6 +266,36 @@
       "jsonPath": "json.from",
       "pinned": false,
       "accent": "#f59e0b"
+    },
+    {
+      "id": "http-geo",
+      "name": "查 IP 归属地",
+      "subtitle": "ip-api.com · 空格后可指定别的 IP",
+      "keywords": [
+        "ip",
+        "归属地",
+        "geo",
+        "whois"
+      ],
+      "icon": "",
+      "type": "webhook",
+      "group": "net",
+      "target": "http://ip-api.com/json/{{ip}}",
+      "method": "GET",
+      "query": {
+        "lang": "zh-CN"
+      },
+      "timeout": 10,
+      "params": [
+        {
+          "name": "ip",
+          "label": "目标 IP",
+          "placeholder": "留空查本机",
+          "optional": true
+        }
+      ],
+      "pinned": false,
+      "accent": "#0ea5e9"
     }
   ],
   "groups": [

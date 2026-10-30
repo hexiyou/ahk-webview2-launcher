@@ -55,11 +55,15 @@
     requested: new Set(),
     reqSeq: 0,
     pending: new Map(),
-    result: null
+    result: null,
+    param: null,          /* 参数态：{ item, head }，列表锁定单条 */
+    noSplit: false        /* 刚按 Esc 退出参数态，别立刻又自动进去 */
   };
 
   const $ = id => document.getElementById(id);
   const els = {};
+
+  const PLACEHOLDER = '搜索应用、命令或关键词…（> 命令 · @ 分组）';
 
   /* ---------------------------------------------------------- 工具函数 */
 
@@ -180,6 +184,207 @@
     return list;
   }
 
+  /* ---------------------------------------------------------- 运行时参数
+
+     输入 `vs code src/app.js` 时，前半截是条目、后半截是本次运行的参数。
+     难点在"从哪里切"：条目名自己可能带空格（"VS Code"），所以不能简单取第一个空格。
+     做法是从右往左找「最长的、能唯一命中」的 head ——
+       "vs code src/app.js" → head "vs code"（精确命中），tail "src/app.js"
+       "ip 8.8.8.8"         → head "ip"（精确命中，再往左没有更长的候选）
+  */
+
+  /* 引号感知的 token 切分：`a "b c" d` → ['a', 'b c', 'd'] */
+  function splitQuoted(s) {
+    const out = [];
+    let cur = '', quote = '', started = false;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (quote) {
+        if (c === quote) quote = '';
+        else cur += c;
+      } else if (c === '"' || c === "'") {
+        quote = c;
+        started = true;
+      } else if (/\s/.test(c)) {
+        if (started || cur) out.push(cur);
+        cur = '';
+        started = false;
+      } else {
+        cur += c;
+        started = true;
+      }
+    }
+    if (started || cur) out.push(cur);
+    return out.filter(x => x !== '');
+  }
+
+  /* 谁接受运行时参数：动作型条目；webhook 还要显式声明 params（否则不知道该往哪填） */
+  function takesArgs(item) {
+    if (!item) return false;
+    if (item.type === 'app' || item.type === 'cmd' || item.type === 'ahk') return true;
+    if (item.type === 'webhook') return (item.params || []).length > 0;
+    return false;                       /* folder / url 不参与，避免误判 */
+  }
+
+  /* head 是否唯一确定一个条目。只认「精确」和「词边界上的唯一前缀」。
+     词边界这条很关键：否则 "查看 ip" 会被「查看本机 IP」的前缀吃掉 ——
+     "查看" 后面是 "本"，不算词边界，所以不分裂，正常走搜索。 */
+  function uniqueMatch(head, pool) {
+    const h = String(head || '').toLowerCase();
+    if (!h) return null;
+    const cand = (pool || []).filter(takesArgs);
+
+    const exact = cand.filter(it =>
+      (it.name || '').toLowerCase() === h || String(it.id || '').toLowerCase() === h);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) return null;          /* 同名歧义：不分裂，交回普通搜索 */
+
+    const kw = cand.filter(it => (it.keywords || []).some(k => String(k).toLowerCase() === h));
+    if (kw.length === 1) return kw[0];
+    if (kw.length > 1) return null;
+
+    const pre = cand.filter(it => {
+      const n = (it.name || '').toLowerCase();
+      if (n === h || !n.startsWith(h)) return false;
+      const next = n.charAt(h.length);
+      return next === '' || /[\s\-_/(.]/.test(next);   /* "VS Code" 打 "vs " ✓ */
+    });
+    if (pre.length === 1) return pre[0];
+    return null;
+  }
+
+  function splitArgs(raw) {
+    const s = String(raw || '');
+    if (!s.trim()) return null;
+    const gaps = [];
+    for (let i = 0; i < s.length; i++) if (/\s/.test(s[i])) gaps.push(i);
+
+    for (let i = gaps.length - 1; i >= 0; i--) {
+      const head = s.slice(0, gaps[i]);
+      const tail = s.slice(gaps[i] + 1);
+      const hq = parseQuery(head);
+      if (!hq.term) continue;
+      const pool = sourceFor(hq.scope, findGroup(hq.groupId));
+      const item = uniqueMatch(hq.term, pool);
+      if (item) return { item: item, head: head, tail: tail };
+    }
+    return null;
+  }
+
+  /* 声明的参数 → 实际取值；没给又没默认值的进 missing */
+  function resolveParamValues(item, values) {
+    const decl = item.params || [];
+    const args = {}, missing = [];
+    decl.forEach(p => {
+      const k = p.name;
+      const v = values ? values[k] : '';
+      if (v != null && v !== '') { args[k] = String(v); return; }
+      if (p.default != null && p.default !== '') { args[k] = String(p.default); return; }
+      args[k] = '';
+      if (!p.optional) missing.push(k);
+    });
+    return { args: args, missing: missing };
+  }
+
+  /* 把参数区的 token 分配到声明的参数上：位置式为主，含 name= 的视为命名式 */
+  function assignTokens(item, tail) {
+    const decl = item.params || [];
+    const tokens = splitQuoted(tail);
+    const values = {};
+    const byName = {};
+    decl.forEach(p => { byName[String(p.name).toLowerCase()] = p.name; });
+
+    let cursor = 0;
+    let extra = 0;
+    tokens.forEach(t => {
+      const eq = t.indexOf('=');
+      if (eq > 0) {
+        const k = t.slice(0, eq).toLowerCase();
+        if (byName[k]) { values[byName[k]] = t.slice(eq + 1); return; }
+      }
+      while (cursor < decl.length && values[decl[cursor].name] != null) cursor++;
+      if (cursor < decl.length) {
+        values[decl[cursor].name] = t;
+        cursor++;
+      } else {
+        extra++;
+      }
+    });
+    return { values: values, extra: extra, tokens: tokens };
+  }
+
+  const TPL_RE = /\{\{\s*([\w.-]+)\s*\}\}/g;
+
+  function fillTemplate(v, args) {
+    if (typeof v === 'string')
+      return v.replace(TPL_RE, (m, k) => (args[k] == null ? '' : String(args[k])));
+    if (Array.isArray(v)) return v.map(x => fillTemplate(x, args));
+    if (v && typeof v === 'object') {
+      const o = {};
+      Object.keys(v).forEach(k => { o[k] = fillTemplate(v[k], args); });
+      return o;
+    }
+    return v;
+  }
+
+  /* query 里"纯模板且替换为空"的键直接丢掉，避免拼出 ?lang= 这种空参 */
+  function fillQuery(q, args) {
+    if (Array.isArray(q)) return q.map(x => fillTemplate(x, args)).filter(x => x !== '');
+    if (q && typeof q === 'object') {
+      const o = {};
+      Object.keys(q).forEach(k => {
+        const src = q[k];
+        const v = fillTemplate(src, args);
+        if (v === '' && typeof src === 'string' && /^\s*\{\{[\w.-]+\}\}\s*$/.test(src)) return;
+        o[k] = v;
+      });
+      return o;
+    }
+    return q;
+  }
+
+  /* 把参数灌进条目，返回一个"本次请求专用"的副本 */
+  function withArgs(item, values) {
+    if (!(item.params || []).length) return { item: item, missing: [], args: {} };
+    const r = resolveParamValues(item, values);
+    return {
+      args: r.args,
+      missing: r.missing,
+      item: Object.assign({}, item, {
+        target: fillTemplate(item.target, r.args),
+        query: fillQuery(item.query, r.args),
+        headers: fillTemplate(item.headers, r.args),
+        body: fillTemplate(item.body, r.args)
+      })
+    };
+  }
+
+  /* 参数历史：每条目最近 5 次，存在 localStorage */
+  const HIST_KEY = 'ql.args';
+
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(HIST_KEY);
+      const o = raw ? JSON.parse(raw) : null;
+      return (o && typeof o === 'object') ? o : {};
+    } catch (e) { return {}; }
+  }
+
+  function historyOf(id) {
+    const all = loadHistory();
+    return Array.isArray(all[id]) ? all[id] : [];
+  }
+
+  function pushHistory(id, tail) {
+    const s = String(tail || '').trim();
+    if (!s) return;
+    const all = loadHistory();
+    const list = (Array.isArray(all[id]) ? all[id] : []).filter(x => x !== s);
+    list.unshift(s);
+    all[id] = list.slice(0, 5);
+    try { localStorage.setItem(HIST_KEY, JSON.stringify(all)); } catch (e) {}
+  }
+
   /* ---------------------------------------------------------- 桥接 */
 
   function post(msg) {
@@ -224,7 +429,15 @@
       query: it.query || null,
       body: it.body,
       timeout: Number(it.timeout) > 0 ? Math.min(Number(it.timeout), 120) : 15,
-      jsonPath: it.jsonPath || it.jsonpath || ''
+      jsonPath: it.jsonPath || it.jsonpath || '',
+      /* 运行时参数声明（webhook 的模板变量，app/cmd 可省略） */
+      params: Array.isArray(it.params) ? it.params.filter(p => p && p.name).map(p => ({
+        name: String(p.name),
+        label: p.label || '',
+        placeholder: p.placeholder || '',
+        default: p.default == null ? '' : String(p.default),
+        optional: p.optional === true && p.required !== true
+      })) : []
     };
   }
 
@@ -246,6 +459,11 @@
     state.pinned = state.all.filter(x => x.pinned);
     if (!state.pinned.length) state.pinned = state.all.slice(0, 5);
     state.sel = 0;
+    state.param = null;
+    state.noSplit = false;
+    state.histIdx = null;
+    if (els.subjChip) els.subjChip.hidden = true;
+    if (els.q) els.q.placeholder = PLACEHOLDER;
     state.requested.clear();
     state.iconMap = {};
     state.result = null;
@@ -335,7 +553,7 @@
 
   /* ---------------------------------------------------------- 匹配 */
 
-  function scoreOf(item, q) {
+  function scoreOne(item, q) {
     const name = (item.name || '').toLowerCase();
     if (name === q) return 100;
     if (name.startsWith(q)) return 80;
@@ -345,6 +563,23 @@
       .join(' ').toLowerCase();
     if (hay.includes(q)) return 30;
     return 0;
+  }
+
+  /* 多词按 AND 匹配：搜「查看 ip」也能命中「查看本机 IP」。
+     没这条的话，带空格的输入既不会进参数态（词边界规则挡住了），
+     又搜不到东西，等于死路。 */
+  function scoreOf(item, q) {
+    const terms = String(q == null ? '' : q).trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!terms.length) return 0;
+    if (terms.length === 1) return scoreOne(item, terms[0]);
+
+    let sum = 0;
+    for (let i = 0; i < terms.length; i++) {
+      const s = scoreOne(item, terms[i]);
+      if (!s) return 0;
+      sum += s;
+    }
+    return Math.round(sum / terms.length);
   }
 
   /* ---------------------------------------------------------- 渲染 */
@@ -363,6 +598,29 @@
     state.groupId = group ? group.id : null;
     state.term = term;
 
+    /* 出现空格、且前半截唯一命中一个「能吃参数」的条目 → 进参数态。
+       state.param 一旦置上就锁定，后续输入全部算参数。 */
+    if (!state.param && !state.noSplit) {
+      const sp = splitArgs(state.q);
+      if (sp) {
+        state.param = { item: sp.item, head: sp.head };
+        state.sel = 0;
+        setInputTail(sp.tail);
+      }
+    }
+
+    if (state.param) {
+      state.results = [state.param.item];
+      renderParamMode();
+      return;
+    }
+
+    els.paramSection.hidden = true;
+    els.listSection.hidden = false;
+    renderNormal(scope, group, term);
+  }
+
+  function renderNormal(scope, group, term) {
     const base = sourceFor(scope, group);
     const q = term.toLowerCase();
 
@@ -395,6 +653,186 @@
     els.listCount.textContent = state.results.length + ' 项';
 
     renderList();
+    updateHint();
+  }
+
+  /* ---------------------------------------------------------- 参数态渲染 */
+
+  /* Windows 命令行里给单个 token 加引号（app / ahk 用；cmd 类型不加，原样拼） */
+  function quoteWin(s) {
+    return '"' + String(s == null ? '' : s).replace(/"/g, '\\"') + '"';
+  }
+
+  function baseName(p) {
+    const s = String(p || '');
+    const i = s.lastIndexOf('\\');
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  /* 参数态：输入框只放参数，主体变成左侧的 chip */
+  function setInputTail(tail) {
+    const item = state.param ? state.param.item : null;
+    els.subjChip.hidden = false;
+    els.subjName.textContent = item ? item.name : '';
+    els.q.value = tail;
+    els.q.placeholder = tailPlaceholder(item);
+    try { els.q.setSelectionRange(tail.length, tail.length); } catch (e) {}
+  }
+
+  function tailPlaceholder(item) {
+    const decl = (item && item.params) || [];
+    if (!decl.length) return '参数，可留空';
+    return '参数：' + decl.map(p => p.name).join(' ');
+  }
+
+  function setTail(v) {
+    if (!state.param) return;
+    els.q.value = v;
+    state.q = state.param.head + ' ' + v;
+    try { els.q.setSelectionRange(v.length, v.length); } catch (e) {}
+    render();
+  }
+
+  /* 退出参数态：输入回到主体本身。
+     为什么连参数一起丢掉：保留成 "记事本 x.txt" 的话，列表会按整串去搜，
+     反而搜不到东西（实测 rows=0），而用户此刻想看的是主体还在不在。
+     参数本身进了历史，重新打空格进参数态按 ↑ 就能取回。 */
+  function exitParam() {
+    if (!state.param) return;
+    const head = state.param.head;
+    state.param = null;
+    state.noSplit = true;                 /* 否则 render 立刻又把它分回去 */
+    state.histIdx = null;
+    els.subjChip.hidden = true;
+    els.q.placeholder = PLACEHOLDER;
+    els.q.value = head;
+    state.q = head;
+    try { els.q.setSelectionRange(head.length, head.length); } catch (e) {}
+    render();
+    els.q.focus();
+  }
+
+  function paramHistory(dir) {
+    if (!state.param) return false;
+    const list = historyOf(state.param.item.id);
+    if (!list.length) return false;
+    if (dir < 0 && els.q.value.trim() !== '') return false;   /* 有内容时别覆盖 */
+    if (state.histIdx == null) state.histIdx = -1;
+    state.histIdx += (dir < 0 ? 1 : -1);
+    if (state.histIdx >= list.length) state.histIdx = 0;
+    if (state.histIdx < 0) { state.histIdx = -1; setTail(''); return true; }
+    setTail(list[state.histIdx]);
+    return true;
+  }
+
+  function updateHint() {
+    if (!els.hintArgs) return;
+    const it = state.results[state.sel];
+    els.hintArgs.hidden = !!(state.param || !it || !takesArgs(it));
+  }
+
+  function renderParamMode() {
+    const item = state.param.item;
+    els.pinnedSection.hidden = true;
+    els.listSection.hidden = true;
+    els.paramSection.hidden = false;
+    els.chips.hidden = true;
+    renderScopeTag();
+
+    els.subjChip.hidden = false;
+    els.subjName.textContent = item.name;
+    els.paramName.textContent = item.name;
+    els.paramKind.textContent = kindLabel(item);
+    els.paramKind.className = 'pkind' + (item.type === 'webhook' ? ' pkind-http' : '');
+
+    const decl = item.params || [];
+    const tail = els.q.value;
+    const table = els.paramTable;
+    table.innerHTML = '';
+
+    const assigned = decl.length ? assignTokens(item, tail) : { values: {}, extra: 0 };
+    const w = withArgs(item, assigned.values);
+    const applied = w.item;
+    const missing = w.missing;
+    const resolved = resolveParamValues(item, assigned.values);
+
+    if (decl.length) {
+      decl.forEach(p => {
+        const given = assigned.values[p.name];
+        const has = given != null && given !== '';
+        const val = has ? given : (resolved.args[p.name] || '');
+
+        const row = document.createElement('div');
+        row.className = 'pitem' + (missing.indexOf(p.name) >= 0 ? ' miss' : '');
+
+        const key = document.createElement('span');
+        key.className = 'pkey';
+        key.textContent = p.name;
+
+        const lbl = document.createElement('span');
+        lbl.className = 'plbl';
+        lbl.textContent = p.label || '';
+
+        const v = document.createElement('span');
+        v.className = 'pval' + (val ? '' : ' ph');
+        v.textContent = val || (p.placeholder || (p.optional ? '可留空' : '必填'));
+
+        const st = document.createElement('span');
+        st.className = 'pstate';
+        st.textContent = has ? '' : (val ? '默认' : (p.optional ? '可选' : '缺'));
+
+        row.appendChild(key);
+        row.appendChild(lbl);
+        row.appendChild(v);
+        row.appendChild(st);
+        table.appendChild(row);
+      });
+    } else {
+      const hint = document.createElement('div');
+      hint.className = 'pfree';
+      hint.textContent = item.type === 'cmd'
+        ? '整段内容会原样追加到命令行末尾，引号和重定向都交给 cmd 解析'
+        : '按空格分开的每个参数会各自加引号，再追加到程序后面';
+      table.appendChild(hint);
+    }
+
+    /* 预览：把拼接结果直接摆出来，最省心的验证方式 */
+    let head = '将执行';
+    let preview = '';
+    const toks = splitQuoted(tail);
+
+    if (item.type === 'webhook') {
+      head = '将请求';
+      preview = (item.method || 'GET') + ' ' + buildUrl(applied);
+    } else if (item.type === 'cmd') {
+      const extra = tail.trim();
+      preview = applied.target + (extra ? ' ' + extra : '');
+    } else if (item.type === 'ahk') {
+      preview = 'AutoHotkey64.exe ' + quoteWin(baseName(applied.target)) +
+        (applied.args ? ' ' + applied.args : '') +
+        (toks.length ? ' ' + toks.map(quoteWin).join(' ') : '');
+    } else {
+      preview = baseName(applied.target) +
+        (applied.args ? ' ' + applied.args : '') +
+        (toks.length ? ' ' + toks.map(quoteWin).join(' ') : '');
+    }
+
+    els.paramPreviewLabel.textContent = head;
+    els.paramPreview.textContent = preview || '（空）';
+    els.paramLine.classList.toggle('bad', missing.length > 0);
+
+    const bits = [];
+    if (missing.length) bits.push('还缺：' + missing.join('、'));
+    if (assigned.extra) bits.push(assigned.extra + ' 个多余参数会被忽略');
+    if (!decl.length) bits.push('空格分隔多个参数，含空格用引号');
+    if (!tail.trim()) {
+      const hist = historyOf(item.id);
+      if (hist.length) bits.push('↑ 上次：' + hist[0]);
+    }
+    bits.push('Enter 运行 · Esc 退出参数');
+    els.paramNote.textContent = bits.join(' · ');
+
+    updateHint();
   }
 
   function renderChips() {
@@ -436,6 +874,11 @@
   }
 
   function setQuery(s) {
+    state.param = null;
+    state.noSplit = false;
+    state.histIdx = null;
+    if (els.subjChip) els.subjChip.hidden = true;
+    if (els.q) els.q.placeholder = PLACEHOLDER;
     els.q.value = s;
     state.q = s;
     state.sel = 0;
@@ -510,7 +953,7 @@
       ent.textContent = '⏎';
       row.appendChild(ent);
 
-      row.addEventListener('click', () => { state.sel = idx; launch(item); });
+      row.addEventListener('click', () => { state.sel = idx; doLaunch(); });
       row.addEventListener('mouseenter', () => { state.sel = idx; highlight(); });
       frag.appendChild(row);
     });
@@ -537,12 +980,23 @@
 
   /* ---------------------------------------------------------- 动作 */
 
-  function launch(item) {
-    if (!item) return;
+  function launch(item, tail) {
+    if (!item) return false;
+    const raw = tail == null ? '' : String(tail);
+
     if (item.type === 'webhook') {
-      runWebhook(item);
-      return;
+      const assigned = assignTokens(item, raw);
+      const w = withArgs(item, assigned.values);
+      if (w.missing.length) {
+        /* 点了没填参数的必填条目：别直接报错，把人送进参数态 */
+        if (!raw.trim()) { enterParamFor(item); return false; }
+        toast('还缺参数：' + w.missing.join('、'));
+        return false;
+      }
+      runWebhook(w.item, raw);
+      return true;
     }
+
     post({
       type: 'run',
       id: item.id,
@@ -550,8 +1004,31 @@
       kind: item.type,
       target: item.target,
       args: item.args,
-      workdir: item.workdir
+      workdir: item.workdir,
+      argv: splitQuoted(raw),
+      /* cmd 类型要的是原文（引号、重定向都交给 cmd 自己解释） */
+      argvRaw: item.type === 'cmd' ? raw.trim() : ''
     });
+    return true;
+  }
+
+  /* 直接进入某条目的参数态：等价于替用户敲了「名字 + 空格」 */
+  function enterParamFor(item) {
+    setQuery(item.name + ' ');
+  }
+
+  /* Enter：参数态就带上参数，否则按老行为 */
+  function doLaunch() {
+    const item = state.results[state.sel];
+    if (!item) return;
+    const tail = state.param ? els.q.value : '';
+    if (state.param) pushHistory(item.id, tail);
+
+    const ok = launch(item, tail);
+    /* 参数态启动成功就把输入清干净：否则下次唤出还停在参数态，
+       新输入会被拼到旧主体后面（实测踩过）。
+       非参数态的启动保持原行为（窗口隐藏，查询留着）。 */
+    if (ok && state.param && item.type !== 'webhook') setQuery('');
   }
 
   /* ---------------------------------------------------------- Webhook */
@@ -900,6 +1377,18 @@
   function bind() {
     els.q = $('q');
     els.list = $('list');
+    els.listSection = $('listSection');
+    els.subjChip = $('subjChip');
+    els.subjName = $('subjName');
+    els.paramSection = $('paramSection');
+    els.paramName = $('paramName');
+    els.paramKind = $('paramKind');
+    els.paramTable = $('paramTable');
+    els.paramNote = $('paramNote');
+    els.paramLine = $('paramLine');
+    els.paramPreviewLabel = $('paramPreviewLabel');
+    els.paramPreview = $('paramPreview');
+    els.hintArgs = $('hintArgs');
     els.pinned = $('pinned');
     els.pinnedSection = $('pinnedSection');
     els.pinnedHint = $('pinnedHint');
@@ -920,18 +1409,38 @@
     els.rToggle = $('rToggle');
 
     els.q.addEventListener('input', () => {
-      state.q = els.q.value;
+      state.noSplit = false;
+      state.histIdx = null;
       state.sel = 0;
+      /* 参数态：输入框里只有参数，主体在 chip 上 */
+      state.q = state.param ? (state.param.head + ' ' + els.q.value) : els.q.value;
       render();
     });
 
     els.q.addEventListener('keydown', e => {
-      if (e.key === 'ArrowDown') { e.preventDefault(); moveSel(1); }
-      else if (e.key === 'ArrowUp') { e.preventDefault(); moveSel(-1); }
-      else if (e.key === 'Enter') { e.preventDefault(); launch(state.results[state.sel]); }
-      else if (e.key === 'Tab') { e.preventDefault(); toggleCmd(); }
-      else if (e.key === 'Escape') { e.preventDefault(); onEscape(); }
-      else if (e.key === 'k' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); els.q.select(); }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (!paramHistory(1)) moveSel(1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (!paramHistory(-1)) moveSel(-1);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        doLaunch();
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        /* 参数态下 Tab 只补一个分隔空格，不去切命令模式（免得误触） */
+        if (state.param) setTail(els.q.value + ' ');
+        else toggleCmd();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        onEscape();
+      } else if (e.key === 'Backspace' && state.param && els.q.value === '') {
+        e.preventDefault();
+        exitParam();
+      } else if (e.key === 'k' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault(); els.q.select();
+      }
     });
 
     document.addEventListener('keydown', e => {
@@ -940,6 +1449,7 @@
 
     /* 作用域胶囊：点一下清掉前缀，退回上层的搜索词 */
     $('scopeClear').addEventListener('click', () => setQuery(state.term || ''));
+    $('subjClear').addEventListener('click', () => exitParam());
     $('rClose').addEventListener('click', closeResult);
     $('rCopy').addEventListener('click', copyResult);
     els.rToggle.addEventListener('click', () => {
@@ -1003,6 +1513,7 @@
   /* Esc 分层退：结果面板 -> 查询串 -> 隐藏窗口 */
   function onEscape() {
     if (state.result) { closeResult(); return; }
+    if (state.param) { exitParam(); return; }
     if (state.q) { setQuery(''); return; }
     post({ type: 'hide' });
   }
