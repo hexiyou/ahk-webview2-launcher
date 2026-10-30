@@ -21,6 +21,7 @@
 global SCRIPT_DIR := A_ScriptDir
 global INI_PATH   := SCRIPT_DIR '\launcher.ini'
 global CFG_PATH   := SCRIPT_DIR '\config.json'
+global USAGE_PATH := SCRIPT_DIR '\usage.json'
 global UI_PATH    := SCRIPT_DIR '\ui\index.html'
 global DLL_PATH   := SCRIPT_DIR '\lib\WebView2Loader.dll'
 global DATA_DIR   := SCRIPT_DIR '\.webview2'
@@ -219,6 +220,7 @@ InjectBootstrap() {
     ; 使用「文档创建时执行」的脚本，先于页面自身 JS 运行
     global wv, SCRIPT_DIR, settings, ncDrag
     script := 'window.__BOOTSTRAP__={config:' ReadConfigText()
+    script .= ',usage:' ReadUsageText()
     script .= ',scriptDir:' JsonQuote(SCRIPT_DIR)
     script .= ',appName:' JsonQuote('QuickLaunch')
     script .= ',nativeDrag:' (ncDrag ? '1' : '0')
@@ -237,6 +239,90 @@ ReadConfigText() {
     if (t = '' || !RegExMatch(t, '^[\{\[]'))
         return '{"items":[]}'
     return t
+}
+
+; 使用记录：页面要的就是一份 JSON 对象，直接原文塞进 bootstrap，
+; 读不出来就给空对象（首次运行 / 文件被手改坏都不该让界面白屏）
+ReadUsageText() {
+    global USAGE_PATH
+    if !FileExist(USAGE_PATH)
+        return '{}'
+    try t := FileRead(USAGE_PATH, 'UTF-8')
+    catch
+        return '{}'
+    t := Trim(t, ' `t`r`n')
+    ; 防御 BOM：某些编辑器/旧版本写出来的首字符是 U+FEFF，不剥掉就会判定成"不是 JSON 对象"
+    if (SubStr(t, 1, 1) = Chr(0xFEFF))
+        t := SubStr(t, 2)
+    if (t = '' || SubStr(t, 1, 1) != '{' || StrLen(t) > 200000)
+        return '{}'
+    return t
+}
+
+; 前端把整份记录序列化好发过来，这里只做长度/前缀校验后落盘。
+; 先写 .tmp 再改名：中途断电也不会留下半截 JSON（加载时会当成空记录）。
+SaveUsage(raw) {
+    global USAGE_PATH
+    text := JsonStr(raw, 'json')
+    if (text = '' || SubStr(Trim(text, ' `t`r`n'), 1, 1) != '{' || StrLen(text) > 200000)
+        return
+    tmp := USAGE_PATH '.tmp'
+    try {
+        ; UTF-8-RAW：不带 BOM。带 BOM 的话读回来首字符不是 '{'，
+        ; 会被 ReadUsageText 当成坏文件 → 使用历史每次重启都清零（踩过）
+        f := FileOpen(tmp, 'w', 'UTF-8-RAW')
+        if !IsObject(f)
+            return
+        f.Write(text)
+        f.Close()
+        FileMove(tmp, USAGE_PATH, 1)
+    }
+}
+
+; ============================================================================
+;  目录补全：Tab 补路径时由前端按需查询
+;  只回名字不拼路径（拼路径的规则在前端，避免两边各算一套）
+; ============================================================================
+
+DoFs(raw) {
+    global SCRIPT_DIR
+    id := JsonStr(raw, 'id')
+    if (id = '')
+        return
+
+    d := JsonStr(raw, 'dir')
+    if (d = '')
+        d := SCRIPT_DIR
+    ; 根目录（C:\）不能把反斜杠削掉，否则 "C:" 变成"该盘的当前目录"
+    if (SubStr(d, -1) != ':\')
+        d := RTrim(d, '\ /')
+
+    if (d = '' || !DirExist(d)) {
+        JsSend('{"type":"fs-result","id":' JsonQuote(id) ',"ok":0,"dir":' JsonQuote(d)
+            . ',"err":' JsonQuote('目录不存在：' d) ',"entries":[]}')
+        return
+    }
+
+    dirs := '', files := '', nd := 0, nf := 0
+    pat := (SubStr(d, -1) = '\') ? d '*' : d '\*'
+    Loop Files, pat, 'FD' {
+        nm := A_LoopFileName
+        isDir := InStr(A_LoopFileAttrib, 'D') ? 1 : 0
+        if (isDir) {
+            if (nd >= 80)
+                continue
+            dirs .= (nd ? ',' : '') '{"n":' JsonQuote(nm) ',"d":1}'
+            nd++
+        } else {
+            if (nf >= 40)
+                continue
+            files .= (nf ? ',' : '') '{"n":' JsonQuote(nm) ',"d":0}'
+            nf++
+        }
+    }
+    all := (nd && nf) ? dirs ',' files : dirs files
+    JsSend('{"type":"fs-result","id":' JsonQuote(id) ',"ok":1,"dir":' JsonQuote(d)
+        . ',"err":"","entries":[' all ']}')
 }
 
 ShowLauncher() {
@@ -435,6 +521,10 @@ OnWebMessage(sender, args) {
             OpenConfig()
         case 'icons':
             DoIcons(raw)
+        case 'usage-save':
+            SaveUsage(raw)
+        case 'fs':
+            DoFs(raw)
         case 'log':
             FileAppend(JsonStr(raw, 'text') '`n', SCRIPT_DIR '\launcher.log', 'UTF-8')
     }

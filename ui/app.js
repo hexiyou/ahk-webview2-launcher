@@ -1,6 +1,6 @@
 /* ============================================================
    QuickLaunch 前端逻辑
-   - 数据源：window.__BOOTSTRAP__（由 AHK 在文档创建时注入 config.json 原文）
+   - 数据源：window.__BOOTSTRAP__（由 AHK 在文档创建时注入 config.json / usage.json 原文）
    - 与 AHK 通信：chrome.webview.postMessage / window.chrome.webview.addEventListener
    - 直接在浏览器打开时进入「预览模式」，用内置示例数据渲染
 
@@ -9,6 +9,12 @@
      @net       只看 net 分组；term 为空 = 列出整组（就是二级菜单）
      @net>ip    分组 + 命令模式
      其它       全量搜索
+
+   搜索（见「匹配」段）：名字/拼音全拼/拼音首字母/关键词/副标题/target/args 逐字段打分，
+   档位硬边界（全等 100 > 前缀 92 > 子串 ≤83 > 跳字模糊 ≤66），再乘一个 ≤8% 的使用频率加成。
+
+   参数态（见「运行时参数」段）：名字后打空格进入，输入全归参数；
+   `↑` 历史、`→` 前缀补全、`Tab` 目录补全（目录由 AHK 读，见 fsList）。
    ============================================================ */
 (function () {
   'use strict';
@@ -57,7 +63,9 @@
     pending: new Map(),
     result: null,
     param: null,          /* 参数态：{ item, head }，列表锁定单条 */
-    noSplit: false        /* 刚按 Esc 退出参数态，别立刻又自动进去 */
+    noSplit: false,       /* 刚按 Esc 退出参数态，别立刻又自动进去 */
+    usage: {},            /* 使用记录：id -> { n 次数, t 上次时间戳(秒), args 参数历史 } */
+    index: {}             /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
   };
 
   const $ = id => document.getElementById(id);
@@ -359,30 +367,107 @@
     };
   }
 
-  /* 参数历史：每条目最近 5 次，存在 localStorage */
-  const HIST_KEY = 'ql.args';
+  /* ---------------------------------------------------------- 使用记录
 
-  function loadHistory() {
-    try {
-      const raw = localStorage.getItem(HIST_KEY);
-      const o = raw ? JSON.parse(raw) : null;
-      return (o && typeof o === 'object') ? o : {};
-    } catch (e) { return {}; }
+     统一记在一份 usage.json 里（由 AHK 落盘，跟着脚本目录走）：
+       { "notepad": { "n": 12, "t": 1761830000, "args": ["a.txt", "b.txt"] } }
+       n = 启动次数，t = 上次使用时间（秒），args = 最近 5 次参数原文。
+
+     为什么不只用 localStorage：WebView2 的 profile 在 .webview2 目录里，
+     清一次缓存或换台机器就没了；写成脚本旁边的 JSON 能跟 config.json 一起备份，
+     也方便用户自己看/改。用浏览器直接打开（没有桥接）时才退回 localStorage。 */
+
+  const USAGE_KEY = 'ql.usage';
+  const LEGACY_HIST_KEY = 'ql.args';
+  let saveTimer = 0;
+
+  function usageRec(id) {
+    const u = state.usage[id];
+    return (u && typeof u === 'object') ? u : null;
+  }
+
+  function usageCount(id) {
+    const u = usageRec(id);
+    return u ? (Number(u.n) || 0) : 0;
   }
 
   function historyOf(id) {
-    const all = loadHistory();
-    return Array.isArray(all[id]) ? all[id] : [];
+    const u = usageRec(id);
+    return (u && Array.isArray(u.args)) ? u.args : [];
   }
 
   function pushHistory(id, tail) {
     const s = String(tail || '').trim();
     if (!s) return;
-    const all = loadHistory();
-    const list = (Array.isArray(all[id]) ? all[id] : []).filter(x => x !== s);
+    const u = state.usage[id] || (state.usage[id] = { n: 0, t: 0, args: [] });
+    const list = (Array.isArray(u.args) ? u.args : []).filter(x => x !== s);
     list.unshift(s);
-    all[id] = list.slice(0, 5);
-    try { localStorage.setItem(HIST_KEY, JSON.stringify(all)); } catch (e) {}
+    u.args = list.slice(0, 5);
+    saveUsage();
+  }
+
+  function bumpUsage(item) {
+    if (!item || !item.id) return;
+    const u = state.usage[item.id] || (state.usage[item.id] = { n: 0, t: 0, args: [] });
+    u.n = (Number(u.n) || 0) + 1;
+    u.t = Math.floor(Date.now() / 1000);
+    saveUsage();
+  }
+
+  /* 频率 → 加成百分比。次数越多越高，长期不用会慢慢沉下去（约两周减半）。
+     上限压到 8%：分数档位是 100/92/≤83/≤66，8% 只够在同一档里排序，
+     不足以让「前缀命中 92」翻过「名字全等 100」，等级感不会被使用习惯冲垮。 */
+  function usageBoost(id) {
+    const n = usageCount(id);
+    if (n <= 0) return 0;
+    const u = usageRec(id);
+    const t = Number(u && u.t) || 0;
+    const days = t ? Math.max(0, Date.now() / 1000 - t) / 86400 : 0;
+    const decay = 1 / (1 + Math.log2(1 + days / 7));
+    return Math.min(8, Math.log2(1 + n) * 2.2) * decay;
+  }
+
+  function saveUsage() {
+    const text = JSON.stringify(state.usage);
+    try { localStorage.setItem(USAGE_KEY, text); } catch (e) {}
+    if (!HAS_BRIDGE) return;                 /* 预览模式没有接收方，别弹 toast */
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => post({ type: 'usage-save', json: text }), 400);
+  }
+
+  function loadUsage() {
+    let u = {};
+    const fromBoot = boot && boot.usage;
+    if (fromBoot && typeof fromBoot === 'object') {
+      u = fromBoot;
+    } else {
+      try {
+        const raw = localStorage.getItem(USAGE_KEY);
+        if (raw) {
+          const o = JSON.parse(raw);
+          if (o && typeof o === 'object') u = o;
+        }
+      } catch (e) {}
+    }
+
+    /* 老版本把参数历史单独存在 ql.args，搬进来后删掉，免得两处打架 */
+    try {
+      const old = localStorage.getItem(LEGACY_HIST_KEY);
+      if (old) {
+        const o = JSON.parse(old) || {};
+        Object.keys(o).forEach(id => {
+          const rec = u[id] || (u[id] = { n: 0, t: 0, args: [] });
+          const merged = (Array.isArray(rec.args) ? rec.args : []).slice();
+          (Array.isArray(o[id]) ? o[id] : []).forEach(x => {
+            if (merged.indexOf(x) < 0) merged.push(x);
+          });
+          rec.args = merged.slice(0, 5);
+        });
+        localStorage.removeItem(LEGACY_HIST_KEY);
+      }
+    } catch (e) {}
+
+    return u;
   }
 
   /* ---------------------------------------------------------- 桥接 */
@@ -436,7 +521,9 @@
         label: p.label || '',
         placeholder: p.placeholder || '',
         default: p.default == null ? '' : String(p.default),
-        optional: p.optional === true && p.required !== true
+        optional: p.optional === true && p.required !== true,
+        /* 可选：path / dir / file —— 声明后 Tab 一定按目录补全，webhook 参数也能用 */
+        type: p.type ? String(p.type) : ''
       })) : []
     };
   }
@@ -466,6 +553,7 @@
     if (els.q) els.q.placeholder = PLACEHOLDER;
     state.requested.clear();
     state.iconMap = {};
+    state.index = {};                     /* 条目内容可能变了，拼音索引一起作废 */
     state.result = null;
     state.pending.clear();
     if (els.result) els.result.hidden = true;
@@ -551,18 +639,117 @@
     return el;
   }
 
-  /* ---------------------------------------------------------- 匹配 */
+  /* ---------------------------------------------------------- 匹配
+
+     每条目预算一组「待匹配字段」，各自有权重，搜索结果 = 各字段里的最高分：
+       name 100 · 全拼 97 · 拼音首字母 93 · keywords 85 · 关键词拼音 80/76
+       副标题 62 · target 58 · args 50
+
+     拼音是压在名字旁边的，不用往 keywords 里手工堆拼音：
+       "jishiben" / "jsb" → 记事本，  "cgw" → 查公网 IP
+
+     加分规则（fieldQuality）：全等 1.0 > 前缀 0.92 > 子串 0.70~0.83 > 模糊子序列 ≤0.66。
+     「真子串」永远压着「跳着命中」，否则 fzf 式的松散匹配会把精确结果挤下去。 */
+
+  const PY = window.__PY__ || null;
+
+  function pyCall(fn, s) {
+    if (!PY || !fn || !s) return '';
+    try { return fn(s); } catch (e) { return ''; }
+  }
+
+  function isBoundaryAt(s, i) {
+    if (i <= 0) return true;
+    return /[\s\-_/.\\\n]/.test(s.charAt(i - 1));
+  }
+
+  /* fzf 风格子序列打分：贪婪前向匹配，按「密度 + 词边界 + 是否从头开始」给分 */
+  function subseqQuality(hay, needle) {
+    const n = hay.length, m = needle.length;
+    if (m < 2 || m > n) return 0;
+
+    let pos = -1, first = -1, last = -1, bnd = 0;
+    for (let i = 0; i < m; i++) {
+      const j = hay.indexOf(needle.charAt(i), pos + 1);
+      if (j < 0) return 0;                   /* 有一个字符找不到 → 整条不命中 */
+      if (first < 0) first = j;
+      if (isBoundaryAt(hay, j)) bnd++;
+      pos = j;
+      last = j;
+    }
+
+    const density = m / (last - first + 1);
+    let q = 0.26 + 0.26 * density + 0.05 * Math.min(bnd, 3) / 3;
+    if (first === 0) q += 0.10;
+    return Math.min(0.66, q);
+  }
+
+  function fieldQuality(hay, needle, fz) {
+    if (!hay || !needle) return 0;
+    if (hay === needle) return 1;
+
+    const at = hay.indexOf(needle);
+    if (at === 0) return 0.92;
+    if (at > 0) {
+      let q = 0.80 - Math.min(0.10, (at - 1) * 0.01);
+      if (isBoundaryAt(hay, at)) q += 0.03;
+      return q;
+    }
+    if (!fz) return 0;
+    return subseqQuality(hay, needle);
+  }
+
+  const FIELD_W = {
+    name: 1, namePy: 0.97, nameInit: 0.93,
+    kw: 0.85, kwPy: 0.80, kwInit: 0.76,
+    sub: 0.62, target: 0.58, args: 0.50
+  };
+
+  /* 索引缓存：配置不变就不重算拼音（每次按键都算上百个字会明显掉帧） */
+  function fieldsOf(item) {
+    const hit = state.index[item.id];
+    if (hit) return hit;
+
+    const name = String(item.name || '').toLowerCase();
+    const kws = item.keywords || [];
+    const kw = kws.join('\n').toLowerCase();
+    const list = [{ t: name, w: FIELD_W.name, fz: 1 }];
+
+    const nPy = pyCall(PY && PY.full, item.name).toLowerCase();
+    const nInit = pyCall(PY && PY.initials, item.name).toLowerCase();
+    if (nPy && nPy !== name) list.push({ t: nPy, w: FIELD_W.namePy, fz: 1 });
+    if (nInit && nInit !== name && nInit !== nPy) list.push({ t: nInit, w: FIELD_W.nameInit, fz: 1 });
+
+    if (kw) {
+      list.push({ t: kw, w: FIELD_W.kw, fz: 1 });
+      const kAll = kws.join(' ');
+      const kPy = pyCall(PY && PY.full, kAll).toLowerCase();
+      const kInit = pyCall(PY && PY.initials, kAll).toLowerCase();
+      if (kPy) list.push({ t: kPy, w: FIELD_W.kwPy, fz: 1 });
+      if (kInit && kInit !== kPy) list.push({ t: kInit, w: FIELD_W.kwInit, fz: 1 });
+    }
+
+    if (item.subtitle) list.push({ t: String(item.subtitle).toLowerCase(), w: FIELD_W.sub });
+    /* target / args 只做「全等 / 前缀 / 子串」：路径太长，放开模糊会满屏噪音 */
+    if (item.target) list.push({ t: String(item.target).toLowerCase(), w: FIELD_W.target });
+    if (item.args) list.push({ t: String(item.args).toLowerCase(), w: FIELD_W.args });
+
+    state.index[item.id] = list;
+    return list;
+  }
 
   function scoreOne(item, q) {
-    const name = (item.name || '').toLowerCase();
-    if (name === q) return 100;
-    if (name.startsWith(q)) return 80;
-    if (name.includes(q)) return 60;
-    if (item.keywords.some(k => String(k).toLowerCase().startsWith(q))) return 50;
-    const hay = [item.name, item.subtitle, item.keywords.join(' '), item.target, item.args]
-      .join(' ').toLowerCase();
-    if (hay.includes(q)) return 30;
-    return 0;
+    const needle = String(q == null ? '' : q).toLowerCase();
+    if (!needle) return 0;
+    const fields = fieldsOf(item);
+    let best = 0;
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
+      const v = fieldQuality(f.t, needle, f.fz) * f.w;
+      if (v > best) best = v;
+      if (best >= 1) break;
+    }
+    return best > 0 ? Math.round(best * 100) : 0;
   }
 
   /* 多词按 AND 匹配：搜「查看 ip」也能命中「查看本机 IP」。
@@ -626,12 +813,17 @@
 
     if (q) {
       state.results = base
-        .map(it => ({ it, s: scoreOf(it, q) }))
+        .map(it => {
+          const s = scoreOf(it, q);
+          /* 命中分 × 频率加成：只影响同档次的先后，不会让 60 分的条目翻过 100 分的 */
+          return { it: it, s: s ? s * (1 + usageBoost(it.id) / 100) : 0 };
+        })
         .filter(x => x.s > 0)
         .sort((a, b) => b.s - a.s)
         .map(x => x.it);
     } else {
-      state.results = base.slice();
+      /* 没关键词时按使用次数排；次数相同的保持配置顺序（Array#sort 是稳定的） */
+      state.results = base.slice().sort((a, b) => usageCount(b.id) - usageCount(a.id));
     }
     if (state.sel >= state.results.length) state.sel = Math.max(0, state.results.length - 1);
 
@@ -723,6 +915,182 @@
     if (state.histIdx < 0) { state.histIdx = -1; setTail(''); return true; }
     setTail(list[state.histIdx]);
     return true;
+  }
+
+  /* ---------------------------------------------------------- 参数补全
+
+     两种补全，都只在参数态生效：
+       →   把「已输入的前缀」扩成最近一次完全匹配的历史（8.8 → 8.8.8.8）
+       Tab 路径类参数补目录（C:\Win → C:\Windows\，多个候选先补公共前缀）
+
+     Tab 需要读目录，页面没有文件系统权限，所以走 AHK：post {type:'fs'} →
+     AHK 列目录 → 回 {type:'fs-result'}。请求带回 reqId，回来时如果输入已经变了
+     就直接丢弃，避免"补到一半结果回来把用户新打的字覆盖掉"。 */
+
+  const fsWait = new Map();
+  let fsSeq = 0;
+
+  function fsList(dir, cb) {
+    if (!HAS_BRIDGE) { cb({ ok: false, err: '预览模式读不到目录，请在软件里试' }); return; }
+    const id = 'f' + (++fsSeq);
+    fsWait.set(id, cb);
+    post({ type: 'fs', id: id, dir: dir });
+    setTimeout(() => {
+      if (!fsWait.has(id)) return;
+      fsWait.delete(id);
+      cb({ ok: false, err: '目录读取超时' });
+    }, 3000);
+  }
+
+  function onFsResult(msg) {
+    const cb = fsWait.get(msg.id);
+    if (!cb) return;
+    fsWait.delete(msg.id);
+    cb({ ok: !!msg.ok, dir: msg.dir || '', err: msg.err || '', entries: msg.entries || [] });
+  }
+
+  /* tail 里最后一段（引号感知）的范围；尾随空格时 start === len，即"正在打新 token" */
+  function lastTokenRange(s) {
+    const str = String(s || '');
+    let quote = '', start = 0;
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charAt(i);
+      if (quote) {
+        if (c === quote) quote = '';
+      } else if (c === '"' || c === "'") {
+        quote = c;
+      } else if (/\s/.test(c)) {
+        start = i + 1;
+      }
+    }
+    return { start: start, end: str.length };
+  }
+
+  function joinPath(a, b) {
+    const x = String(a || '').replace(/\//g, '\\');
+    const y = String(b || '').replace(/\//g, '\\');
+    if (!x) return y;
+    if (!y) return x;
+    return x.replace(/\\+$/, '') + '\\' + y.replace(/^\\+/, '');
+  }
+
+  /* 当前 token 拆成「要列哪个目录」+「已经打了的目录名前缀」 */
+  function splitForComplete(tok, workdir) {
+    const s = String(tok || '');
+    const cut = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
+    const dirPart = cut >= 0 ? s.slice(0, cut + 1) : '';
+    const prefix = cut >= 0 ? s.slice(cut + 1) : s;
+
+    let base;
+    if (/^[a-zA-Z]:/.test(dirPart) || dirPart.charAt(0) === '\\' || dirPart.charAt(0) === '/')
+      base = dirPart;
+    else
+      base = joinPath(workdir, dirPart);
+
+    return { base: base, prefix: prefix, dirPart: dirPart };
+  }
+
+  function longestCommonPrefix(list) {
+    if (!list.length) return '';
+    let p = list[0];
+    for (let i = 1; i < list.length; i++) {
+      let j = 0;
+      while (j < p.length && j < list[i].length && p.charAt(j).toLowerCase() === list[i].charAt(j).toLowerCase()) j++;
+      p = p.slice(0, j);
+      if (!p) break;
+    }
+    return p;
+  }
+
+  /* 正在编辑的参数声明（只是给"这个参数是不是路径"做参考，取不到也不影响） */
+  function currentParamDecl(item) {
+    const decl = (item && item.params) || [];
+    if (!decl.length) return null;
+    const v = els.q.value;
+    if (/\s$/.test(v)) return null;
+    const i = splitQuoted(v).length - 1;
+    return (i >= 0 && i < decl.length) ? decl[i] : null;
+  }
+
+  /* 这一段的输入看起来像路径吗？
+     webhook 的参数默认不是路径（除非声明 type: "path"），其余动作型条目只要带分隔符就算 */
+  function looksPathy(tok, item) {
+    if (!tok) return false;
+    const d = currentParamDecl(item);
+    if (d && /^(path|dir|file)$/i.test(String(d.type || ''))) return true;
+    if (item.type === 'webhook' && !(d && d.type)) return false;
+    return /[\\/]/.test(tok) || /^[a-zA-Z]:/.test(tok) || /^\.{1,2}$/.test(tok);
+  }
+
+  /* 引号包裹的 token：拆出「引号 / 内容 / 是否已闭合」，补完再按原样拼回去。
+     不拆的话 `"C:\Program Files` 会带着引号去解析，目录直接被拼成非法路径。 */
+  function unquoteToken(raw) {
+    const s = String(raw || '');
+    const q = s.charAt(0);
+    if (q !== '"' && q !== "'") return { q: '', tok: s, closed: false };
+    const closed = s.length > 1 && s.charAt(s.length - 1) === q;
+    return { q: q, tok: s.slice(1, closed ? s.length - 1 : s.length), closed: closed };
+  }
+
+  /* Tab：目录补全。返回 true 表示"已接管这次按键"（可能是异步的） */
+  function completePath() {
+    if (!state.param) return false;
+    const item = state.param.item;
+    const tail = els.q.value;
+    const range = lastTokenRange(tail);
+    const raw = tail.slice(range.start, range.end);
+    const uq = unquoteToken(raw);
+    const tok = uq.tok;
+    if (!looksPathy(tok, item)) return false;
+
+    const sp = splitForComplete(tok, item.workdir || scriptDir);
+    const wrap = v => (uq.q || '') + v + (uq.closed ? uq.q : '');
+
+    fsList(sp.base, res => {
+      if (els.q.value !== tail) return;          /* 用户已经改了输入，结果作废 */
+      if (!res.ok) { toast(res.err || '目录读取失败'); return; }
+
+      const pre = sp.prefix.toLowerCase();
+      const hits = res.entries.filter(e => String(e.n).toLowerCase().startsWith(pre));
+      if (!hits.length) { setTail(tail + ' '); return; }   /* 没候选就当分隔空格 */
+
+      if (hits.length === 1) {
+        const e = hits[0];
+        setTail(tail.slice(0, range.start) + wrap(sp.dirPart + e.n + (e.d ? '\\' : '')));
+        return;
+      }
+
+      const cp = longestCommonPrefix(hits.map(e => String(e.n)));
+      if (cp.length > sp.prefix.length) {
+        setTail(tail.slice(0, range.start) + wrap(sp.dirPart + cp));
+        const nd = hits.filter(e => e.d).length;
+        toast('补到 "' + cp + '"，' + hits.length + ' 个候选（' + nd + ' 个目录）· 再按 Tab 看更多');
+      } else {
+        const head = hits.slice(0, 8).map(e => e.n + (e.d ? '\\' : '')).join('   ');
+        toast('候选：' + head + (hits.length > 8 ? '  …' : ''), 3600);
+      }
+    });
+    return true;
+  }
+
+  /* →：用最近一次的历史把当前前缀补全。有多个可补时取最近的那条。 */
+  function histComplete() {
+    if (!state.param) return false;
+    const v = els.q.value;
+    if (!v) return false;
+    try {
+      if (els.q.selectionStart !== v.length || els.q.selectionEnd !== v.length) return false;
+    } catch (e) {}
+
+    const list = historyOf(state.param.item.id);
+    for (let i = 0; i < list.length; i++) {
+      const h = list[i];
+      if (h !== v && h.length > v.length && h.toLowerCase().startsWith(v.toLowerCase())) {
+        setTail(h);
+        return true;
+      }
+    }
+    return false;
   }
 
   function updateHint() {
@@ -829,6 +1197,9 @@
       const hist = historyOf(item.id);
       if (hist.length) bits.push('↑ 上次：' + hist[0]);
     }
+    const pathy = item.type === 'app' || item.type === 'cmd' || item.type === 'ahk' ||
+      decl.some(p => /^(path|dir|file)$/i.test(String(p.type || '')));
+    if (pathy) bits.push('Tab 补路径 · → 补上次');
     bits.push('Enter 运行 · Esc 退出参数');
     els.paramNote.textContent = bits.join(' · ');
 
@@ -943,6 +1314,16 @@
       }
       row.appendChild(main);
 
+      /* 无关键词浏览时露一下使用次数，让排序有据可查（只显示用过的） */
+      const n = usageCount(item.id);
+      if (!state.term && n > 0) {
+        const use = document.createElement('span');
+        use.className = 'row-use';
+        use.textContent = n > 99 ? '99+' : '×' + n;
+        use.title = '已使用 ' + n + ' 次';
+        row.appendChild(use);
+      }
+
       const kind = document.createElement('span');
       kind.className = 'row-kind' + (item.type === 'webhook' ? ' row-kind-http' : '');
       kind.textContent = kindLabel(item);
@@ -994,6 +1375,7 @@
         return false;
       }
       runWebhook(w.item, raw);
+      bumpUsage(item);
       return true;
     }
 
@@ -1009,6 +1391,7 @@
       /* cmd 类型要的是原文（引号、重定向都交给 cmd 自己解释） */
       argvRaw: item.type === 'cmd' ? raw.trim() : ''
     });
+    bumpUsage(item);
     return true;
   }
 
@@ -1424,14 +1807,17 @@
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         if (!paramHistory(-1)) moveSel(-1);
+      } else if (e.key === 'ArrowRight') {
+        /* 只在补全真发生时抢键，否则保持"移动光标"的原生行为 */
+        if (histComplete()) e.preventDefault();
       } else if (e.key === 'Enter') {
         e.preventDefault();
         doLaunch();
       } else if (e.key === 'Tab') {
         e.preventDefault();
-        /* 参数态下 Tab 只补一个分隔空格，不去切命令模式（免得误触） */
-        if (state.param) setTail(els.q.value + ' ');
-        else toggleCmd();
+        if (!state.param) { toggleCmd(); return; }
+        /* 参数态：路径 → 补目录；不补就退回原来的「补一个分隔空格」 */
+        if (!completePath()) setTail(els.q.value + ' ');
       } else if (e.key === 'Escape') {
         e.preventDefault();
         onEscape();
@@ -1551,6 +1937,9 @@
         case 'http-result':
           onHttpResult(msg);
           break;
+        case 'fs-result':
+          onFsResult(msg);
+          break;
       }
     });
   }
@@ -1571,13 +1960,21 @@
   };
 
   /* 测试用：暴露纯函数，方便 node 侧抽出来跑用例 */
-  window.__qlTest = { parseQuery, getByPath, highlightJson, buildUrl, toQueryString };
+  window.__qlTest = {
+    parseQuery, getByPath, highlightJson, buildUrl, toQueryString,
+    scoreOf: scoreOf, scoreOne: scoreOne, fieldQuality: fieldQuality,
+    subseqQuality: subseqQuality, lastTokenRange: lastTokenRange,
+    splitForComplete: splitForComplete, histComplete: histComplete
+  };
 
   /* ---------------------------------------------------------- 启动 */
 
   function init() {
     bind();
     bindBridge();
+
+    /* 使用记录先就位：render 里的排序和角标都要读它 */
+    state.usage = loadUsage();
 
     const cfg = boot && boot.config;
     if (cfg) {

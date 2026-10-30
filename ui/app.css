@@ -292,6 +292,17 @@ body {
 }
 .row.sel .row-enter { opacity: 1; }
 
+/* 使用次数角标：只在"没关键词"浏览时出现，说明按频率排序的依据 */
+.row-use {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: #9aa0a9;
+  background: #f5f6f9;
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* 图标 */
 .ic {
   flex: 0 0 auto;

@@ -1,33 +1,13 @@
-/* 从 ui/app.js 里抽取真实函数体跑用例（不复制实现，避免用例和实现漂移） */
-const fs = require('fs');
-const src = fs.readFileSync('ui/app.js', 'utf8');
-
-function grab(name) {
-  const m = new RegExp('^  function ' + name + '\\(', 'm').exec(src);
-  if (!m) throw new Error('找不到函数 ' + name);
-  const rest = src.slice(m.index);
-  const i = rest.search(/\n  \}\n/);
-  if (i < 0) throw new Error('函数未闭合 ' + name);
-  return rest.slice(0, i + 4);
-}
-
-const consts = [
-  src.match(/const CMD_TYPES = \{[^}]*\};/)[0],
-  src.match(/const TPL_RE = .*;/)[0]
-].join('\n');
-
-const names = ['splitQuoted', 'takesArgs', 'uniqueMatch', 'splitArgs', 'scoreOne', 'scoreOf',
-  'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery', 'withArgs',
-  'parseQuery', 'sourceFor', 'findGroup'];
-
-const code = consts + '\n' + names.map(grab).join('\n') + '\nreturn {' + names.join(',') + '};';
+/* 参数 / 查询语义用例（函数体从 ui/app.js 抽取，见 tests/harness.js） */
+const { build } = require('./harness');
 
 const state = {
   groups: [{ id: 'net', name: '网络' }, { id: 'dev', name: '开发' }],
-  all: []
+  all: [],
+  index: {}
 };
 
-const T = new Function('state', code)(state);
+const T = build(state, require('../ui/pinyin.js'));
 
 /* ---------- 测试数据 ---------- */
 state.all = [

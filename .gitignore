@@ -10,6 +10,13 @@ _*.ahk
 _*.txt
 _*.png
 
+# ── 使用记录（每台机器各不相同，跟着使用习惯走，不进仓库） ──
+usage.json
+usage.json.tmp
+
+# ── 生成拼音表用的原始数据（985KB，只在重新生成时需要） ──
+pinyin.txt
+
 # ── AutoHotkey 官方帮助文档（2MB，非运行必需，需要时从官网取） ──
 runtime/AutoHotkey.chm
 
