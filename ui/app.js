@@ -5,7 +5,7 @@
    - 直接在浏览器打开时进入「预览模式」，用内置示例数据渲染
 
    查询串语法（见 parseQuery）：
-     >ip        命令模式：只搜 cmd / ahk / webhook 三类「动作」条目
+     >ip        命令模式：只搜 cmd / ahk / webhook / download 这类「动作」条目
      @net       只看 net 分组；term 为空 = 列出整组（就是二级菜单）
      @net>ip    分组 + 命令模式
      其它       全量搜索
@@ -32,7 +32,8 @@
     { id: 'c', name: '计算器', subtitle: '示例数据 · 浏览器预览', icon: '🧮', type: 'url', target: 'ms-calculator:', pinned: true, group: 'sys' },
     { id: 'd', name: '画图', subtitle: '示例数据 · 浏览器预览', icon: '🎨', type: 'app', target: 'C:\\Windows\\System32\\mspaint.exe', pinned: false, group: 'sys' },
     { id: 'e', name: '查看本机 IP', subtitle: '示例数据 · 浏览器预览', icon: '⚙', type: 'cmd', target: 'ipconfig /all', pinned: false, group: 'net' },
-    { id: 'f', name: '示例请求', subtitle: '示例数据 · 预览返回假响应', icon: '🌐', type: 'webhook', target: 'https://example.com/api', method: 'GET', pinned: true, group: 'net', jsonPath: 'data.items[0]' }
+    { id: 'f', name: '示例请求', subtitle: '示例数据 · 预览返回假响应', icon: '🌐', type: 'webhook', target: 'https://example.com/api', method: 'GET', pinned: true, group: 'net', jsonPath: 'data.items[0]' },
+    { id: 'g', name: '下载示例文件', subtitle: '示例数据 · download 类型', icon: '⬇', type: 'download', target: 'https://example.com/demo.txt', savePath: '', fileName: '', pinned: false, group: 'net' }
   ];
 
   const DEMO_GROUPS = [
@@ -98,7 +99,7 @@
   function resolveTarget(type, p) {
     const s = (p == null ? '' : String(p)).trim();
     if (!s) return '';
-    if (type === 'cmd' || type === 'url' || type === 'webhook') return s;
+    if (type === 'cmd' || type === 'url' || type === 'webhook' || type === 'download') return s;
     if (isProtocol(s) || isAbsPath(s)) return s;
     // folder / ahk 的 target 天然是路径，裸名也按脚本目录解析
     if (type === 'folder' || type === 'ahk') return absPath(s);
@@ -132,12 +133,20 @@
     return `linear-gradient(135deg, ${a}, ${a}cc)`;
   }
 
-  const KIND_LABEL = { app: '应用', cmd: '命令', url: '链接', folder: '目录', ahk: '脚本', webhook: '请求' };
+  const KIND_LABEL = { app: '应用', cmd: '命令', url: '链接', folder: '目录', ahk: '脚本', webhook: '请求', download: '下载' };
 
   function kindLabel(item) {
     /* webhook 直接显示请求方法，比"请求"两个字信息量大 */
     if (item.type === 'webhook') return (item.method || 'GET').toUpperCase();
     return KIND_LABEL[item.type] || '应用';
+  }
+
+  /* 保存路径：空 = 交给 AHK 用系统「下载」目录；%TEMP% 这类原样传给 AHK 展开 */
+  function resolveSavePath(p) {
+    const s = String(p == null ? '' : p).trim();
+    if (!s) return '';
+    if (/^%[^%]+%/.test(s)) return s;
+    return absPath(s);
   }
 
   function esc(s) {
@@ -181,7 +190,7 @@
         || null;
   }
 
-  const CMD_TYPES = { cmd: 1, ahk: 1, webhook: 1 };
+  const CMD_TYPES = { cmd: 1, ahk: 1, webhook: 1, download: 1 };
 
   function sourceFor(scope, group) {
     let list = state.all;
@@ -226,11 +235,12 @@
     return out.filter(x => x !== '');
   }
 
-  /* 谁接受运行时参数：动作型条目；webhook 还要显式声明 params（否则不知道该往哪填） */
+  /* 谁接受运行时参数：动作型条目；webhook / download 还要显式声明 params
+     （否则不知道该往 URL 模板的哪个变量里填） */
   function takesArgs(item) {
     if (!item) return false;
     if (item.type === 'app' || item.type === 'cmd' || item.type === 'ahk') return true;
-    if (item.type === 'webhook') return (item.params || []).length > 0;
+    if (item.type === 'webhook' || item.type === 'download') return (item.params || []).length > 0;
     return false;                       /* folder / url 不参与，避免误判 */
   }
 
@@ -362,7 +372,10 @@
         target: fillTemplate(item.target, r.args),
         query: fillQuery(item.query, r.args),
         headers: fillTemplate(item.headers, r.args),
-        body: fillTemplate(item.body, r.args)
+        body: fillTemplate(item.body, r.args),
+        /* download 的保存位置也能模板化：「下载 {{name}}」直接把远端文件名当本地文件名 */
+        savePath: fillTemplate(item.savePath, r.args),
+        fileName: fillTemplate(item.fileName, r.args)
       })
     };
   }
@@ -515,6 +528,12 @@
       body: it.body,
       timeout: Number(it.timeout) > 0 ? Math.min(Number(it.timeout), 120) : 15,
       jsonPath: it.jsonPath || it.jsonpath || '',
+      /* download 专用（本质是 webhook 的变种，只是把响应写成文件） */
+      savePath: resolveSavePath(it.savePath || it.savepath || ''),
+      fileName: String(it.fileName || it.filename || '').trim(),
+      onExists: String(it.onExists || '').toLowerCase() === 'overwrite' ? 'overwrite' : 'skip',
+      backup: it.backup !== false,          /* 覆盖时默认留一份 .bak */
+      reload: it.reload === true,           /* 下载完自动重载配置（拉取 config.json 用） */
       /* 运行时参数声明（webhook 的模板变量，app/cmd 可省略） */
       params: Array.isArray(it.params) ? it.params.filter(p => p && p.name).map(p => ({
         name: String(p.name),
@@ -1183,7 +1202,12 @@
     let preview = '';
     const toks = splitQuoted(tail);
 
-    if (item.type === 'webhook') {
+    if (item.type === 'download') {
+      head = '将下载';
+      preview = 'GET ' + buildUrl(applied) +
+        '  →  ' + (applied.savePath || '系统「下载」目录') + '\\' +
+        (applied.fileName || '（沿用远端文件名）');
+    } else if (item.type === 'webhook') {
       head = '将请求';
       preview = (item.method || 'GET') + ' ' + buildUrl(applied);
     } else if (item.type === 'cmd') {
@@ -1297,7 +1321,7 @@
     if (!state.results.length) {
       els.empty.hidden = false;
       if (state.scope === 'cmd' || state.scope === 'group-cmd')
-        els.emptyText.textContent = state.term ? '没有匹配的命令' : '这个范围里没有命令或请求';
+        els.emptyText.textContent = state.term ? '没有匹配的命令' : '这个范围里没有命令、请求或下载';
       else if (state.scope === 'group' && !state.term)
         els.emptyText.textContent = state.groupId ? '这个分组还没有条目' : '没有这个分组';
       else
@@ -1339,7 +1363,9 @@
       }
 
       const kind = document.createElement('span');
-      kind.className = 'row-kind' + (item.type === 'webhook' ? ' row-kind-http' : '');
+      kind.className = 'row-kind'
+        + (item.type === 'webhook' ? ' row-kind-http' : '')
+        + (item.type === 'download' ? ' row-kind-dl' : '');
       kind.textContent = kindLabel(item);
       row.appendChild(kind);
 
@@ -1379,7 +1405,8 @@
     if (!item) return false;
     const raw = tail == null ? '' : String(tail);
 
-    if (item.type === 'webhook') {
+    /* webhook / download 都要先把参数灌进模板再发请求 */
+    if (item.type === 'webhook' || item.type === 'download') {
       const assigned = assignTokens(item, raw);
       const w = withArgs(item, assigned.values);
       if (w.missing.length) {
@@ -1388,7 +1415,8 @@
         toast('还缺参数：' + w.missing.join('、'));
         return false;
       }
-      runWebhook(w.item, raw);
+      if (item.type === 'download') runDownload(w.item);
+      else runWebhook(w.item, raw);
       bumpUsage(item);
       return true;
     }
@@ -1425,7 +1453,7 @@
     /* 参数态启动成功就把输入清干净：否则下次唤出还停在参数态，
        新输入会被拼到旧主体后面（实测踩过）。
        非参数态的启动保持原行为（窗口隐藏，查询留着）。 */
-    if (ok && state.param && item.type !== 'webhook') setQuery('');
+    if (ok && state.param && item.type !== 'webhook' && item.type !== 'download') setQuery('');
   }
 
   /* ---------------------------------------------------------- Webhook */
@@ -1529,6 +1557,99 @@
       view: 'body'
     };
     renderResult();
+  }
+
+  /* ---------------------------------------------------------- Download */
+
+  function runDownload(item) {
+    const id = 'd' + (++state.reqSeq).toString(36) + '-' + Date.now().toString(36);
+    state.pending.set(id, { item: item, kind: 'download' });
+
+    state.result = {
+      id: id, item: item, loading: true, ok: true, download: true,
+      status: 0, ms: 0, error: '', url: buildUrl(item),
+      file: '', name: '', size: 0, skipped: 0, backup: '', view: 'body'
+    };
+    renderResult();
+
+    if (!HAS_BRIDGE) {
+      setTimeout(() => {
+        state.pending.delete(id);
+        state.result = Object.assign({}, state.result, {
+          loading: false, status: 200, ms: 186, size: 20480,
+          file: 'C:\\Users\\你\\Downloads\\示例文件.txt'
+        });
+        renderResult();
+      }, 320);
+      return;
+    }
+
+    post({
+      type: 'download',
+      id: id,
+      url: buildUrl(item),
+      headers: headerLines(item),
+      savePath: item.savePath || '',
+      fileName: item.fileName || '',
+      timeout: item.timeout,
+      onExists: item.onExists,
+      backup: item.backup ? 1 : 0,
+      reload: item.reload ? 1 : 0
+    });
+  }
+
+  function onDownloadResult(msg) {
+    /* 「拉取在线配置」不挂在结果面板上，只用 toast 报告 */
+    if (msg.purpose === 'pull-config') {
+      if (msg.ok) {
+        toast('配置已拉取并重载' + (msg.backup ? '（原文件已备份为 config.json.bak）' : ''), 3600);
+      } else {
+        toast('拉取失败：' + (msg.error || '未知错误'), 4200);
+      }
+      return;
+    }
+
+    const pend = state.pending.get(msg.id);
+    state.pending.delete(msg.id);
+    if (!state.result || state.result.id !== msg.id) return;
+
+    state.result = Object.assign({}, state.result, {
+      loading: false,
+      ok: !!msg.ok,
+      status: msg.status | 0,
+      ms: msg.ms | 0,
+      error: msg.error || '',
+      file: msg.file || '',
+      name: msg.name || '',
+      size: msg.size | 0,
+      skipped: msg.skipped | 0,
+      backup: msg.backup || ''
+    });
+    renderResult();
+
+    if (msg.ok) {
+      toast(msg.skipped ? '文件已存在，已跳过' : ('已下载：' + baseName(msg.file || '')), 2600);
+    } else {
+      toast('下载失败：' + (msg.error || '未知错误'), 4000);
+    }
+  }
+
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(2) + ' MB';
+  }
+
+  function downloadSummary(res) {
+    if (res.loading) return '正在下载…';
+    if (!res.ok) return netErrorText(res);
+    if (res.skipped) return '文件已存在，按「跳过」处理：\n' + res.file;
+    const lines = ['已保存：' + (res.file || '(未知路径)')];
+    if (res.size) lines.push('大小：' + fmtBytes(res.size));
+    if (res.ms) lines.push('用时：' + res.ms + ' ms');
+    if (res.backup) lines.push('原文件已备份：' + res.backup);
+    return lines.join('\n');
   }
 
   /* ---------------------------------------------------------- 结果分析 */
@@ -1673,21 +1794,27 @@
     box.hidden = false;
 
     const item = res.item || {};
-    els.rMethod.textContent = (item.method || 'GET').toUpperCase();
-    els.rMethod.className = 'rmethod m-' + (item.method || 'GET').toLowerCase();
+    const isDl = !!res.download;
+    els.rMethod.textContent = isDl ? 'GET' : (item.method || 'GET').toUpperCase();
+    els.rMethod.className = 'rmethod m-' + (isDl ? 'get' : (item.method || 'GET').toLowerCase());
     /* 显示最终请求地址（含 query 串），否则用户会以为 query 没生效 */
-    const fullUrl = buildUrl(item) || '';
+    const fullUrl = res.url || buildUrl(item) || '';
     els.rUrl.textContent = fullUrl;
     els.rUrl.title = fullUrl;
 
     /* 状态行 */
     if (res.loading) {
       els.rStatus.className = 'rstat st-wait';
-      els.rStatus.textContent = '请求中…';
+      els.rStatus.textContent = isDl ? '下载中…' : '请求中…';
     } else if (!res.ok) {
       els.rStatus.className = 'rstat st-err';
       els.rStatus.textContent = shortErrLabel(res.error);
       els.rStatus.title = res.error || '';
+    } else if (isDl) {
+      /* 下载没有"状态码文案"的需求，跳过/成功更直观 */
+      const txt = res.skipped ? '已跳过（文件已存在）' : (res.status ? String(res.status) : '完成');
+      els.rStatus.className = 'rstat ' + (res.skipped ? 'st-warn' : statusClass(res));
+      els.rStatus.textContent = txt + (res.ms ? ' · ' + res.ms + 'ms' : '');
     } else {
       const txt = (STATUS_TEXT[res.status] ? res.status + ' ' + STATUS_TEXT[res.status] : res.status ? String(res.status) : '无状态码');
       els.rStatus.className = 'rstat ' + statusClass(res);
@@ -1699,7 +1826,9 @@
     let text = res.body || '';
     let isJsonView = false;
 
-    if (res.view === 'body' && an.hasPath) {
+    if (isDl) {
+      text = downloadSummary(res);
+    } else if (res.view === 'body' && an.hasPath) {
       if (an.pathError) {
         text = '取路径失败：' + an.pathError;
       } else {
@@ -1712,8 +1841,8 @@
     }
 
     if (res.loading) {
-      els.rPre.innerHTML = '<span class="jt-p">等待响应…</span>';
-    } else if (!res.ok && !res.body) {
+      els.rPre.innerHTML = '<span class="jt-p">' + (isDl ? '正在下载…' : '等待响应…') + '</span>';
+    } else if (!res.ok && !res.body && !isDl) {
       els.rPre.textContent = netErrorText(res);
     } else if (isJsonView) {
       els.rPre.innerHTML = highlightJson(text);
@@ -1725,16 +1854,21 @@
 
     /* 元信息 */
     const bits = [];
-    if (an.hasPath && res.view === 'body' && !an.pathError)
-      bits.push('jsonPath: ' + (item.jsonPath || ''));
-    if (an.hasPath && an.pathError) bits.push('取路径失败');
-    if (res.truncated) bits.push('响应过大已截断');
-    if (!an.isJson && !res.loading && res.body) bits.push('非 JSON，按原文显示');
+    if (isDl) {
+      if (res.backup) bits.push('原文件已备份');
+      if (res.skipped) bits.push('onExists: skip');
+    } else {
+      if (an.hasPath && res.view === 'body' && !an.pathError)
+        bits.push('jsonPath: ' + (item.jsonPath || ''));
+      if (an.hasPath && an.pathError) bits.push('取路径失败');
+      if (res.truncated) bits.push('响应过大已截断');
+      if (!an.isJson && !res.loading && res.body) bits.push('非 JSON，按原文显示');
+    }
     els.rMeta.textContent = bits.join(' · ');
     els.rMeta.hidden = !bits.length;
 
     /* 按钮 */
-    els.rToggle.hidden = !an.hasPath;
+    els.rToggle.hidden = isDl || !an.hasPath;
     els.rToggle.textContent = res.view === 'body' ? '完整响应' : '只看结果';
 
     state.viewText = text;
@@ -1767,6 +1901,51 @@
     ta.select();
     try { document.execCommand('copy'); toast('已复制'); } catch (e) { toast('复制失败'); }
     document.body.removeChild(ta);
+  }
+
+  /* ---------------------------------------------------------- 拉取在线配置 */
+
+  const PULL_KEY = 'ql.pullUrl';
+
+  function openPull() {
+    if (!els.pullDlg) return;
+    let last = '';
+    try { last = localStorage.getItem(PULL_KEY) || ''; } catch (e) {}
+    els.pullUrl.value = last;
+    els.pullErr.hidden = true;
+    els.pullOk.disabled = false;
+    els.pullDlg.hidden = false;
+    els.pullUrl.focus();
+    els.pullUrl.select();
+  }
+
+  function closePull() {
+    if (!els.pullDlg) return;
+    els.pullDlg.hidden = true;
+    if (els.q) els.q.focus();
+  }
+
+  function showPullErr(text) {
+    els.pullErr.textContent = text;
+    els.pullErr.hidden = false;
+  }
+
+  function submitPull() {
+    const raw = String(els.pullUrl.value || '').trim();
+    if (!raw) { showPullErr('请填写配置文件的网址'); return; }
+    if (/\s/.test(raw)) { showPullErr('网址里不能有空格'); return; }
+    /* 允许直接粘 example.com/x.json，协议头由这里（和 AHK 侧）补齐 */
+    const url = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+    if (!/^https?:\/\/[^\s/]+\.[^\s/]+/i.test(url)) {
+      showPullErr('网址格式不对，例如 https://example.com/quicklaunch/config.json');
+      return;
+    }
+
+    try { localStorage.setItem(PULL_KEY, url); } catch (e) {}
+    els.pullOk.disabled = true;
+    closePull();
+    post({ type: 'pull-config', url: url });
+    toast('正在拉取配置…', 2200);
   }
 
   /* ---------------------------------------------------------- 事件绑定 */
@@ -1804,6 +1983,10 @@
     els.rPre = $('rPre');
     els.rMeta = $('rMeta');
     els.rToggle = $('rToggle');
+    els.pullDlg = $('pullDlg');
+    els.pullUrl = $('pullUrl');
+    els.pullErr = $('pullErr');
+    els.pullOk = $('pullOk');
 
     els.q.addEventListener('input', () => {
       state.noSplit = false;
@@ -1844,7 +2027,10 @@
     });
 
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape' && document.activeElement !== els.q) onEscape();
+      if (e.key !== 'Escape') return;
+      /* 弹层开着时 Esc 只关弹层，别顺手把窗口也藏了 */
+      if (els.pullDlg && !els.pullDlg.hidden) { closePull(); return; }
+      if (document.activeElement !== els.q) onEscape();
     });
 
     /* 作用域胶囊：点一下清掉前缀，退回上层的搜索词 */
@@ -1889,6 +2075,17 @@
     $('btnExit').addEventListener('click', () => post({ type: 'close' }));
     $('btnReload').addEventListener('click', () => post({ type: 'reload' }));
     $('btnOpenCfg').addEventListener('click', () => post({ type: 'open-config' }));
+    $('btnPullCfg').addEventListener('click', openPull);
+    $('pullCancel').addEventListener('click', closePull);
+    $('pullOk').addEventListener('click', submitPull);
+    els.pullUrl.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); submitPull(); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closePull(); }
+    });
+    /* 点遮罩 = 关掉；点弹层内部不关 */
+    els.pullDlg.addEventListener('mousedown', e => {
+      if (e.target === els.pullDlg) closePull();
+    });
 
     document.addEventListener('contextmenu', e => e.preventDefault());
   }
@@ -1950,6 +2147,9 @@
           break;
         case 'http-result':
           onHttpResult(msg);
+          break;
+        case 'download-result':
+          onDownloadResult(msg);
           break;
         case 'fs-result':
           onFsResult(msg);

@@ -65,12 +65,15 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 | 参数态 `→` 补历史 | ✅ 先跑一次 `8.8.8.8`，再输入 `8.8` 按 `→` → `8.8.8.8` |
 | 使用频率落盘 | ✅ `usage.json` 出现 `{"http-geo":{"n":1,...}}`，空查询时该条目排到第一 |
 | UNC 共享上的 exe / bat / 图标 / 参数 | ✅ 真去 `\\localhost\…` 跑（`node tools/unc-check.js`），见「局域网共享」一节 |
+| 下载二进制文件 | ✅ 本地起 HTTP 服务，286 字节二进制**逐字节一致**（含全部 256 种字节值 + 中文）；`skip`/`overwrite`/`.bak`/404 全按预期（`node tools/dl-check.js` 14 项） |
+| 拉取在线配置 | ✅ 拉到正常 JSON 会替换并留 `.bak`；拉到 HTML 错误页会拒绝覆盖（同一脚本 T8/T9） |
 | 点击条目 → 真的启动程序 | ✅ 通过 `cmd /c echo ok>…` 生成了目标文件 |
 | 全局热键 `Ctrl+Alt+Space` 显隐 | ✅ 用 `keybd_event` 模拟真实按键，窗口 visible 1→0→1 |
 
-> 后面四项不是"看起来对"，是 `node tools/e2e.js` 用真窗口、真 WebView2、真 AHK 桥接跑出来的
-> （15 步，日志见 `_e2e.log`，跑完自动退出）。UNC 那几项由 `node tools/unc-check.js` 单独跑，
-> 它会真的启动共享上的进程。
+> 后面几项不是"看起来对"，是 `node tools/e2e.js` 用真窗口、真 WebView2、真 AHK 桥接跑出来的
+> （18 步，日志见 `_e2e.log`，跑完自动退出）。UNC 那几项由 `node tools/unc-check.js` 单独跑，
+> 它会真的启动共享上的进程；下载那两项由 `node tools/dl-check.js` 跑，自己起本地 HTTP 服务，
+> 不联网、不碰仓库里的文件。
 
 ---
 
@@ -90,7 +93,7 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 |---|---|
 | `Ctrl+Alt+Space` | 全局显隐（热键由 `launcher.ini` 的 `Hotkey` 决定） |
 | 输入关键词 | 实时过滤（拼音 / 拼音首字母 / 跳字模糊都能命中）；`↑` `↓` 选择，`Enter` 启动 |
-| `>` 开头 | **命令模式**：只搜 `cmd` / `ahk` / `webhook` 这三类「动作」条目 |
+| `>` 开头 | **命令模式**：只搜 `cmd` / `ahk` / `webhook` / `download` 这几类「动作」条目 |
 | `@分组` | 只看某个分组；支持前缀匹配（`@n` 命中 `net`），`term` 为空就是列出整组 |
 | `@net>ip` | 分组 + 命令模式，可叠加 |
 | `Tab` | 非参数态：在当前范围里开关命令模式（`ip` ⇄ `>ip`，`@net ip` ⇄ `@net>ip`） |
@@ -98,6 +101,7 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 | 参数态 `→` | 用最近一次的历史把当前前缀补全（`8.8` → `8.8.8.8`） |
 | 参数态 `Tab` | 路径类参数补目录（`C:\Win` → `C:\Windows\`） |
 | 点分组胶囊 | 等价于输入 `@分组`，会自动保留关键词与命令模式 |
+| 底部「拉取在线配置」 | 弹层里填网址，下载远端 `config.json` 覆盖本地（先校验再替换，原文件留 `.bak`），见「拉取在线配置」 |
 | `Esc` | 逐层退：关结果面板 → 退出参数态 → 清空查询 → 隐藏窗口 |
 | 标题栏 `—` / `✕` | **只隐藏，不退出**（否则全局热键就唤不出来了） |
 | 托盘图标右键 | 编辑配置 / 重载配置 / 重启软件 / 退出软件 |
@@ -112,7 +116,7 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 ```
 wv2-launcher/
 ├─ launcher.ahk          主程序：无边框窗口 + WebView2 宿主 + 热键 + 启动逻辑 + 图标提取 + 目录补全
-├─ webhook.ahk           HTTP 执行器（子进程）：webhook 类型的请求都在这里跑，避免阻塞界面
+├─ webhook.ahk           HTTP 执行器（子进程）：webhook / download 的请求都在这里跑，避免阻塞界面
 ├─ launcher.ini          AHK 侧设置：热键/尺寸/圆角/行为
 ├─ config.json           数据源：应用条目（前端读取解析）
 ├─ usage.json            使用记录：次数 / 上次时间 / 参数历史（首次启动自动生成）
@@ -130,12 +134,15 @@ wv2-launcher/
 │  ├─ args.test.js       参数/查询语义用例（38 条）
 │  ├─ search.test.js     拼音/打分/频率/补全用例（58 条）
 │  ├─ unc.test.js        UNC 路径用例（45 条）
+│  ├─ download.test.js   download 类型用例（30 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
 │  ├─ gen-pinyin.ps1     从 pinyin-data 重新生成 ui/pinyin.js
 │  ├─ e2e.js             端到端冒烟：真窗口 + 真桥接跑一遍，跑完自己退出
 │  ├─ unc-check.js       UNC 专项实测：真去跑共享上的 exe/bat，读一遍 _unc.log
-│  └─ unc-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
+│  ├─ unc-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
+│  ├─ dl-check.js        下载专项实测：本地起 HTTP 服务，验证字节一致性/跳过/覆盖/备份
+│  └─ dl-probe.ahk       上面那个脚本注入到 launcher.ahk 副本里的检查项
 ├─ docs/screenshot.png
 └─ run.bat
 ```
@@ -147,8 +154,10 @@ wv2-launcher/
 > node tests/args.test.js      # 38 条
 > node tests/search.test.js    # 58 条
 > node tests/unc.test.js       # 45 条
-> node tools/e2e.js            # 会弹一个真窗口跑 15 步，跑完自动关
+> node tests/download.test.js  # 30 条
+> node tools/e2e.js            # 会弹一个真窗口跑 18 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
+> node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
 > ```
 
 ---
@@ -177,7 +186,7 @@ wv2-launcher/
   "subtitle": "代码编辑器",     // 副标题
   "keywords": ["code", "vsc"], // 额外搜索词（支持中英文）
   "icon": "C:\\...\\Code.exe", // 图标：exe 路径 / png|ico|svg 路径 / http(s) 地址 / emoji
-  "type": "app",               // app | cmd | url | folder | ahk | webhook
+  "type": "app",               // app | cmd | url | folder | ahk | webhook | download
   "target": "C:\\...\\Code.exe",
   "args": "",                  // 启动参数
   "workdir": "",               // 工作目录，相对路径按脚本目录解析
@@ -194,6 +203,8 @@ wv2-launcher/
 - `folder` —— 用资源管理器打开目录
 - `ahk` —— 用当前 AHK 运行另一个 .ahk 脚本
 - `webhook` —— 发 HTTP 请求，把响应显示在面板里（见下方「webhook 类型」）
+- `download` —— 下载小文件并保存到本地（见下方「download 类型」），是 `webhook` 的变种：
+  联网逻辑完全一样，只是响应体按**二进制**写进文件而不是显示在面板里
 
 ### 分组（`groups` + 条目的 `group`）
 
@@ -406,6 +417,97 @@ vs code src/app.js           → Code.exe "src/app.js"
 
 ![请求失败时的面板](docs/screenshot-error.png)
 
+### download 类型（下载小文件）
+
+和 `webhook` 共用同一套联网代码（`webhook.ahk` 子进程 + `WinHttp`），区别只有一处：
+响应体**按二进制**写进文件，而不是当文本塞进结果面板。
+所以它同样不阻塞界面，超时、错误码翻译、请求头这一套行为全都一样。
+
+> 刻意做小：文件一次性进内存、先写 `.part` 再改名，**不做**断点续传、分片下载、校验和、进度条。
+> 目标场景是「配置文件、图标、脚本、几十 KB 到几 MB 的附件」，不是下载 ISO。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `target` | — | 下载地址（http/https），必填。可以写 `{{变量}}` 模板 |
+| `savePath` | 系统「下载」目录 | 保存目录。支持相对路径（按脚本目录解析）、`%USERPROFILE%` / `%TEMP%` 这类环境变量、UNC 路径；不存在会自动创建（含多级） |
+| `fileName` | 远端文件名 | 省略时自动取：`Content-Disposition` 优先，其次 URL 最后一段（就是 `curl -O` 的行为）。非法字符会被换掉 |
+| `timeout` | `15` | 秒，上限 120 |
+| `headers` | — | 对象 `{"X-Token":"abc"}` 或数组 `["Name: Value"]`，内网下载要鉴权时用 |
+| `onExists` | `skip` | 同名文件已存在时：`skip` 跳过 / `overwrite` 覆盖 |
+| `backup` | `true` | 覆盖前是否把原文件复制成 `xxx.bak`（`onExists=skip` 时无意义） |
+| `reload` | `false` | 下载成功后自动重载配置（拉取 `config.json` 时用） |
+| `group` | — | 归到哪个分组 |
+| `params` | — | 模板变量声明；写了才能带运行时参数（`target` / `fileName` / `savePath` 都支持 `{{name}}`） |
+
+```jsonc
+{
+  "id": "dl-demo",
+  "name": "下载示例文件",
+  "type": "download",
+  "target": "https://example.com/files/report.pdf",
+  "savePath": "%USERPROFILE%\\Downloads",
+  "fileName": "",            // 留空 → 用远端文件名（含中文、空格都没问题）
+  "onExists": "skip",
+  "backup": true,
+  "timeout": 30
+}
+```
+
+下载完，结果面板会写明「存到哪、多大、耗时多久」；被跳过时明确说「文件已存在，按跳过处理」。
+两种情况都不写坏文件：
+
+- **只认 2xx**：404 / 500 的错误页不会被当成文件存下来（否则目录里会多出一堆 HTML）；
+- **先写 `名字.part` 再改名**：中途断线不会留下一个"看起来完整"的半截文件。
+
+想让下载目标也能带参数，声明 `params` 即可，例如「下载某天的报表」：
+
+```jsonc
+{
+  "name": "下载每日报表",
+  "type": "download",
+  "target": "https://intranet.example.com/report/{{day}}.xlsx",
+  "savePath": "D:\\报表",
+  "fileName": "报表-{{day}}.xlsx",
+  "params": [{ "name": "day", "label": "日期", "default": "today" }]
+}
+```
+
+### 拉取在线配置（两个入口）
+
+把远端一份 `config.json` 下载下来覆盖本地，然后立刻重载 —— 用来在多台机器间同步配置。
+
+**方式 1：底部按钮。** 界面右下角「拉取在线配置」（在「编辑配置」右边）→ 弹层里填网址 → Enter。
+下载先落到临时目录，**校验首字符是 `{` 才替换**；替换前把原文件备份成 `config.json.bak`。
+拉到的是登录页/错误页时直接拒绝，本地配置一个字节都不动。
+
+**方式 2：写进 config.json，用搜索框运行。** 配置里已经有这条示例（`id: pull-config`，地址是假的）：
+
+```jsonc
+{
+  "id": "pull-config",
+  "name": "拉取在线配置",
+  "type": "download",
+  "target": "https://example.com/quicklaunch/config.json",   // ← 换成你自己的地址
+  "savePath": ".",              // "." = 脚本目录
+  "fileName": "config.json",
+  "onExists": "overwrite",
+  "backup": true,
+  "reload": true                // ← 下载完自动重载，不用再点「重载配置」
+}
+```
+
+两个入口的区别只在于「谁负责校验」：
+
+| | 底部按钮 | config 里的 download 条目 |
+|---|---|---|
+| 网址来源 | 手动输入（记住上次填的，存在 localStorage） | 写死在配置里 |
+| 校验 | 下载到临时目录 → 检查是 JSON → 备份 → 替换 | 直接写目标文件（`reload: true` 时自动重载） |
+| 适合 | 临时换一份配置试试 | 固定同步源，当成日常动作 |
+
+> 底部按钮那条路更"保险"：因为它先落到 `%TEMP%`，验证通过才动本地文件。
+> 配置条目走的是通用下载逻辑 —— 如果你把它指向 `config.json`，建议配上 `"backup": true`，
+> 万一远端给的是错误页，还能从 `config.json.bak` 恢复。
+
 ### 请求不通时，怎么判断是网络问题还是配置写错
 
 | 看到什么 | 说明 | 怎么处理 |
@@ -425,6 +527,7 @@ vs code src/app.js           → Code.exe "src/app.js"
 |---|---|---|
 | `cmd` | **原样**交给 cmd，绝不按路径改写 | `ipconfig /all` → `ipconfig /all` |
 | `url` | 原样 | `ms-calculator:`、`https://…` |
+| `webhook` / `download` | 原样（是网址，不是路径） | `https://api…` → 原样 |
 | `folder` / `ahk` | 一律当路径，相对路径按脚本目录解析 | `docs` → `<脚本目录>\docs` |
 | `app` | 绝对路径/协议原样；`.`、`..` 或带分隔符的相对路径按脚本目录解析；**裸命令名**交给 PATH | `.\tool.exe` → `<脚本目录>\tool.exe`；`notepad.exe` → 交给 PATH |
 
@@ -698,6 +801,44 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     日志停在上一行，进程不退，也没有 stderr）。
     程序里所有 `FileDelete` 本来就包了 `try`，但写测试脚本时很容易漏。
 
+31. **⭐ 下载二进制千万别用 `ResponseText`**：`req.ResponseText` 会按响应头/系统代码页把字节
+    **解码成字符串**，再写回去就已经不是原文件了 —— 图片、压缩包、xlsx 全是坏的（而且往往
+    "看起来下载成功了"）。正确姿势是拿 `req.ResponseBody`（`SafeArray(VT_UI1)`，逐字节原样），
+    丢给 `ADODB.Stream`（`Type := 1` 二进制模式）再 `SaveToFile`：
+    ```ahk
+    st := ComObject('ADODB.Stream')
+    st.Type := 1          ; adTypeBinary，默认是 2（文本），不设会按 BSTR 处理
+    st.Open()
+    st.Write(req.ResponseBody)
+    st.SaveToFile(tmp, 2) ; 2 = adSaveCreateOverWrite
+    ```
+    实测用一份"包含全部 256 种字节值 + 中文"的文件验证：`cmp` 逐字节一致，才算真通。
+    （另一条路 `req.ResponseStream` + `IStream::CopyTo` 也能走通，但在 v2 里要用 `ComCall`
+    去开 `WinHttpRequestOption_EnableStreamingResponse`，绕远了，收益一样。）
+
+32. **AHK 里写带引号的正则会翻车，用单引号字符串**：想在匹配 `filename="x.png"` 的正则里
+    表达引号，写成 `"…filename=""([^""]*)""…"` 会被解析成"字符串结束 + 一个 `"`"，
+    报 `Missing space or operator before this`。改用**单引号字符串**原样写就没事：
+    ```ahk
+    RegExMatch(cd, 'i)filename\s*=\s*("([^"]*)"|([^;]+))', &m)
+    ```
+    规律：一段文本里同时要出现 `\` 和 `"` 时，优先用单引号；只有需要反引号转义（`` `n ``）
+    或拼接变量时才用双引号。
+
+33. **下载要么"先写 `.part` 再改名"，要么别写**：直接往目标文件名上写，断线/被杀进程会留下
+    一个长度不对的"完整文件"，下次 `onExists: skip` 还会把它当成已存在而跳过 —— 坏文件
+    就此长期驻留。先写 `名字.part` 再 `FileMove(..., 1)`，失败就把 `.part` 删掉，
+    目标文件要么是旧的、要么是完整的。
+
+34. **`ExitApp` 别和还在跑的定时器抢**：测试脚本最后一行 `ExitApp(0)` 时，如果
+    `CheckHttp` 还有 job 在处理（子进程正在写盘），偶尔会以 `0xC000041D`
+    （用户回调里的异常）退出。加一句 `Sleep(600)` 让收尾跑完再退，退出码就稳定是 0 了。
+
+35. **换行符能把测试夹具弄哑**：`tests/harness.js` 用 `"\n  }\n"` 作锚点从 `app.js` 里抽函数体，
+    在 Windows 上把文件存成 CRLF 之后，锚点一个都匹配不到，报"函数未闭合 pyCall" —— 
+    代码明明是对的。现在 `readSrc()` 会先把 `\r\n` 归一成 `\n` 再抽取，跟签出设置无关。
+    （`core.autocrlf=true` 时 index 里存的还是 LF，所以提交不会因此产生噪音。）
+
 ---
 
 ## 六、已知限制
@@ -714,8 +855,15 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
 - 使用频率的加成上限只有 8%（刻意压的），所以它是"同级微调"而不是"越用越靠前"的强排序；
   真正决定顺序的还是匹配档位。
 - 频率统计以"启动成功"为准，`app` 类型被杀掉/秒退也算一次；没有做失败回滚。
-- webhook 只处理**文本**响应：二进制（图片/文件）会被当作文本读，得到乱码。
+- webhook 只处理**文本**响应：二进制（图片/文件）会被当作文本读，得到乱码。要下文件请用 `download` 类型。
 - webhook 响应超过 400KB 会被截断（面板会标「响应过大已截断」）。
+- `download` 是**最小实现**：整个响应一次性读进内存，所以只适合小文件（几 MB 以内）。
+  没有断点续传、没有分片、没有完整性校验（不比对 `Content-Length` 之外的哈希）、没有进度条，
+  也**不能中途取消**（Esc 只关面板，进程会跑到超时）。
+- `download` 只发 `GET`，不带请求体；`headers` 会照传（内网要 token 的下载直接写 `X-Token: …`）。
+  需要 POST 才能拿到文件的接口，请改用 `webhook`。
+- `download` 把光标留给「保存路径」这一层：路径存在性、写权限的问题只会得到一句错误提示，
+  不会自动换目录；`%VAR%` 只展开一层环境变量，不解析 `~`。
 - 每个请求起一个子进程，没有连接复用；高频连续点会有点开销（单次约 30~80ms 启动成本）。
 - 运行时参数只做"空白切分 + 引号"，不解析 `%VAR%`、管道、通配符。
   `app` / `ahk` 的每个参数按需加引号（含空白或引号才加），所以 `cmd.exe` 这类 shell 语义请用 `cmd` 类型条目（原样拼接）。
@@ -730,6 +878,8 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
 ## 七、可以继续加的东西
 
 - `{{ENV}}` 占位符：把密钥放进环境变量，而不是写在 config.json 里
+- `download`：进度条与中途取消、断点续传（`Range` + `.part` 续写）、`Content-Length`/哈希校验
+- `download`：多文件批量下载（现在一个条目只下一个文件）
 - webhook：请求历史、把常用请求存成条目
 - webhook：响应里可搜索/折叠大 JSON、支持复制单个字段
 - webhook：自定义代理（`WINHTTP_OPTION_PROXY`）与「忽略证书错误」开关（内网自签证书场景）

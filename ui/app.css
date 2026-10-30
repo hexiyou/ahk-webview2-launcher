@@ -401,6 +401,84 @@ kbd {
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
+/* ---------------- 拉取在线配置：输入网址的小弹层 ---------------- */
+.dlg {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(17, 24, 39, .18);
+  backdrop-filter: blur(1.5px);
+}
+.dlg-box {
+  width: 440px;
+  max-width: calc(100% - 40px);
+  padding: 16px 18px 14px;
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(17, 24, 39, .18);
+}
+.dlg-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.dlg-sub {
+  margin-top: 5px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.dlg input {
+  width: 100%;
+  margin-top: 11px;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg-soft);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  outline: none;
+}
+.dlg input:focus {
+  background: #fff;
+  border-color: #b9c9ff;
+  box-shadow: 0 0 0 3px rgba(59, 109, 255, .10);
+}
+.dlg-err {
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: #b42318;
+}
+.dlg-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+}
+.dlg-tip {
+  flex: 1 1 auto;
+  font-size: 11px;
+  color: var(--muted);
+}
+.dlg-tip kbd { margin: 0 2px; }
+.dlg-ok {
+  border: 1px solid #3b6dff;
+  background: #3b6dff;
+  color: #fff;
+  font: inherit;
+  font-size: 11.5px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.dlg-ok:hover { background: #2f5cf0; }
+.dlg-ok:disabled { opacity: .55; cursor: default; }
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 9px; }
 ::-webkit-scrollbar-thumb {
@@ -483,6 +561,15 @@ kbd {
   font-weight: 600;
   letter-spacing: .3px;
   opacity: 1;          /* 方法名一眼能看见，不用等 hover */
+}
+
+/* 下载条目：和"请求"区分开，一眼看出是会落盘的 */
+.row-kind-dl {
+  color: #1d4ed8;
+  background: #eff4ff;
+  border-color: #d3e0ff;
+  font-weight: 600;
+  opacity: 1;
 }
 
 /* ============================================================

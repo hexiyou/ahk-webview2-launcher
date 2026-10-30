@@ -6,7 +6,11 @@ const path = require('path');
 const APP = path.join(__dirname, '..', 'ui', 'app.js');
 
 function readSrc() {
-  return fs.readFileSync(APP, 'utf8');
+  /* 统一换行：Windows 上 git 可能把工作区签出成 CRLF，
+     而抽取函数体用的是 "\n  }\n" 这种锚点，CRLF 会让它匹配不到 */
+  return fs.readFileSync(APP, 'utf8')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n');
 }
 
 function grab(src, name) {
@@ -48,6 +52,7 @@ function build(state, PY, extra, prelude) {
     grabConst(src, /const CMD_TYPES = \{[^}]*\};/, 'CMD_TYPES'),
     grabConst(src, /const TPL_RE = .*;/, 'TPL_RE'),
     grabConst(src, /const FIELD_W = \{[\s\S]*?\n  \};/, 'FIELD_W'),
+    grabConst(src, /const KIND_LABEL = \{[^}]*\};/, 'KIND_LABEL'),
     prelude || ''
   ].join('\n');
 

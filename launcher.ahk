@@ -27,6 +27,7 @@ global DLL_PATH   := SCRIPT_DIR '\lib\WebView2Loader.dll'
 global DATA_DIR   := SCRIPT_DIR '\.webview2'
 global ICON_DIR   := A_Temp '\quicklaunch-icons'
 global HTTP_DIR   := A_Temp '\quicklaunch-http'
+global PULL_DIR   := A_Temp '\quicklaunch-pull'   ; 「拉取在线配置」先落到这里，校验过了才换掉本地文件
 global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
 
 ; ---------------------------- 运行时状态 ------------------------------------
@@ -52,6 +53,7 @@ if !FileExist(UI_PATH) {
 
 ; 清掉上次运行留下的 webhook 临时目录（响应正文可能不小，不清理会越积越多）
 try DirDelete(HTTP_DIR, true)
+try DirDelete(PULL_DIR, true)
 
 BuildUi(settings)
 RegisterHotkey(settings.hotkey)
@@ -556,6 +558,10 @@ OnWebMessage(sender, args) {
             DoRun(raw)
         case 'http':
             DoWebhook(raw)
+        case 'download':
+            DoDownload(raw)
+        case 'pull-config':
+            DoPullConfig(raw)
         case 'reload':
             DoReload()
         case 'open-config':
@@ -760,13 +766,13 @@ DoWebhook(raw) {
         return
     }
 
-    httpJobs[id] := {dir: dir, pid: pid, timeout: timeout
+    httpJobs[id] := {dir: dir, pid: pid, timeout: timeout, kind: 'http', reload: false, purpose: ''
         , deadline: A_TickCount + (timeout + 1) * 1000}
     SetTimer(CheckHttp, 120)          ; SetTimer 幂等，重复调用只是重置间隔
 }
 
 CheckHttp() {
-    global httpJobs, HTTP_MAX_BODY
+    global httpJobs, HTTP_MAX_BODY, CFG_PATH
     for id, job in httpJobs.Clone() {
         metaPath := job.dir '\meta.ini'
         err := ''
@@ -796,21 +802,63 @@ CheckHttp() {
                 try body := FileRead(bodyPath, 'UTF-8')
         }
 
-        truncated := 0
-        if (StrLen(body) > HTTP_MAX_BODY) {
-            body := SubStr(body, 1, HTTP_MAX_BODY)
-            truncated := 1
+        if (job.kind = 'download') {
+            dlFile := '', dlName := '', dlSize := 0, skipped := 0, bakFile := ''
+            if FileExist(metaPath) {
+                dlFile := IniRead(metaPath, 'dl', 'File', '')
+                dlName := IniRead(metaPath, 'dl', 'Name', '')
+                bakFile := IniRead(metaPath, 'dl', 'Backup', '')
+                v := IniRead(metaPath, 'dl', 'Size', '0')
+                dlSize := IsNumber(v) ? Integer(v) : 0
+                v := IniRead(metaPath, 'dl', 'Skipped', '0')
+                skipped := (IsNumber(v) && Integer(v) = 1) ? 1 : 0
+            }
+
+            if (err = '') {
+                if (job.purpose = 'pull-config') {
+                    ; 下载到的只是临时文件：校验通过才覆盖本地，并保留 .bak
+                    r := InstallConfig(dlFile)
+                    if (r.err != '') {
+                        err := r.err
+                    } else {
+                        dlFile := CFG_PATH
+                        bakFile := r.backup
+                        DoReload()
+                    }
+                } else if job.reload {
+                    DoReload()
+                }
+            }
+
+            JsSend('{"type":"download-result","id":' JsonQuote(id)
+                . ',"ok":' (err = '' ? 1 : 0)
+                . ',"status":' status
+                . ',"ms":' ms
+                . ',"error":' JsonQuote(err)
+                . ',"file":' JsonQuote(dlFile)
+                . ',"name":' JsonQuote(dlName)
+                . ',"size":' dlSize
+                . ',"skipped":' skipped
+                . ',"backup":' JsonQuote(bakFile)
+                . ',"purpose":' JsonQuote(job.purpose) '}')
+        } else {
+            truncated := 0
+            if (StrLen(body) > HTTP_MAX_BODY) {
+                body := SubStr(body, 1, HTTP_MAX_BODY)
+                truncated := 1
+            }
+
+            try {
+                JsSend('{"type":"http-result","id":' JsonQuote(id)
+                    . ',"ok":' (err = '' ? 1 : 0)
+                    . ',"status":' status
+                    . ',"ms":' ms
+                    . ',"truncated":' truncated
+                    . ',"error":' JsonQuote(err)
+                    . ',"body":' JsonQuote(body) '}')
+            }
         }
 
-        try {
-            JsSend('{"type":"http-result","id":' JsonQuote(id)
-                ',"ok":' (err = '' ? 1 : 0)
-                ',"status":' status
-                ',"ms":' ms
-                ',"truncated":' truncated
-                ',"error":' JsonQuote(err)
-                ',"body":' JsonQuote(body) '}')
-        }
         ; 请求载荷（请求头/请求体/spec）用完就删，响应留在原处方便排查
         for f in ['h.txt', 'b.txt', 'spec.ini']
             try FileDelete(job.dir '\' f)
@@ -818,6 +866,190 @@ CheckHttp() {
     }
     if !httpJobs.Count
         SetTimer(CheckHttp, 0)
+}
+
+; ============================================================================
+;  Download：webhook 的变种，差别只在"响应体去哪"
+;  ---------------------------------------------------------------------------
+;  和 DoWebhook 共用同一套骨架：写 spec.ini -> 起 webhook.ahk 子进程 -> 轮询结果。
+;  多出来的只有 [dl] 段，子进程据此把 ResponseBody 按二进制写进文件。
+;  有意保持最小：一次性进内存，不做断点续传、校验和、分片。
+; ============================================================================
+
+DoDownload(raw) {
+    StartDownload({
+        id:       JsonStr(raw, 'id'),
+        url:      JsonStr(raw, 'url'),
+        saveDir:  JsonStr(raw, 'savePath'),
+        name:     JsonStr(raw, 'fileName'),
+        timeout:  JsonNum(raw, 'timeout', 15),
+        onExists: JsonStr(raw, 'onExists'),
+        backup:   JsonNum(raw, 'backup', 1) ? true : false,
+        reload:   JsonNum(raw, 'reload', 0) ? true : false,
+        headers:  JsonStrArray(raw, 'headers'),
+        purpose:  ''
+    })
+}
+
+/* 界面底部「拉取在线配置」：下到临时目录 -> 校验 -> 备份 -> 覆盖 config.json -> 重载 */
+DoPullConfig(raw) {
+    global PULL_DIR
+    url := Trim(JsonStr(raw, 'url'), ' `t')
+    if (url = '') {
+        Notify('请先填写网址')
+        return
+    }
+    ; 用户直接粘 example.com/x.json 也能用，不用纠结协议头
+    if !RegExMatch(url, 'i)^https?://')
+        url := 'https://' url
+
+    try DirCreate(PULL_DIR)
+    ; 上一次的残留必须先清掉：否则这次下载失败时会拿旧文件去覆盖配置
+    for f in ['config.json', 'config.json.part', 'config.json.bak']
+        try FileDelete(PULL_DIR '\' f)
+
+    StartDownload({
+        id:       'pull-' A_TickCount,
+        url:      url,
+        saveDir:  PULL_DIR,
+        name:     'config.json',
+        timeout:  JsonNum(raw, 'timeout', 20),
+        onExists: 'overwrite',
+        backup:   0,                 ; 备份交给 InstallConfig（要备到 config.json 旁边，不是临时目录）
+        reload:   false,
+        purpose:  'pull-config'
+    })
+}
+
+StartDownload(cfg) {
+    global HTTP_DIR, SCRIPT_DIR, httpJobs
+
+    if (cfg.url = '') {
+        Notify('download 没有配置下载地址')
+        return
+    }
+    id := cfg.id != '' ? cfg.id : 'd' A_TickCount
+    timeout := (cfg.timeout > 0) ? Min(cfg.timeout, 120) : 15
+
+    saveDir := Trim(cfg.saveDir, ' `t')
+    if (saveDir = '') {
+        saveDir := EnvGet('USERPROFILE') '\Downloads'      ; 没写保存路径 → 系统「下载」目录
+    } else {
+        saveDir := ExpandEnvVars(saveDir)
+        if !IsAbsPath(saveDir)
+            saveDir := SCRIPT_DIR '\' saveDir              ; 相对路径按脚本目录
+    }
+    saveDir := RTrim(saveDir, '\/')
+
+    if !DirExist(saveDir) {
+        try DirCreate(saveDir)                             ; 多级目录一起建
+        if !DirExist(saveDir) {
+            SendDownloadError(id, cfg.purpose, '保存目录无法创建：' saveDir)
+            return
+        }
+    }
+
+    dir := HTTP_DIR '\' id
+    try DirCreate(dir)
+    for f in ['meta.ini', 'body.txt', 'spec.ini', 'h.txt', 'b.txt']
+        try FileDelete(dir '\' f)
+
+    ; download 只发 GET、不带请求体；请求头照传（内网下载常要带 token）
+    hs := ''
+    if cfg.HasOwnProp('headers')
+        for h in cfg.headers
+            hs .= h '`n'
+    try FileAppend(hs, dir '\h.txt', 'UTF-8-RAW')
+    try FileAppend('', dir '\b.txt', 'UTF-8-RAW')
+
+    spec := dir '\spec.ini'
+    IniWrite('download', spec, 'req', 'Mode')
+    IniWrite('GET', spec, 'req', 'Method')
+    IniWrite(cfg.url, spec, 'req', 'Url')
+    IniWrite(timeout, spec, 'req', 'Timeout')
+    IniWrite(dir '\h.txt', spec, 'req', 'HeadersFile')
+    IniWrite(dir '\b.txt', spec, 'req', 'BodyFile')
+    IniWrite(dir, spec, 'req', 'OutDir')
+    IniWrite(saveDir, spec, 'dl', 'SaveDir')
+    IniWrite(cfg.name, spec, 'dl', 'SaveName')
+    IniWrite(cfg.onExists = 'overwrite' ? 'overwrite' : 'skip', spec, 'dl', 'OnExists')
+    IniWrite(cfg.backup ? 1 : 0, spec, 'dl', 'Backup')
+
+    pid := 0
+    try {
+        Run('"' A_AhkPath '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
+            , SCRIPT_DIR, 'Hide', &pid)
+    } catch as e {
+        SendDownloadError(id, cfg.purpose, '无法启动下载进程：' e.Message)
+        return
+    }
+
+    httpJobs[id] := {dir: dir, pid: pid, timeout: timeout, kind: 'download'
+        , reload: cfg.reload, purpose: cfg.purpose
+        , deadline: A_TickCount + (timeout + 1) * 1000}
+    SetTimer(CheckHttp, 120)
+}
+
+SendDownloadError(id, purpose, msg) {
+    JsSend('{"type":"download-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
+        . ',"error":' JsonQuote(msg) ',"file":"","name":"","size":0'
+        . ',"skipped":0,"backup":"","purpose":' JsonQuote(purpose) '}')
+}
+
+/* 用下载到的文件替换本地 config.json。
+   校验只做一件事：首字符必须是 { 或 [ —— 足以挡住 302 到登录页、404 的 HTML 这类
+   "看着成功其实是错误页"的情况。真正的结构问题由前端 applyConfig 兜底。 */
+InstallConfig(src) {
+    global CFG_PATH
+    if (src = '' || !FileExist(src))
+        return { err: '下载到的文件不见了（临时目录可能被清理）', backup: '' }
+
+    try t := Trim(FileRead(src, 'UTF-8'), ' `t`r`n')
+    catch
+        return { err: '读不到下载到的文件', backup: '' }
+
+    if (SubStr(t, 1, 1) != '{' && SubStr(t, 1, 1) != '[')
+        return { err: '下载到的内容不是 JSON（多半是错误页或登录页），本地配置未改动', backup: '' }
+
+    bak := CFG_PATH '.bak'
+    try FileDelete(bak)
+    if FileExist(CFG_PATH) {
+        try FileCopy(CFG_PATH, bak, 1)
+        catch
+            bak := ''
+    }
+
+    try FileMove(src, CFG_PATH, 1)
+    catch {
+        ; 临时目录和脚本目录不在同一个盘时 FileMove 会失败，退回复制
+        try {
+            FileCopy(src, CFG_PATH, 1)
+            FileDelete(src)
+        } catch as e {
+            return { err: '覆盖配置失败：' CleanComError(e.Message), backup: '' }
+        }
+    }
+
+    return { err: '', backup: (bak != '' && FileExist(bak)) ? bak : '' }
+}
+
+/* 展开 %USERPROFILE% 这类环境变量：配置里写 %TEMP% 比写死用户名可移植 */
+ExpandEnvVars(p) {
+    Loop 10 {                             ; 防御：变量值里再套变量也不至于打转
+        if !RegExMatch(p, '%([^%]+)%', &m)
+            break
+        v := EnvGet(m[1])
+        if (v = '')
+            break                         ; 未知变量原样留着，用户一眼能看到
+        p := StrReplace(p, m[0], v)
+    }
+    return p
+}
+
+IsAbsPath(p) {
+    if RegExMatch(p, '^[a-zA-Z]:[\\/]')
+        return true
+    return (SubStr(p, 1, 2) = '\\' || SubStr(p, 1, 2) = '//')
 }
 
 OpenConfig() {
@@ -1001,4 +1233,12 @@ JsonUnescape(s) {
         i++
     }
     return out
+}
+
+/* AHK 的 COM 异常 Message 后面会挂 "Source: ... Description: ..."，只留前半句人话 */
+CleanComError(msg) {
+    p := InStr(msg, 'Source:')
+    if p
+        msg := SubStr(msg, 1, p - 1)
+    return Trim(StrReplace(StrReplace(msg, "`r", ' '), "`n", ' '))
 }

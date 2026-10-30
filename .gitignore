@@ -16,6 +16,9 @@ _*.js
 usage.json
 usage.json.tmp
 
+# ── 拉取在线配置时自动留的备份（本机状态，不进仓库） ──
+config.json.bak
+
 # ── 生成拼音表用的原始数据（985KB，只在重新生成时需要） ──
 pinyin.txt
 

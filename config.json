@@ -180,6 +180,29 @@
       "group": "tool"
     },
     {
+      "id": "pull-config",
+      "name": "拉取在线配置",
+      "subtitle": "示例：下载远端 config.json 覆盖本地并重载（地址是假的）",
+      "keywords": [
+        "pull",
+        "config",
+        "sync",
+        "在线配置",
+        "同步"
+      ],
+      "icon": "⬇",
+      "type": "download",
+      "group": "tool",
+      "target": "https://example.com/quicklaunch/config.json",
+      "savePath": ".",
+      "fileName": "config.json",
+      "onExists": "overwrite",
+      "backup": true,
+      "reload": true,
+      "timeout": 20,
+      "accent": "#8b5cf6"
+    },
+    {
       "id": "ip-config",
       "name": "查看本机 IP",
       "subtitle": "在 cmd 中执行 ipconfig /all",
@@ -295,6 +318,27 @@
         }
       ],
       "pinned": false,
+      "accent": "#0ea5e9"
+    },
+    {
+      "id": "dl-demo",
+      "name": "下载示例文件",
+      "subtitle": "小文件下载 · 存到「下载」目录，同名文件跳过",
+      "keywords": [
+        "download",
+        "下载",
+        "文件",
+        "curl"
+      ],
+      "icon": "⬇",
+      "type": "download",
+      "group": "net",
+      "target": "https://raw.githubusercontent.com/mozillazg/pinyin-data/master/pinyin.txt",
+      "savePath": "%USERPROFILE%\\Downloads",
+      "fileName": "",
+      "onExists": "skip",
+      "backup": false,
+      "timeout": 30,
       "accent": "#0ea5e9"
     }
   ],

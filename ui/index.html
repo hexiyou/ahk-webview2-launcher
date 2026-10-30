@@ -115,7 +115,24 @@
     <span class="spacer"></span>
     <button class="linkbtn" id="btnReload" title="重新读取 config.json">重载配置</button>
     <button class="linkbtn" id="btnOpenCfg" title="用默认编辑器打开 config.json">编辑配置</button>
+    <button class="linkbtn" id="btnPullCfg" title="从网址下载一份 config.json 覆盖本地">拉取在线配置</button>
   </footer>
+
+  <!-- 拉取在线配置：输入网址 → 下载 → 校验 → 覆盖本地 config.json -->
+  <div class="dlg" id="pullDlg" hidden>
+    <div class="dlg-box">
+      <div class="dlg-title">拉取在线配置</div>
+      <div class="dlg-sub">下载一份 config.json 覆盖本地文件，成功后会立即重载；原文件备份为 config.json.bak</div>
+      <input id="pullUrl" type="text" spellcheck="false" autocomplete="off"
+             placeholder="https://example.com/quicklaunch/config.json">
+      <div class="dlg-err" id="pullErr" hidden></div>
+      <div class="dlg-btns">
+        <span class="dlg-tip"><kbd>Enter</kbd> 下载 · <kbd>Esc</kbd> 取消</span>
+        <button class="linkbtn" id="pullCancel">取消</button>
+        <button class="dlg-ok" id="pullOk">下载并覆盖</button>
+      </div>
+    </div>
+  </div>
 
   <div class="toast" id="toast"></div>
 </div>

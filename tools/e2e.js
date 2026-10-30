@@ -99,6 +99,62 @@ const PAGE_JS = String.raw`
     });
     log('T13 file:///// UNC 图标  -> ' + imgRes);
 
+    /* download 类型：列表徽标应该是「下载」而不是方法名。
+       先退出参数态，否则列表 DOM 还是上一步的（参数态下列表是隐藏的，不会重绘） */
+    key('Escape'); await wait(120);
+    setQ('下载示例'); await wait(150);
+    const dlRow = document.querySelector('#list .row');
+    const dlKind = dlRow && dlRow.querySelector('.row-kind');
+    log('T14 download 行徽标     -> 命中=' + JSON.stringify(names().slice(0, 2)) +
+        ' 徽标=' + (dlKind ? dlKind.textContent : '(无)'));
+
+    /* 「拉取在线配置」弹层：点开 / Esc 关 / 非法网址报错 */
+    const dlg = document.getElementById('pullDlg');
+    const input = document.getElementById('pullUrl');
+    document.getElementById('btnPullCfg').click(); await wait(150);
+    const opened = !dlg.hidden;
+    const focused = document.activeElement === input;
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await wait(120);
+    log('T15 拉取弹层           -> 打开=' + opened + ' 焦点=' + focused + ' Esc 后已关=' + dlg.hidden);
+
+    document.getElementById('btnPullCfg').click(); await wait(120);
+    input.value = '这不是网址';
+    document.getElementById('pullOk').click(); await wait(150);
+    log('T16 非法网址           -> 提示=' + JSON.stringify(
+        (document.getElementById('pullErr').textContent || '').slice(0, 24)) + ' 仍打开=' + !dlg.hidden);
+
+    /* 合法但必然连不上的地址：验证"JS → AHK → webhook.ahk → 回包 → toast"整条链路 */
+    input.value = 'http://127.0.0.1:1/config.json';
+    document.getElementById('pullOk').click(); await wait(250);
+    const closed = dlg.hidden;
+    let pullToast = '';
+    for (let i = 0; i < 40; i++) {
+      await wait(200);
+      pullToast = document.getElementById('toast').textContent || '';
+      if (/拉取失败|配置已拉取/.test(pullToast)) break;
+    }
+    log('T17 拉取失败回包       -> 弹层已关=' + closed + ' toast=' + JSON.stringify(pullToast.slice(0, 36)));
+
+    /* download 的结果面板（临时配置，指向不存在的端口，不会真落盘） */
+    window.__applyConfig({
+      items: [{ id: 'tdl', name: '测试下载', type: 'download',
+        target: 'http://127.0.0.1:1/x.bin', savePath: '%TEMP%', timeout: 5 }]
+    });
+    await wait(200);
+    setQ('测试下载'); await wait(150);
+    key('Enter');
+    for (let i = 0; i < 30; i++) {
+      await wait(200);
+      if (!document.getElementById('result').hidden) {
+        const stat = document.getElementById('rStatus').textContent || '';
+        if (!/下载中/.test(stat)) break;
+      }
+    }
+    log('T18 download 结果面板   -> 面板=' + !document.getElementById('result').hidden +
+        ' 状态=' + JSON.stringify(document.getElementById('rStatus').textContent) +
+        ' 正文=' + JSON.stringify((document.getElementById('rPre').textContent || '').slice(0, 30)));
+
     await wait(900);                      /* 等 usage.json 落盘（写盘有 400ms 防抖） */
     log('DONE');
   } catch (e) {
@@ -136,6 +192,24 @@ const AHK_TAIL = [
   ''
 ].join('\n');
 
+/* T13 要在 UNC 共享上放一张 png 来验证 file:///// 能不能加载。
+   不依赖之前测试留下的文件：这里直接写一张 1×1 PNG 过去（失败就跳过那一步） */
+const UNC_DIR = '\\\\localhost\\Users\\Administrator\\AppData\\Local\\Temp\\unctest';
+const ONE_PX_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64');
+
+function prepareUncIcon() {
+  try {
+    fs.mkdirSync(UNC_DIR + '\\子 目录', { recursive: true });
+    fs.writeFileSync(UNC_DIR + '\\icon test.png', ONE_PX_PNG);
+    return true;
+  } catch (e) {
+    console.log('[提示] 准备 UNC 图标测试文件失败（这台机器可能没开 SMB 共享）：' + e.message);
+    return false;
+  }
+}
+
 function build() {
   let src = fs.readFileSync(path.join(ROOT, 'launcher.ahk'), 'utf8');
 
@@ -156,6 +230,7 @@ function build() {
 
 function main() {
   build();
+  prepareUncIcon();
   try { fs.unlinkSync(LOG); } catch (e) {}
 
   const r = spawnSync(AHK, ['/ErrorStdOut', '/force', GEN], {
@@ -171,7 +246,10 @@ function main() {
   const stderr = (r.stderr || '').trim();
   if (stderr) console.log('\n[AHK stderr]\n' + stderr);
 
-  const ok = /E2E DONE/.test(log) && /T9 → 补历史\s*-> "8\.8\.8\.8"/.test(log);
+  const ok = /E2E DONE/.test(log) &&
+    /T9 → 补历史\s*-> "8\.8\.8\.8"/.test(log) &&
+    /T17 拉取失败回包\s*-> 弹层已关=true/.test(log) &&
+    /T18 download 结果面板\s*-> 面板=true/.test(log);
   console.log('\n' + (ok ? '端到端冒烟：通过' : '端到端冒烟：有异常，逐行看上面的输出'));
   process.exit(ok ? 0 : 1);
 }

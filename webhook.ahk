@@ -10,9 +10,15 @@
 ;    AutoHotkey64.exe webhook.ahk <spec.ini>
 ;    spec.ini 由主进程写，内容见下面 IniRead 的键名。
 ;
+;  两种模式（spec 里的 [req] Mode）：
+;    http      默认。响应正文按文本落盘，交给前端显示（webhook 类型）
+;    download  把响应体按二进制写进文件（download 类型）。和 http 共用
+;              同一套请求逻辑，只是"结果去哪"不同
+;
 ;  产物（写给主进程读）：
 ;    <OutDir>\meta.ini   [resp] Status / Error / Ms / Len
-;    <OutDir>\body.txt   响应正文（UTF-8 无 BOM）
+;                        [dl]   File / Name / Size / Skipped / Backup   （仅 download）
+;    <OutDir>\body.txt   响应正文（UTF-8 无 BOM，仅 http 模式）
 ;
 ;  注意：这里刻意不做任何 JSON 解析 —— 正文原样落盘，交给前端的 JSON.parse 处理。
 ; ============================================================================
@@ -25,12 +31,19 @@ spec := A_Args.Length >= 1 ? A_Args[1] : ''
 if (spec = '' || !FileExist(spec))
     ExitApp(2)
 
+mode     := IniRead(spec, 'req', 'Mode', 'http')
 method   := IniRead(spec, 'req', 'Method', 'GET')
 url      := IniRead(spec, 'req', 'Url', '')
-timeout  := Integer(IniRead(spec, 'req', 'Timeout', '15'))
+timeout  := IntOr(IniRead(spec, 'req', 'Timeout', '15'), 15)
 hdrsFile := IniRead(spec, 'req', 'HeadersFile', '')
 bodyFile := IniRead(spec, 'req', 'BodyFile', '')
 outDir   := IniRead(spec, 'req', 'OutDir', '')
+
+; download 专用
+saveDir  := IniRead(spec, 'dl', 'SaveDir', '')
+saveName := IniRead(spec, 'dl', 'SaveName', '')
+onExists := IniRead(spec, 'dl', 'OnExists', 'skip')
+backup   := IntOr(IniRead(spec, 'dl', 'Backup', '0'), 0)
 
 if (outDir = '' || url = '')
     ExitApp(3)
@@ -43,6 +56,7 @@ try FileDelete(outBody)
 status := 0
 errMsg := ''
 body := ''
+dl := { file: '', name: '', size: 0, skipped: 0, backup: '' }
 t0 := A_TickCount
 
 try {
@@ -77,7 +91,15 @@ try {
     }
 
     status := req.Status
-    body := req.ResponseText
+
+    if (mode = 'download') {
+        ; 只认 2xx：404/500 的响应体是错误页，存成文件只会污染目录
+        if (status < 200 || status > 299)
+            throw Error('下载失败：服务器返回 HTTP ' status '（未保存任何文件）')
+        dl := SaveToFile(req, saveDir, saveName, onExists, backup, url)
+    } else {
+        body := req.ResponseText
+    }
 } catch as e {
     errMsg := CleanComError(e.Message)
 
@@ -111,9 +133,11 @@ try {
 
 elapsed := A_TickCount - t0
 
-try FileAppend(body, outBody, 'UTF-8-RAW')
-catch
-    errMsg := errMsg = '' ? '响应写入失败（可能无权限）' : errMsg
+if (mode != 'download') {
+    try FileAppend(body, outBody, 'UTF-8-RAW')
+    catch
+        errMsg := errMsg = '' ? '响应写入失败（可能无权限）' : errMsg
+}
 
 ; 错误信息可能带换行，IniWrite 的值必须是单行
 errMsg := StrReplace(StrReplace(errMsg, "`r", ' '), "`n", ' ')
@@ -122,13 +146,155 @@ try FileDelete(meta)
 IniWrite(status, meta, 'resp', 'Status')
 IniWrite(errMsg, meta, 'resp', 'Error')
 IniWrite(elapsed, meta, 'resp', 'Ms')
-IniWrite(StrLen(body), meta, 'resp', 'Len')
+IniWrite(mode = 'download' ? dl.size : StrLen(body), meta, 'resp', 'Len')
+
+if (mode = 'download') {
+    IniWrite(dl.file, meta, 'dl', 'File')
+    IniWrite(dl.name, meta, 'dl', 'Name')
+    IniWrite(dl.size, meta, 'dl', 'Size')
+    IniWrite(dl.skipped, meta, 'dl', 'Skipped')
+    IniWrite(dl.backup, meta, 'dl', 'Backup')
+}
 
 ExitApp(0)
 
 ; ----------------------------------------------------------------------------
 ;  ↓ 以下必须留在自动执行段之后
 ; ----------------------------------------------------------------------------
+
+/* 把响应体写成文件。返回 {file, name, size, skipped, backup}
+   —— 文件很小（配置文件、图标、脚本），所以一次性进内存，不做分片/断点。 */
+SaveToFile(req, dir, given, onExists, doBackup, url) {
+    name := SaltName(given != '' ? given : PickName(req, url))
+    if (dir = '')
+        dir := EnvGet('USERPROFILE') '\Downloads'
+    try DirCreate(dir)                      ; 顺带创建多级目录
+    if !DirExist(dir)
+        throw Error('保存目录不可用：' dir)
+
+    final := RTrim(dir, '\/') '\' name
+    res := { file: final, name: name, size: 0, skipped: 0, backup: '' }
+
+    if FileExist(final) {
+        if (onExists != 'overwrite') {       ; 默认跳过：最保守的语义
+            res.skipped := 1
+            res.size := FileGetSize(final)
+            return res
+        }
+        if (doBackup) {
+            bakPath := final '.bak'
+            try FileDelete(bakPath)
+            try {
+                FileCopy(final, bakPath, 1)
+                res.backup := bakPath
+            }
+        }
+    }
+
+    ; 先写 .part 再改名：中途失败不会留下一个"看起来完整"的半截文件
+    tmp := final '.part'
+    try FileDelete(tmp)
+
+    st := ComObject('ADODB.Stream')          ; ADODB 是最省事的二进制写盘方式
+    st.Type := 1                             ; adTypeBinary（1 = 二进制，默认是文本）
+    st.Open()
+    try {
+        ; ResponseBody 是 SafeArray(VT_UI1)，ADODB 能直接吃。
+        ; 千万别用 ResponseText：那会按字符集解码，图片/压缩包当场废掉
+        st.Write(req.ResponseBody)
+        st.SaveToFile(tmp, 2)                ; 2 = adSaveCreateOverWrite
+        st.Close()
+    } catch as e {
+        try st.Close()
+        try FileDelete(tmp)
+        throw Error('写入文件失败：' CleanComError(e.Message))
+    }
+
+    try FileMove(tmp, final, 1)
+    catch {
+        try FileDelete(tmp)
+        throw Error('保存失败：目标被占用或没有权限（' final '）')
+    }
+
+    res.size := FileGetSize(final)
+    return res
+}
+
+/* 文件名优先级：Content-Disposition > URL 最后一段（curl -O 的行为） */
+PickName(req, url) {
+    cd := ''
+    try cd := req.GetResponseHeader('Content-Disposition')
+    cd := Trim(cd == '' ? '' : cd)
+
+    if (cd != '') {
+        ; RFC 5987 的 filename*=UTF-8''%E4%B8%AD.txt 优先，浏览器/服务端都这么排
+        if RegExMatch(cd, "i)filename\*\s*=\s*([^;]+)", &m) {
+            v := Trim(m[1], ' "')
+            if RegExMatch(v, "^[^']*'[^']*'(.*)$", &pfx)
+                v := pfx[1]
+            v := UrlDecode(v)
+            if (v != '')
+                return v
+        }
+        if RegExMatch(cd, 'i)filename\s*=\s*("([^"]*)"|([^;]+))', &m) {
+            v := m[2] != '' ? m[2] : Trim(m[3], ' ')
+            v := UrlDecode(v)
+            if (v != '')
+                return v
+        }
+    }
+
+    u := url
+    if (p := InStr(u, '#'))
+        u := SubStr(u, 1, p - 1)
+    if (p := InStr(u, '?'))
+        u := SubStr(u, 1, p - 1)
+    seg := ''
+    for part in StrSplit(u, '/')
+        seg := part
+    seg := UrlDecode(seg)
+    return (seg != '') ? seg : 'download.bin'
+}
+
+/* 文件名里不能出现的字符一律换掉 —— 远端可以返回任意字符串，
+   带 : / \ 的名字会被当成路径写到别的地方去 */
+SaltName(n) {
+    n := RegExReplace(n, '[\\/:*?"<>|\x00-\x1f]', '_')
+    n := Trim(n, ' .')
+    if (n = '' || n = '.' || n = '..')
+        n := 'download.bin'
+    return n
+}
+
+/* %XX 解码（按 UTF-8 解释）。不做 + → 空格：路径里 + 就是加号本身 */
+UrlDecode(s) {
+    len := StrLen(s)
+    if !len
+        return ''
+    buf := Buffer(len * 4 + 8, 0)
+    n := 0, i := 1
+    while (i <= len) {
+        c := SubStr(s, i, 1)
+        if (c = '%' && i + 2 <= len && RegExMatch(SubStr(s, i + 1, 2), '^[0-9a-fA-F]{2}$')) {
+            NumPut('UChar', Integer('0x' SubStr(s, i + 1, 2)), buf, n)
+            n += 1, i += 3
+            continue
+        }
+        b := StrPut(c, 'UTF-8')
+        tmp := Buffer(b, 0)
+        StrPut(c, tmp, 'UTF-8')
+        DllCall('RtlMoveMemory', 'ptr', buf.Ptr + n, 'ptr', tmp.Ptr, 'uptr', b - 1)
+        n += b - 1
+        i += 1
+    }
+    return n ? StrGet(buf, n, 'UTF-8') : ''
+}
+
+IntOr(s, def) {
+    s := Trim(s)
+    return IsNumber(s) ? Integer(s) : def
+}
+
 CleanComError(msg) {
     p := InStr(msg, 'Source:')
     if p
