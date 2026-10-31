@@ -33,6 +33,8 @@ const DEFAULT_NAMES = [
   'pyCall', 'isBoundaryAt', 'subseqQuality', 'fieldQuality', 'fieldsOf', 'scoreOne', 'scoreOf',
   /* 查询解析 + 参数切分 */
   'splitQuoted', 'takesArgs', 'uniqueMatch', 'splitArgs', 'parseQuery', 'sourceFor', 'findGroup',
+  /* 空格语义 / 切范围保选择 */
+  'spaceTarget', 'selIndexById',
   /* 参数取值 */
   'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery',
   'tplVars', 'templateIssues', 'joinTokens', 'applyParams',

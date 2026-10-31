@@ -65,6 +65,7 @@
     result: null,
     param: null,          /* 参数态：{ item, head }，列表锁定单条 */
     noSplit: false,       /* 刚按 Esc 退出参数态，别立刻又自动进去 */
+    selTouched: false,    /* 选择被 ↑↓ 主动挪过（打字会立刻清掉，见 input 事件） */
     usage: {},            /* 使用记录：id -> { n 次数, t 上次时间戳(秒), args 参数历史 } */
     index: {},            /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
     cfg: null,            /* 原始配置：定时调度那段要重新解析，所以要留一份 */
@@ -291,6 +292,36 @@
       if (item) return { item: item, head: head, tail: tail };
     }
     return null;
+  }
+
+  /* 空格到底是什么意思？两种意图共用这一个键：
+       —— 多词搜索的分隔符（「查看 ip」要能命中「查看本机 IP」）
+       —— 「给高亮的这一条填参数」（页脚也是这么写的：空格 带参数）
+
+     靠「选择是不是用户自己挪过去的」来消歧。打字会触发 input 事件把 sel 归零、
+     同时清掉这个标记，所以 selTouched 为真时用户的上一个动作一定是 ↑↓ ——
+     此刻按空格的意图只可能是"给这一条填参数"。
+     没挪过就交回文本判据（splitArgs），多词搜索一个字的语义都不变。
+
+     鼠标悬停故意**不**置这个标记：窗口弹出时光标常常正压在列表上，
+     一悬停就让空格变语义的话，「查看 ip」这种两段式搜索会被莫名其妙地打断。
+
+     之前的 bug 就在这儿：空格只走文本判据（uniqueMatch("cmd") 精确命中 id 为
+     cmd 的「命令提示符」），于是无论高亮停在第三行还是第四行，空格都把参数态
+     钉到第一条上去。 */
+  function spaceTarget(item, inParam, selTouched) {
+    if (inParam || !selTouched) return null;
+    return takesArgs(item) ? item : null;
+  }
+
+  /* 切范围（Tab 命中命令模式）时用：在新结果里找回原来选中的那条，找不到返回 -1 */
+  function selIndexById(results, id) {
+    if (!id) return -1;
+    const list = results || [];
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id === id) return i;
+    }
+    return -1;
   }
 
   /* 声明的参数 → 实际取值；没给又没默认值的进 missing */
@@ -1216,6 +1247,7 @@
     state.param = null;
     state.noSplit = true;                 /* 否则 render 立刻又把它分回去 */
     state.histIdx = null;
+    state.selTouched = false;
     els.subjChip.hidden = true;
     els.q.placeholder = PLACEHOLDER;
     els.q.value = head;
@@ -1392,6 +1424,16 @@
       }
     });
     return true;
+  }
+
+  /* 光标是否停在末尾、且没选中一段文本 —— 此时空格抢键才不会吃掉用户正在编辑的内容 */
+  function caretAtEnd() {
+    try {
+      const v = els.q.value;
+      return els.q.selectionStart === v.length && els.q.selectionEnd === v.length;
+    } catch (e) {
+      return true;                        /* 取不到就按"在末尾"处理，老浏览器也能用 */
+    }
   }
 
   /* →：用最近一次的历史把当前前缀补全。有多个可补时取最近的那条。 */
@@ -1580,6 +1622,7 @@
     els.q.value = s;
     state.q = s;
     state.sel = 0;
+    state.selTouched = false;
     render();
     els.q.focus();
   }
@@ -1664,6 +1707,8 @@
       row.appendChild(ent);
 
       row.addEventListener('click', () => { state.sel = idx; doLaunch(); });
+      /* 鼠标悬停只挪高亮，不置 selTouched：光标本来就可能停在列表上，
+         一悬停就让空格变成"进参数态"，多词搜索会被莫名其妙地打断 */
       row.addEventListener('mouseenter', () => { state.sel = idx; highlight(); });
       frag.appendChild(row);
     });
@@ -1685,6 +1730,7 @@
   function moveSel(delta) {
     if (!state.results.length) return;
     state.sel = (state.sel + delta + state.results.length) % state.results.length;
+    state.selTouched = true;              /* 空格从此对这个高亮行生效，见 spaceTarget */
     highlight();
   }
 
@@ -1745,9 +1791,21 @@
     return true;
   }
 
-  /* 直接进入某条目的参数态：等价于替用户敲了「名字 + 空格」 */
+  /* 直接进入某条目的参数态：等价于替用户敲了「名字 + 空格」。
+     以前是绕回文本（setQuery(item.name + ' ')）让 render 的拆分规则再接一手，
+     同名条目会拆不开（exact > 1 → 不分裂），于是空格点下去像没反应。
+     现在直接置参数态，不再依赖文本能不能重新拆回来。 */
   function enterParamFor(item) {
-    setQuery(item.name + ' ');
+    if (!item) return;
+    state.param = { item: item, head: item.name };
+    state.noSplit = false;
+    state.histIdx = null;
+    state.sel = 0;
+    state.selTouched = false;
+    state.q = item.name + ' ';
+    setInputTail('');                     /* 芯片写名字、输入框清空、占位符换成参数提示 */
+    render();
+    els.q.focus();
   }
 
   /* Enter：参数态就带上参数，否则按老行为 */
@@ -2340,12 +2398,15 @@
       state.noSplit = false;
       state.histIdx = null;
       state.sel = 0;
+      state.selTouched = false;           /* 一打字就回到"文字说了算"，空格还是普通字符 */
       /* 参数态：输入框里只有参数，主体在 chip 上 */
       state.q = state.param ? (state.param.head + ' ' + els.q.value) : els.q.value;
       render();
     });
 
     els.q.addEventListener('keydown', e => {
+      /* 输入法正在组字：空格/回车/方向键此刻都是在跟候选词打交道，一个都别抢 */
+      if (e.isComposing) return;
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         if (!paramHistory(1)) moveSel(1);
@@ -2358,6 +2419,14 @@
       } else if (e.key === 'Enter') {
         e.preventDefault();
         doLaunch();
+      } else if (e.key === ' ' || e.code === 'Space') {
+        /* 空格：高亮行是用户自己挪过去的，就为他进参数态（修"空格永远跳第一条"）。
+           光标不在末尾、或选了一段文本时不动，让空格老老实实当字符用。 */
+        const target = spaceTarget(state.results[state.sel], state.param, state.selTouched);
+        if (target && caretAtEnd()) {
+          e.preventDefault();
+          enterParamFor(target);
+        }
       } else if (e.key === 'Tab') {
         e.preventDefault();
         if (!state.param) { toggleCmd(); return; }
@@ -2444,6 +2513,9 @@
     const isCmd = state.scope === 'cmd' || state.scope === 'group-cmd';
     const gid = state.groupId;
     const term = state.term || '';
+    /* 切范围不该把人选好的行切没了：记下 id，换完再找回来（找不回才回第一行） */
+    const keep = state.results[state.sel];
+    const keepId = keep ? keep.id : '';
 
     let q = gid ? '@' + gid : '';
     if (isCmd) {
@@ -2453,6 +2525,15 @@
       q += '>' + term;
     }
     setQuery(q);
+
+    const idx = selIndexById(state.results, keepId);
+    if (idx > 0) {
+      state.sel = idx;
+      /* 找回来了，就等于"用户仍然选着这一行"：接着按空格可以直接填参数 */
+      state.selTouched = true;
+      highlight();
+      updateHint();
+    }
   }
 
   /* Esc 分层退：结果面板 -> 查询串 -> 隐藏窗口 */

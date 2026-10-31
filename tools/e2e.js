@@ -136,6 +136,40 @@ const PAGE_JS = String.raw`
     }
     log('T17 拉取失败回包       -> 弹层已关=' + closed + ' toast=' + JSON.stringify(pullToast.slice(0, 36)));
 
+    /* 空格必须认「当前高亮行」而不是只认文字：搜 cmd 出多条 → ↓↓ 选到第三条 → 空格，
+       参数态的 chip 应该是第三条。临时配置刻意复刻事故现场（一条 id 就叫 cmd 的 app，
+       文字判据会精确命中它，老版本于是永远进第一条的参数态）。 */
+    window.__applyConfig({
+      items: [
+        { id: 'cmd', name: '命令提示符', type: 'app', keywords: ['cmd'], target: 'cmd.exe' },
+        { id: 'x1', name: '示例甲 cmd 一条', type: 'cmd', keywords: ['cmd'], target: 'echo a' },
+        { id: 'x2', name: '示例乙 cmd 两条', type: 'cmd', keywords: ['cmd'], target: 'echo b' }
+      ]
+    });
+    await wait(250);
+    setQ('cmd'); await wait(150);
+    key('ArrowDown'); key('ArrowDown'); await wait(80);
+    const movedRow = document.querySelector('#list .row.sel .row-name');
+    const moved = movedRow ? movedRow.textContent : '(无)';
+    key(' '); await wait(150);
+    const chip = document.getElementById('subjName').textContent;
+    log('T18 空格认高亮行       -> 移到=' + JSON.stringify(moved) +
+        ' 参数态=' + JSON.stringify(chip) + ' 一致=' + (chip === moved) +
+        ' 面板=' + !document.getElementById('paramSection').hidden);
+
+    /* Tab 切范围不该把人选好的那行切丢 */
+    key('Escape'); await wait(120);
+    setQ('cmd'); await wait(150);
+    key('ArrowDown'); key('ArrowDown'); await wait(80);
+    const tabBeforeRow = document.querySelector('#list .row.sel .row-name');
+    const tabBefore = tabBeforeRow ? tabBeforeRow.textContent : '(无)';
+    key('Tab'); await wait(200);
+    const tabAfterRow = document.querySelector('#list .row.sel .row-name');
+    const tabAfter = tabAfterRow ? tabAfterRow.textContent : '(无)';
+    log('T18b Tab 保住选中      -> 切前=' + JSON.stringify(tabBefore) +
+        ' 切后=' + JSON.stringify(tabAfter) + ' 一致=' + (tabAfter === tabBefore) +
+        ' 范围=' + JSON.stringify(q.value));
+
     /* download 的结果面板（临时配置，指向不存在的端口，不会真落盘） */
     window.__applyConfig({
       items: [{ id: 'tdl', name: '测试下载', type: 'download',
@@ -151,7 +185,7 @@ const PAGE_JS = String.raw`
         if (!/下载中/.test(stat)) break;
       }
     }
-    log('T18 download 结果面板   -> 面板=' + !document.getElementById('result').hidden +
+    log('T19 download 结果面板   -> 面板=' + !document.getElementById('result').hidden +
         ' 状态=' + JSON.stringify(document.getElementById('rStatus').textContent) +
         ' 正文=' + JSON.stringify((document.getElementById('rPre').textContent || '').slice(0, 30)));
 
@@ -254,7 +288,9 @@ function main() {
   const ok = /E2E DONE/.test(log) &&
     /T9 → 补历史\s*-> "8\.8\.8\.8"/.test(log) &&
     /T17 拉取失败回包\s*-> 弹层已关=true/.test(log) &&
-    /T18 download 结果面板\s*-> 面板=true/.test(log);
+    /T18 空格认高亮行\s*-> .*一致=true 面板=true/.test(log) &&
+    /T18b Tab 保住选中\s*-> .*一致=true/.test(log) &&
+    /T19 download 结果面板\s*-> 面板=true/.test(log);
   console.log('\n' + (ok ? '端到端冒烟：通过' : '端到端冒烟：有异常，逐行看上面的输出'));
   process.exit(ok ? 0 : 1);
 }
