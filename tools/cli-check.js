@@ -150,6 +150,12 @@ function prep() {
       { id: 'hidden', name: '停用条目', type: 'ahk', target: 'mark.ahk', group: 't', enabled: false },
       { id: 'shown', name: '显式启用', type: 'ahk', target: 'mark.ahk', group: 't', enabled: true },
       { id: 'badtarget', name: '坏目标', type: 'app', target: 'C:\\nope\\missing.exe', group: 't' },
+      /* 模板变量：声明了 params，args 里的 {{tag}} 该被替换，且 tag 不再追加 */
+      { id: 'tpl', name: '模板条目', type: 'ahk', target: 'mark.ahk', args: '--tag {{tag}}', group: 't', params: [{ name: 'tag' }] },
+      /* 没声明 params：{{tag}} 原样传下去（老配置的行为一个字节都不能变） */
+      { id: 'tplraw', name: '无声明参数', type: 'ahk', target: 'mark.ahk', args: '{{tag}}', group: 't' },
+      /* 拼错变量名：执行前就该被拦住 */
+      { id: 'tplbad', name: '拼错模板', type: 'ahk', target: 'mark.ahk', args: '{{tga}}', group: 't', params: [{ name: 'tag' }] },
       {
         id: 'hook', name: '测试请求', type: 'webhook', group: 't',
         target: base + '/api?q={{q}}', params: [{ name: 'q', label: '关键词' }]
@@ -264,6 +270,29 @@ function killInstances(pid) {
   eq('显式启用的条目能被 list 到', (() => {
     try { return (JSON.parse(t6e.out).items || []).map(x => x.id); } catch (e) { return []; }
   })(), ['shown']);
+
+  /* 模板变量：声明了 params 的条目 target/args 里的 {{x}} 会被替换，
+     没声明的整条不替换（老配置零影响），拼错变量则拒绝执行。 */
+  console.log('— 模板变量（{{x}}）');
+  clearMark();
+  const t7a = await run(['run', 'tpl', '--args', 'hello', '--wait']);
+  eq('模板条目退出码 0', t7a.code, 0);
+  eq('args 里的 {{tag}} 被替换且不再追加', await waitMark('args=[--tag|hello|]'),
+    'args=[--tag|hello|]');
+
+  clearMark();
+  const t7b = await run(['run', 'tplraw', '--args', 'hello', '--wait']);
+  eq('没声明 params 的条目照常执行', t7b.code, 0);
+  eq('{{tag}} 原样传下去', await waitMark('args=[{{tag}}|hello|]'), 'args=[{{tag}}|hello|]');
+
+  clearMark();
+  await sleep(400);
+  const t7c = await run(['run', 'tplbad', '--args', 'hello', '--wait']);
+  eq('拼错变量退出码 4', t7c.code, 4);
+  ok('说出了是哪个变量', /tga/.test(t7c.out + t7c.err), t7c.out + t7c.err);
+  ok('说清了原因', /没有在 params 里声明/.test(t7c.out + t7c.err), t7c.out + t7c.err);
+  await sleep(600);
+  eq('拼错的条目没有真的跑起来', readMark(), '');
 
   console.log('— 参数与目标错误');
   const t8 = await run(['run', 'hook', '--wait']);

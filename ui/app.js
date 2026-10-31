@@ -68,7 +68,9 @@
     usage: {},            /* 使用记录：id -> { n 次数, t 上次时间戳(秒), args 参数历史 } */
     index: {},            /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
     cfg: null,            /* 原始配置：定时调度那段要重新解析，所以要留一份 */
-    offCount: 0           /* 配置里 enabled:false 的条目数（只用于提示，不参与搜索） */
+    offCount: 0,          /* 配置里 enabled:false 的条目数（只用于提示，不参与搜索） */
+    tplBad: [],           /* 模板变量写错的条目（执行时会被拒绝） */
+    tplWarn: []           /* 用了 {{…}} 但没声明 params 的条目（只提醒） */
   };
 
   const $ = id => document.getElementById(id);
@@ -316,6 +318,7 @@
 
     let cursor = 0;
     let extra = 0;
+    const extras = [];                    /* 多出来的（声明数量之外）原样留着，还得追加 */
     tokens.forEach(t => {
       const eq = t.indexOf('=');
       if (eq > 0) {
@@ -328,23 +331,86 @@
         cursor++;
       } else {
         extra++;
+        extras.push(t);
       }
     });
-    return { values: values, extra: extra, tokens: tokens };
+    return { values: values, extra: extra, extras: extras, tokens: tokens };
   }
 
-  const TPL_RE = /\{\{\s*([\w.-]+)\s*\}\}/g;
+  /* 模板变量的适用面：声明了 params 的条目，下面这些字段里的 {{x}} 都会被替换。
+     没声明 params 的条目整条不替换，{{ }} 原样直传 —— 老配置一个字节都不变。
 
-  function fillTemplate(v, args) {
+     刻意不含 workdir：它在 normalizeItem 里已经按"相对脚本目录"展开成绝对路径了，
+     再往里塞模板只会得到 `D:\app\C:\work` 这种四不像。 */
+  const TPL_FIELDS = ['target', 'args', 'query', 'headers', 'body', 'savePath', 'fileName'];
+
+  /* 三种写法：{{{{ 出字面 {{，}}}} 出字面 }}，{{ name }} 才是变量。
+     逃生口是给「参数本身就是模板语法」的场景留的（mustache 文件、Jinja2、
+     PowerShell 脚本块），JSON 里直接写四个花括号，不用跟反斜杠搏斗。 */
+  const TPL_RE = /\{\{\{\{|\}\}\}\}|\{\{\s*([\w.-]+)\s*\}\}/g;
+
+  function fillTemplate(v, args, opts) {
     if (typeof v === 'string')
-      return v.replace(TPL_RE, (m, k) => (args[k] == null ? '' : String(args[k])));
-    if (Array.isArray(v)) return v.map(x => fillTemplate(x, args));
+      return v.replace(TPL_RE, (m, k, off, whole) => {
+        if (m === '{{{{') return '{{';
+        if (m === '}}}}') return '}}';
+        const val = args[k] == null ? '' : String(args[k]);
+        if (!opts || !opts.quote || !/\s/.test(val)) return val;
+        /* app / ahk 的 args 是拼成一整条命令的，值里有空格就必须自己补引号，
+           否则 "C:\my dir\a.txt" 会被拆成两个参数。
+           只给「独占一个位置」的变量补：--dir={{d}} 和 "{{d}}" 都已经有结构了，
+           再套一层反而改坏用户写好的参数。 */
+        const b = off > 0 ? whole[off - 1] : '';
+        const a = whole[off + m.length] || '';
+        const alone = (!b || /\s/.test(b)) && (!a || /\s/.test(a));
+        return alone ? '"' + val + '"' : val;
+      });
+    if (Array.isArray(v)) return v.map(x => fillTemplate(x, args, opts));
     if (v && typeof v === 'object') {
       const o = {};
-      Object.keys(v).forEach(k => { o[k] = fillTemplate(v[k], args); });
+      Object.keys(v).forEach(k => { o[k] = fillTemplate(v[k], args, opts); });
       return o;
     }
     return v;
+  }
+
+  /* 扫出模板里真的用到了哪些变量（去重）。转义写法不算，query 只看值不看键。 */
+  function tplVars(srcs) {
+    const out = new Set();
+    const scan = (v) => {
+      if (typeof v === 'string') {
+        const re = new RegExp(TPL_RE.source, 'g');
+        let m;
+        while ((m = re.exec(v))) {
+          if (m[1]) out.add(m[1]);
+        }
+        return;
+      }
+      if (Array.isArray(v)) { v.forEach(scan); return; }
+      if (v && typeof v === 'object') Object.keys(v).forEach(k => scan(v[k]));
+    };
+    (Array.isArray(srcs) ? srcs : [srcs]).forEach(scan);
+    return out;
+  }
+
+  /* 模板体检：载入配置时跑一次，问题挂在条目上。
+       err  —— 声明了 params，却引用了没声明的变量（执行时会被拒绝）
+       warn —— 没声明 params，却出现了 {{x}}（可能忘了写 params；
+               也可能它本来就是给别的工具用的字面量，所以只提示不拦） */
+  function templateIssues(item) {
+    const decl = item.params || [];
+    const vars = tplVars(TPL_FIELDS.map(f => item[f]));
+    if (!decl.length) return { err: [], warn: Array.from(vars) };
+
+    const known = new Set(decl.map(p => p.name));
+    const err = [];
+    vars.forEach(k => {
+      if (known.has(k)) return;
+      /* 大小写敏感，但拼错大小写是手写配置最常见的一种，直接给提示 */
+      const near = decl.map(p => p.name).find(n => n.toLowerCase() === k.toLowerCase());
+      err.push('{{' + k + '}} 没有在 params 里声明' + (near ? '（是不是想写 ' + near + '？）' : ''));
+    });
+    return { err: err, warn: [] };
   }
 
   /* query 里"纯模板且替换为空"的键直接丢掉，避免拼出 ?lang= 这种空参 */
@@ -363,22 +429,68 @@
     return q;
   }
 
-  /* 把参数灌进条目，返回一个"本次请求专用"的副本 */
-  function withArgs(item, values) {
-    if (!(item.params || []).length) return { item: item, missing: [], args: {} };
-    const r = resolveParamValues(item, values);
+  /* 含空白的 token 补回引号：splitQuoted 把引号剥掉了，拼回 cmd 原文时得还原，
+     否则 "a b" 会变成两个参数 */
+  function joinTokens(toks) {
+    return toks.map(t => (/\s/.test(t) ? '"' + t + '"' : t)).join(' ');
+  }
+
+  /* 按声明把运行时参数灌进条目，返回「本次执行专用」的副本。
+        item     —— 填好模板的副本（target/args/workdir/query/… 都替换过）
+        missing  —— 还缺的必填参数（非网络类型只算模板真的用到的）
+        argv     —— 需要追加到末尾的 token（app / ahk 逐项加引号）
+        argvRaw  —— 同一批 token 的 cmd 原文（引号、重定向交给 cmd 解析）
+        used     —— 模板里点名过的参数名，这些不再追加 */
+  function applyParams(item, raw) {
+    const decl = item.params || [];
+    const text = raw == null ? '' : String(raw);
+    const isNet = item.type === 'webhook' || item.type === 'download';
+
+    /* 没声明 params：整条不参与替换，参数照旧原样追加。
+       这是「老配置零影响」的兜底 —— 也是 {{ }} 在这些条目上的语义：字面量。 */
+    if (!decl.length) {
+      return {
+        item: item, missing: [], args: {},
+        argv: splitQuoted(text), argvRaw: text.trim(), used: new Set()
+      };
+    }
+
+    const asg = assignTokens(item, text);
+    const r = resolveParamValues(item, asg.values);
+    const used = tplVars(TPL_FIELDS.map(f => item[f]));
+
+    const filled = Object.assign({}, item, {
+      target: fillTemplate(item.target, r.args),
+      /* app / ahk 的 args 是整条命令里的一段，含空格的取值要补引号；
+         cmd 的 args 是「原文交给 cmd」，补了引号 echo 会把引号一起打出来 */
+      args: fillTemplate(item.args, r.args,
+        (item.type === 'app' || item.type === 'ahk') ? { quote: true } : null),
+      query: fillQuery(item.query, r.args),
+      headers: fillTemplate(item.headers, r.args),
+      body: fillTemplate(item.body, r.args),
+      /* download 的保存位置也能模板化：「下载 {{name}}」直接把远端文件名当本地文件名 */
+      savePath: fillTemplate(item.savePath, r.args),
+      fileName: fillTemplate(item.fileName, r.args)
+    });
+
+    /* 被模板点名的参数已经落到该落的位置了，不再往末尾重复追加一次；
+       没被点名的照旧按声明顺序追加 —— 所以「声明了 params 但一个模板都不用」
+       的配置，表现和以前一模一样。超出声明数量的多余 token 也照旧追加。 */
+    const argv = [];
+    decl.forEach(p => {
+      if (used.has(p.name)) return;
+      const v = r.args[p.name];
+      if (v !== '' && v != null) argv.push(v);
+    });
+    asg.extras.forEach(t => argv.push(t));
+
+    /* 非网络类型以前不校验必填（参数只是追加，缺了也能跑）。现在有了模板，
+       缺的正好是模板要用的那个变量就得拦下来，否则会静默替换成空串。 */
+    const missing = isNet ? r.missing : r.missing.filter(k => used.has(k));
+
     return {
-      args: r.args,
-      missing: r.missing,
-      item: Object.assign({}, item, {
-        target: fillTemplate(item.target, r.args),
-        query: fillQuery(item.query, r.args),
-        headers: fillTemplate(item.headers, r.args),
-        body: fillTemplate(item.body, r.args),
-        /* download 的保存位置也能模板化：「下载 {{name}}」直接把远端文件名当本地文件名 */
-        savePath: fillTemplate(item.savePath, r.args),
-        fileName: fillTemplate(item.fileName, r.args)
-      })
+      item: filled, missing: missing, args: r.args,
+      argv: argv, argvRaw: joinTokens(argv), used: used
     };
   }
 
@@ -563,7 +675,17 @@
        （ql list / ql run）全都读 state.all，一处过滤等于处处生效，不用在
        每个入口各写一遍。归一化在前、过滤在后 —— id 缺省值是按原始下标生成的，
        先过滤会让后面条目的 id 悄悄变样。 */
-    const norm = (arr) => arr.map(normalizeItem);
+    /* 模板体检放在归一化之后 —— 要拿到归一化后的 params 才能判断哪个变量是拼错的。
+       这里只挂标记，执行时（launch）再拦：不把条目藏起来，否则用户对着配置
+       找半天也看不出「为什么它不见了」。 */
+    const norm = (arr) => arr.map((raw, i) => {
+      const it = normalizeItem(raw, i);
+      const t = templateIssues(it);
+      it.tplErr = t.err;
+      it.tplWarn = t.warn;
+      if (t.err.length) console.warn('[QuickLaunch] ' + it.id + '：' + t.err.join('；'));
+      return it;
+    });
     const on = (arr) => arr.filter(it => it.enabled);
     if (!items) {
       state.groups = DEMO_GROUPS;
@@ -575,6 +697,10 @@
       state.all = on(norm(items));
     }
     state.offCount = items ? items.length - state.all.length : 0;
+    /* 模板写错的条目（启用中的）：重载时汇总提示一声，执行时还会逐个拦 */
+    state.tplBad = state.all.filter(x => x.tplErr.length);
+    /* 有 {{x}} 但没声明 params：不拦，只提醒 —— 也可能它就是给别的工具用的字面量 */
+    state.tplWarn = state.all.filter(x => x.tplWarn.length);
 
     state.pinned = state.all.filter(x => x.pinned);
     if (!state.pinned.length) state.pinned = state.all.slice(0, 5);
@@ -1313,11 +1439,12 @@
     const table = els.paramTable;
     table.innerHTML = '';
 
-    const assigned = decl.length ? assignTokens(item, tail) : { values: {}, extra: 0 };
-    const w = withArgs(item, assigned.values);
+    const assigned = decl.length ? assignTokens(item, tail) : { values: {}, extra: 0, extras: [] };
+    const w = applyParams(item, tail);
     const applied = w.item;
-    const missing = w.missing;
+    /* 参数态里「缺」要按声明算全，不看模板用没用到 —— 人在这儿就是要看清单 */
     const resolved = resolveParamValues(item, assigned.values);
+    const missing = resolved.missing;
 
     if (decl.length) {
       decl.forEach(p => {
@@ -1353,16 +1480,17 @@
     } else {
       const hint = document.createElement('div');
       hint.className = 'pfree';
-      hint.textContent = item.type === 'cmd'
-        ? '整段内容会原样追加到命令行末尾，引号和重定向都交给 cmd 解析'
-        : '按空格分开的每个参数会各自加引号，再追加到程序后面';
+      hint.textContent = decl.length
+        ? '这些变量会被替换进 target / args：' + decl.map(p => '{{' + p.name + '}}').join(' ')
+        : (item.type === 'cmd'
+          ? '整段内容会原样追加到命令行末尾，引号和重定向都交给 cmd 解析'
+          : '按空格分开的每个参数会各自加引号，再追加到程序后面');
       table.appendChild(hint);
     }
 
     /* 预览：把拼接结果直接摆出来，最省心的验证方式 */
     let head = '将执行';
     let preview = '';
-    const toks = splitQuoted(tail);
 
     if (item.type === 'download') {
       head = '将下载';
@@ -1373,16 +1501,15 @@
       head = '将请求';
       preview = (item.method || 'GET') + ' ' + buildUrl(applied);
     } else if (item.type === 'cmd') {
-      const extra = tail.trim();
-      preview = applied.target + (extra ? ' ' + extra : '');
+      preview = applied.target + (w.argvRaw ? ' ' + w.argvRaw : '');
     } else if (item.type === 'ahk') {
       preview = 'AutoHotkey64.exe ' + quoteWin(baseName(applied.target)) +
         (applied.args ? ' ' + applied.args : '') +
-        (toks.length ? ' ' + toks.map(quoteWin).join(' ') : '');
+        (w.argv.length ? ' ' + w.argv.map(quoteWin).join(' ') : '');
     } else {
       preview = baseName(applied.target) +
         (applied.args ? ' ' + applied.args : '') +
-        (toks.length ? ' ' + toks.map(quoteWin).join(' ') : '');
+        (w.argv.length ? ' ' + w.argv.map(quoteWin).join(' ') : '');
     }
 
     els.paramPreviewLabel.textContent = head;
@@ -1572,17 +1699,27 @@
     /* 定时调度发起的执行：同样没人看着，而且不能动界面（不弹结果面板、不计使用频率） */
     const quiet = !!(opts && opts.quiet);
 
-    /* webhook / download 都要先把参数灌进模板再发请求 */
+    /* 模板里写了个没声明的变量：宁可拒绝，也别悄悄替换成空串跑出个歪结果。
+       载入配置时就查过一遍（见 templateIssues），这里是最后一道闸。 */
+    if (item.tplErr && item.tplErr.length) {
+      const msg = '配置有误：' + item.tplErr.join('；');
+      if (cli) { cliDone(4, msg); return false; }
+      toast(msg, 5000);
+      return false;
+    }
+
+    /* 声明了 params 的条目：先把模板填好，再决定末尾还要追加什么 */
+    const w = applyParams(item, raw);
+
+    if (w.missing.length) {
+      /* 点了没填参数的必填条目：别直接报错，把人送进参数态 */
+      if (cli) { cliDone(3, '还缺参数：' + w.missing.join('、')); return false; }
+      if (!raw.trim()) { enterParamFor(item); return false; }
+      toast('还缺参数：' + w.missing.join('、'));
+      return false;
+    }
+
     if (item.type === 'webhook' || item.type === 'download') {
-      const assigned = assignTokens(item, raw);
-      const w = withArgs(item, assigned.values);
-      if (w.missing.length) {
-        /* 点了没填参数的必填条目：别直接报错，把人送进参数态 */
-        if (cli) { cliDone(3, '还缺参数：' + w.missing.join('、')); return false; }
-        if (!raw.trim()) { enterParamFor(item); return false; }
-        toast('还缺参数：' + w.missing.join('、'));
-        return false;
-      }
       if (item.type === 'download') runDownload(w.item, cli, quiet);
       else runWebhook(w.item, raw, cli, quiet);
       if (!quiet) bumpUsage(item);
@@ -1594,12 +1731,12 @@
       id: item.id,
       name: item.name,
       kind: item.type,
-      target: item.target,
-      args: item.args,
-      workdir: item.workdir,
-      argv: splitQuoted(raw),
+      target: w.item.target,
+      args: w.item.args,
+      workdir: w.item.workdir,
+      argv: w.argv,
       /* cmd 类型要的是原文（引号、重定向都交给 cmd 自己解释） */
-      argvRaw: item.type === 'cmd' ? raw.trim() : '',
+      argvRaw: item.type === 'cmd' ? w.argvRaw : '',
       /* 带 rid 时 AHK 会把启动结果回执回来（见 run-ack） */
       cli: cli && cliCur ? cliCur.rid : ''
     });
@@ -2531,8 +2668,11 @@
 
   window.__applyConfig = function (cfg) {
     applyConfig(cfg);
-    toast('配置已更新，共 ' + state.all.length + ' 项'
-      + (state.offCount ? '（另有 ' + state.offCount + ' 项已停用）' : ''));
+    let msg = '配置已更新，共 ' + state.all.length + ' 项'
+      + (state.offCount ? '（另有 ' + state.offCount + ' 项已停用）' : '');
+    if (state.tplBad.length) msg += '；有 ' + state.tplBad.length + ' 个条目的模板变量写错了';
+    else if (state.tplWarn.length) msg += '；有 ' + state.tplWarn.length + ' 个条目用了 {{…}} 但没声明 params';
+    toast(msg, state.tplBad.length || state.tplWarn.length ? 6000 : 2000);
   };
 
   /* 测试用：暴露纯函数，方便 node 侧抽出来跑用例 */
@@ -2543,7 +2683,9 @@
     splitForComplete: splitForComplete, histComplete: histComplete,
     cliRank: cliRank, cliResolve: cliResolve,
     parseAt: parseAt, parseEvery: parseEvery, parseDays: parseDays,
-    normalizeSchedules: normalizeSchedules
+    normalizeSchedules: normalizeSchedules,
+    fillTemplate: fillTemplate, tplVars: tplVars, templateIssues: templateIssues,
+    applyParams: applyParams, joinTokens: joinTokens
   };
 
   /* ---------------------------------------------------------- 启动 */

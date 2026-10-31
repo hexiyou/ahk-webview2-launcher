@@ -206,7 +206,14 @@ async function phaseWithSchedules() {
   while (hits < 1 && Date.now() - t1 < 25000) await sleep(300);
   ok('定时触发的 webhook 真的发出去了', hits >= 1, '服务端命中 ' + hits + ' 次');
 
-  const log = read(SCHED_LOG);
+  /* 服务端命中只说明请求到了，日志是在响应回来、页面回执之后才写的。
+     这里必须轮询等那一行，不能读一次就断言 —— 差几百毫秒就会假失败。 */
+  const t2 = Date.now();
+  let log = read(SCHED_LOG);
+  while (!/ok\s+hook-task\s+HTTP 200/.test(log) && Date.now() - t2 < 15000) {
+    await sleep(300);
+    log = read(SCHED_LOG);
+  }
   ok('webhook 的结果摘要写进了日志', /ok\s+hook-task\s+HTTP 200/.test(log), log);
   ok('sched.log 有安装记录', /plan\s+at-task/.test(log) && /plan\s+every-task/.test(log), log);
   /* 描述里的时刻是 "HH:MM"（整分时省掉秒），所以两种形式都得认 */

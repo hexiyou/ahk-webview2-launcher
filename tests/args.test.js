@@ -87,36 +87,38 @@ eq('引号包裹的参数', a.values, { ip: '8.8.8.8', lang: 'en' });
 a = T.assignTokens(web, '1.2.3.4 ip=9.9.9.9');
 eq('命名式覆盖位置值', a.values, { ip: '9.9.9.9' });
 
-console.log('— resolveParamValues / withArgs');
-let w = T.withArgs(web, {});
+console.log('— resolveParamValues / applyParams');
+let w = T.applyParams(web, '');
 eq('必填缺失', w.missing, ['ip']);
-w = T.withArgs(web, { ip: '1.1.1.1' });
+w = T.applyParams(web, '1.1.1.1');
 eq('填了就不缺', w.missing, []);
 
-const withDefault = { params: [{ name: 'lang', default: 'zh-CN' }, { name: 'fmt', optional: true }] };
-w = T.withArgs(withDefault, {});
+const withDefault = { type: 'webhook', params: [{ name: 'lang', default: 'zh-CN' }, { name: 'fmt', optional: true }] };
+w = T.applyParams(withDefault, '');
 eq('默认值生效', w.args, { lang: 'zh-CN', fmt: '' });
 eq('可选空不算缺', w.missing, []);
 
 const ipq = state.all[2];
-w = T.withArgs(ipq, { ip: '8.8.8.8' });
+w = T.applyParams(ipq, '8.8.8.8');
 eq('target 模板替换', w.item.target, 'http://ip-api.com/json/8.8.8.8');
-w = T.withArgs(ipq, {});
+w = T.applyParams(ipq, '');
 eq('空值保留路径', w.item.target, 'http://ip-api.com/json/');
 
 console.log('— fillQuery 丢空键');
 const qItem = {
+  type: 'webhook',
   params: [{ name: 'lang' }],
   query: { lang: '{{lang}}', page: '1' }
 };
-w = T.withArgs(qItem, {});
+w = T.applyParams(qItem, '');
 eq('空模板键被丢弃', w.item.query, { page: '1' });
-w = T.withArgs(qItem, { lang: 'en' });
+w = T.applyParams(qItem, 'lang=en');
 eq('有值保留', w.item.query, { lang: 'en', page: '1' });
 
 console.log('— 无 params 的条目原样返回');
 const plain = { type: 'app', target: 'x.exe' };
-eq('不声明就不改', T.withArgs(plain, { a: '1' }).item, plain);
+eq('不声明就不改', T.applyParams(plain, 'a 1').item, plain);
+eq('不声明就照旧追加', T.applyParams(plain, 'a "b c"').argv, ['a', 'b c']);
 
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

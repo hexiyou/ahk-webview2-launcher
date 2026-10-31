@@ -180,6 +180,77 @@
       "group": "tool"
     },
     {
+      "id": "example-cmd-arg",
+      "name": "示例：cmd 带参数",
+      "subtitle": "选中后打空格再输内容，{{msg}} 会被换成你输的内容",
+      "keywords": [
+        "echo",
+        "示例",
+        "模板",
+        "cmd"
+      ],
+      "icon": "⚙",
+      "type": "cmd",
+      "target": "echo {{msg}}",
+      "params": [
+        {
+          "name": "msg",
+          "label": "要显示的文字",
+          "default": "hello"
+        }
+      ],
+      "accent": "#10b981",
+      "group": "tool"
+    },
+    {
+      "id": "example-cmd-chain",
+      "name": "示例：cmd 多条命令串起来",
+      "subtitle": "type=cmd 只套一层 cmd，&& 直接写、不用转义",
+      "keywords": [
+        "chain",
+        "示例",
+        "串联",
+        "chain"
+      ],
+      "icon": "⚙",
+      "type": "cmd",
+      "target": "echo 开始 && echo {{msg}} && echo 结束",
+      "params": [
+        {
+          "name": "msg",
+          "label": "中间那句",
+          "default": "中间"
+        }
+      ],
+      "accent": "#10b981",
+      "group": "tool"
+    },
+    {
+      "id": "example-open",
+      "name": "示例：用记事本打开指定文件",
+      "subtitle": "app 类型也能用模板；路径含空格时会自动补引号",
+      "keywords": [
+        "open",
+        "示例",
+        "打开",
+        "open"
+      ],
+      "icon": "C:\\Windows\\System32\\notepad.exe",
+      "type": "app",
+      "target": "C:\\Windows\\System32\\notepad.exe",
+      "args": "{{file}}",
+      "params": [
+        {
+          "name": "file",
+          "label": "文件路径",
+          "placeholder": "拖一个文件进来，或手输路径",
+          "type": "path"
+        }
+      ],
+      "accent": "#94a3b8",
+      "group": "tool"
+    },
+    {
       "id": "pull-config",
       "name": "拉取在线配置",
       "subtitle": "示例：下载远端 config.json 覆盖本地并重载（地址是假的）",

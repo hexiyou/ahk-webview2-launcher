@@ -80,16 +80,16 @@ const dp = T.normalizeItem({
 }, 3);
 eq('声明了 params 才接受参数', T.takesArgs(dp), true);
 
-const w = T.withArgs(dp, { file: '报告.pdf' });
+const w = T.applyParams(dp, '报告.pdf');
 eq('target 里的 {{file}} 被替换', w.item.target, 'https://x/报告.pdf');
 eq('fileName 里的模板被替换', w.item.fileName, '报告.pdf');
 eq('savePath 里的默认值也参与替换', w.item.savePath, '%TEMP%\\dl');
-eq('缺必填时会被记成缺', T.withArgs(dp, {}).missing, ['file']);
+eq('缺必填时会被记成缺', T.applyParams(dp, '').missing, ['file']);
 eq('必填项留空会报缺',
-  T.withArgs(T.normalizeItem({
+  T.applyParams(T.normalizeItem({
     id: 'x', name: 'x', type: 'download', target: 'https://x/{{f}}',
     params: [{ name: 'f' }]
-  }, 4), {}).missing, ['f']);
+  }, 4), '').missing, ['f']);
 
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

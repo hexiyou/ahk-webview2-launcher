@@ -34,7 +34,8 @@ const DEFAULT_NAMES = [
   /* 查询解析 + 参数切分 */
   'splitQuoted', 'takesArgs', 'uniqueMatch', 'splitArgs', 'parseQuery', 'sourceFor', 'findGroup',
   /* 参数取值 */
-  'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery', 'withArgs',
+  'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery',
+  'tplVars', 'templateIssues', 'joinTokens', 'applyParams',
   /* 使用记录 */
   'usageRec', 'usageCount', 'historyOf', 'usageBoost',
   /* 补全 */
@@ -50,6 +51,7 @@ function build(state, PY, extra, prelude) {
 
   const consts = [
     grabConst(src, /const CMD_TYPES = \{[^}]*\};/, 'CMD_TYPES'),
+    grabConst(src, /const TPL_FIELDS = \[[^\]]*\];/, 'TPL_FIELDS'),
     grabConst(src, /const TPL_RE = .*;/, 'TPL_RE'),
     grabConst(src, /const FIELD_W = \{[\s\S]*?\n  \};/, 'FIELD_W'),
     grabConst(src, /const KIND_LABEL = \{[^}]*\};/, 'KIND_LABEL'),
