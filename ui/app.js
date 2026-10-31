@@ -1401,9 +1401,12 @@
 
   /* ---------------------------------------------------------- 动作 */
 
-  function launch(item, tail) {
+  function launch(item, tail, opts) {
     if (!item) return false;
     const raw = tail == null ? '' : String(tail);
+    /* 命令行发起的执行：缺参数时不能"送进参数态"（窗口多半是隐藏的，没人能接着敲），
+       必须直接失败并把原因回给调用方 */
+    const cli = !!(opts && opts.cli);
 
     /* webhook / download 都要先把参数灌进模板再发请求 */
     if (item.type === 'webhook' || item.type === 'download') {
@@ -1411,12 +1414,13 @@
       const w = withArgs(item, assigned.values);
       if (w.missing.length) {
         /* 点了没填参数的必填条目：别直接报错，把人送进参数态 */
+        if (cli) { cliDone(3, '还缺参数：' + w.missing.join('、')); return false; }
         if (!raw.trim()) { enterParamFor(item); return false; }
         toast('还缺参数：' + w.missing.join('、'));
         return false;
       }
-      if (item.type === 'download') runDownload(w.item);
-      else runWebhook(w.item, raw);
+      if (item.type === 'download') runDownload(w.item, cli);
+      else runWebhook(w.item, raw, cli);
       bumpUsage(item);
       return true;
     }
@@ -1431,7 +1435,9 @@
       workdir: item.workdir,
       argv: splitQuoted(raw),
       /* cmd 类型要的是原文（引号、重定向都交给 cmd 自己解释） */
-      argvRaw: item.type === 'cmd' ? raw.trim() : ''
+      argvRaw: item.type === 'cmd' ? raw.trim() : '',
+      /* 带 rid 时 AHK 会把启动结果回执回来（见 run-ack） */
+      cli: cli && cliCur ? cliCur.rid : ''
     });
     bumpUsage(item);
     return true;
@@ -1505,9 +1511,9 @@
     return lines;
   }
 
-  function runWebhook(item) {
+  function runWebhook(item, raw, cli) {
     const id = 'r' + (++state.reqSeq).toString(36) + '-' + Date.now().toString(36);
-    state.pending.set(id, { item: item });
+    state.pending.set(id, { item: item, cli: !!cli });
 
     state.result = {
       id: id, item: item, loading: true, ok: true,
@@ -1542,7 +1548,11 @@
   function onHttpResult(msg) {
     const pend = state.pending.get(msg.id);
     state.pending.delete(msg.id);
-    if (!state.result || state.result.id !== msg.id) return;   /* 过期结果直接丢 */
+    const wasCli = !!(pend && pend.cli);
+    if (!state.result || state.result.id !== msg.id) {   /* 过期结果直接丢 */
+      if (wasCli) cliDone(4, '结果面板已被关闭，取不到这次请求的结果');
+      return;
+    }
 
     state.result = {
       id: msg.id,
@@ -1557,13 +1567,19 @@
       view: 'body'
     };
     renderResult();
+
+    if (wasCli) {
+      cliDone(msg.ok ? 0 : 4, msg.ok
+        ? ('HTTP ' + (msg.status | 0) + ' · ' + (msg.ms | 0) + 'ms')
+        : ('请求失败：' + (msg.error || '未知错误')));
+    }
   }
 
   /* ---------------------------------------------------------- Download */
 
-  function runDownload(item) {
+  function runDownload(item, cli) {
     const id = 'd' + (++state.reqSeq).toString(36) + '-' + Date.now().toString(36);
-    state.pending.set(id, { item: item, kind: 'download' });
+    state.pending.set(id, { item: item, kind: 'download', cli: !!cli });
 
     state.result = {
       id: id, item: item, loading: true, ok: true, download: true,
@@ -1611,7 +1627,11 @@
 
     const pend = state.pending.get(msg.id);
     state.pending.delete(msg.id);
-    if (!state.result || state.result.id !== msg.id) return;
+    const wasCli = !!(pend && pend.cli);
+    if (!state.result || state.result.id !== msg.id) {
+      if (wasCli) cliDone(4, '结果面板已被关闭，取不到这次下载的结果');
+      return;
+    }
 
     state.result = Object.assign({}, state.result, {
       loading: false,
@@ -1626,6 +1646,13 @@
       backup: msg.backup || ''
     });
     renderResult();
+
+    if (wasCli) {
+      cliDone(msg.ok ? 0 : 4, msg.ok
+        ? ((msg.skipped ? '文件已存在，已跳过：' : '已下载：') + (msg.file || ''))
+        : ('下载失败：' + (msg.error || '未知错误')));
+      return;
+    }
 
     if (msg.ok) {
       toast(msg.skipped ? '文件已存在，已跳过' : ('已下载：' + baseName(msg.file || '')), 2600);
@@ -2115,6 +2142,149 @@
     post({ type: 'hide' });
   }
 
+  /* ---------------------------------------------------------- 命令行接口
+
+     AHK 把一个请求原样转成 window.__cli({rid, mode, q, args, first})：
+       search —— 打开窗口并把查询填好（和手敲完全等价）
+       list   —— 只返回候选，不动界面
+       run    —— 直接执行，参数按参数态那套原文分配
+
+     每条请求都必须以 cliDone 收尾（AHK 在等这条回执，--wait 的调用方也在等）。
+     慢请求（webhook / download）由结果回调收尾，期间 cliBusy 一直为真，
+     后面的请求排在队里 —— 命令行本来就该一条一条来。
+     ---------------------------------------------------------- */
+
+  const cliQ = [];
+  let cliBusy = false;
+  let cliCur = null;
+
+  /* 一次 CLI 不可能同时跑两条，所以"当前请求"用一个槽就够 */
+  function cliDone(code, text, payload) {
+    const req = cliCur;
+    if (!req || !cliBusy) return;
+    cliBusy = false;
+    cliCur = null;
+    const body = Object.assign(
+      { ok: code === 0, code: code, text: text || '' },
+      payload || {}
+    );
+    post({
+      type: 'cli-result',
+      rid: req.rid,
+      code: code,
+      text: body.text,
+      json: JSON.stringify(body)
+    });
+    setTimeout(cliPump, 0);
+  }
+
+  function cliPump() {
+    if (cliBusy || !cliQ.length) return;
+    const req = cliQ.shift();
+    cliBusy = true;
+    cliCur = req;
+    try {
+      cliExec(req);
+    } catch (e) {
+      cliDone(4, '内部错误：' + ((e && e.message) || e));
+    }
+  }
+
+  function cliExec(req) {
+    const mode = String(req.mode || 'search');
+
+    if (mode === 'search') {
+      setQuery(String(req.q || ''));
+      post({ type: 'cli-applied', rid: req.rid });
+      cliDone(0, req.q ? ('已打开查询：' + req.q) : '已打开启动器', { q: String(req.q || '') });
+      return;
+    }
+
+    if (mode === 'list') {
+      const hit = cliRank(String(req.q || '')).slice(0, 80);
+      if (!hit.length) { cliDone(1, '没有匹配的条目：' + (req.q || '')); return; }
+      const items = hit.map(x => ({
+        id: x.it.id, name: x.it.name, type: x.it.type,
+        subtitle: x.it.subtitle, score: Math.round(x.s)
+      }));
+      const lines = items.map(x => x.id + '\t' + x.name + '\t' + x.type);
+      cliDone(0, lines.join('\n'), { items: items });
+      return;
+    }
+
+    /* run */
+    const r = cliResolve(String(req.q || ''), !!req.first);
+    if (r.none) {
+      cliDone(1, '没找到匹配的条目：' + (req.q || ''));
+      return;
+    }
+    if (r.amb) {
+      const list = r.amb.slice(0, 12);
+      const items = list.map(it => ({ id: it.id, name: it.name, type: it.type }));
+      const lines = items.map(x => x.id + '\t' + x.name + '\t' + x.type);
+      cliDone(2, '有多个条目匹配，请写全 id 或名称，或加 --first 取第一条：\n'
+        + lines.join('\n'), { items: items });
+      return;
+    }
+
+    const item = r.item;
+    req._item = item;
+    /* 先让 AHK 决定要不要把窗口显示出来，再执行 */
+    post({ type: 'cli-applied', rid: req.rid });
+
+    const ok = launch(item, String(req.args || ''), { cli: true });
+    if (!ok) return;                 /* launch 内部已经 cliDone */
+    if (item.type === 'webhook' || item.type === 'download') return;  /* 结果回调收尾 */
+    /* app / cmd / ahk / folder / url：等 AHK 的 run-ack 收尾 */
+  }
+
+  /* 打分排序：和界面上 renderNormal 完全同一套（同一个 scoreOf + 频率加成） */
+  function cliRank(q) {
+    const parsed = parseQuery(q || '');
+    let scope = parsed.scope;
+    const group = findGroup(parsed.groupId);
+    if ((scope === 'group' || scope === 'group-cmd') && !group)
+      scope = parsed.term ? 'all' : 'group';
+    const base = sourceFor(scope, group);
+    const term = String(parsed.term || '').toLowerCase();
+    if (!term) return base.map(it => ({ it: it, s: 0 }));
+    return base
+      .map(it => {
+        const s = scoreOf(it, term);
+        return { it: it, s: s ? s * (1 + usageBoost(it.id) / 100) : 0 };
+      })
+      .filter(x => x.s > 0)
+      .sort((a, b) => b.s - a.s);
+  }
+
+  /* 解析顺序：id 全等 → name 全等 → 搜索。有多个候选一律算歧义，
+     不替用户猜 —— 脚本里静默跑错条目比报错难查得多。 */
+  function cliResolve(q, first) {
+    const s = String(q || '').trim();
+    if (!s) return { none: true };
+    const low = s.toLowerCase();
+
+    const byId = state.all.filter(it => String(it.id || '').toLowerCase() === low);
+    if (byId.length === 1) return { item: byId[0] };
+    const byName = state.all.filter(it => String(it.name || '').toLowerCase() === low);
+    if (byName.length === 1) return { item: byName[0] };
+    if (byId.length > 1) return { amb: byId };
+    if (byName.length > 1) return { amb: byName };
+
+    const ranked = cliRank(s).map(x => x.it);
+    if (!ranked.length) return { none: true };
+    if (ranked.length === 1) return { item: ranked[0] };
+    if (first) return { item: ranked[0] };
+    return { amb: ranked };
+  }
+
+  window.__cli = function (req) {
+    if (!req || !req.rid) return false;
+    cliQ.push(req);
+    cliPump();
+    return true;
+  };
+
   /* ---------------------------------------------------------- AHK -> JS */
 
   function bindBridge() {
@@ -2154,6 +2324,13 @@
         case 'fs-result':
           onFsResult(msg);
           break;
+        case 'run-ack':
+          /* AHK 那边真正起了进程（或报了错），命令行执行的收尾回执 */
+          if (cliBusy && cliCur && cliCur.rid === msg.rid) {
+            const nm = cliCur._item ? cliCur._item.name : '';
+            cliDone(msg.ok ? 0 : 4, msg.ok ? ('已启动：' + nm) : ('启动失败：' + (msg.msg || '')));
+          }
+          break;
       }
     });
   }
@@ -2178,7 +2355,8 @@
     parseQuery, getByPath, highlightJson, buildUrl, toQueryString,
     scoreOf: scoreOf, scoreOne: scoreOne, fieldQuality: fieldQuality,
     subseqQuality: subseqQuality, lastTokenRange: lastTokenRange,
-    splitForComplete: splitForComplete, histComplete: histComplete
+    splitForComplete: splitForComplete, histComplete: histComplete,
+    cliRank: cliRank, cliResolve: cliResolve
   };
 
   /* ---------------------------------------------------------- 启动 */

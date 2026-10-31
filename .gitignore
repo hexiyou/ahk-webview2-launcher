@@ -12,6 +12,9 @@ _*.txt
 _*.png
 _*.js
 
+# ── 页面报错时会写的日志（排障用，不提交） ──
+launcher.log
+
 # ── 使用记录（每台机器各不相同，跟着使用习惯走，不进仓库） ──
 usage.json
 usage.json.tmp

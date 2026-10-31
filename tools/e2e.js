@@ -213,12 +213,17 @@ function prepareUncIcon() {
 function build() {
   let src = fs.readFileSync(path.join(ROOT, 'launcher.ahk'), 'utf8');
 
-  /* 别和用户正在跑的实例抢 SingleInstance，也别共用同一个 WebView2 数据目录 */
+  /* 别和用户正在跑的实例抢单例锁，也别共用同一个 WebView2 数据目录。
+     单例键是从脚本目录算出来的，而生成出来的脚本就在同一个目录 —— 不换掉的话
+     测试实例会把自己当成客户端，把"唤醒"投给用户那个进程然后退出。 */
   src = src.replace('#SingleInstance Force', '#SingleInstance Off');
+  src = src.replace(/global INST_KEY\s*:=.*/, "global INST_KEY   := 'e2e-run'");
   src = src.replace(/global DATA_DIR\s*:=.*/, "global DATA_DIR   := '" + DATA_DIR + "'");
 
-  /* 页面的 log 消息平时写 launcher.log，测试期间改写到 _e2e.log，方便一次性读取 */
-  src = src.replace("SCRIPT_DIR '\\launcher.log'", "SCRIPT_DIR '\\_e2e.log'");
+  /* 页面的 log 消息平时写 launcher.log，测试期间改写到 _e2e.log，方便一次性读取。
+     注意要用 replaceAll：脚本里不止一处写这个路径（ReadyWatchdog 也有一处），
+     只换第一处的话，真正打日志的那行会留在原地，_e2e.log 永远不出现。 */
+  src = src.replaceAll("SCRIPT_DIR '\\launcher.log'", "SCRIPT_DIR '\\_e2e.log'");
 
   const anchor = 'RegisterHotkey(settings.hotkey)';
   if (!src.includes(anchor)) throw new Error('找不到注入点：' + anchor);

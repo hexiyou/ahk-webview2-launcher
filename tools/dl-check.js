@@ -34,6 +34,8 @@ const REMOTE_CFG = '{"items":[],"remote":1}';
 function build() {
   let src = fs.readFileSync(path.join(ROOT, 'launcher.ahk'), 'utf8');
   src = src.replace('#SingleInstance Force', '#SingleInstance Off');
+  /* 换掉单例键，否则会和用户正在跑的实例抢锁，把自己当客户端然后直接退出 */
+  src = src.replace(/global INST_KEY\s*:=.*/, "global INST_KEY   := 'dl-run'");
   src = src.replace(/global DATA_DIR\s*:=.*/, "global DATA_DIR   := '" + DATA_DIR.replace(/\\/g, '\\\\') + "'");
 
   /* 别真的把仓库里的 config.json 换掉：测试用的 CFG_PATH 在 %TEMP% 下 */

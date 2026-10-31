@@ -13,6 +13,40 @@ UKv(k, v) {
     UAppend(k . '  ->  ' . v)
 }
 
+UFreeLetters() {
+    return 26 - StrLen(DriveGetList())
+}
+
+/* 关掉探针开出来的 cmd 窗口，并且等它真的没了再往下走：
+   cmd /k + pushd 会临时映射一个盘符，进程不退出映射就不还。WinClose 是异步的，
+   不等就直接 ExitApp，映射会跟着漏在系统里，跑几轮就把盘符吃干净
+   （表现就是下一轮 B4/C1 假失败，排查半天）。 */
+UCloseCmd() {
+    if WinWait('QL_UNC_PROBE', , 3) {
+        WinClose('QL_UNC_PROBE')
+        if !WinWaitClose('QL_UNC_PROBE', , 3)
+            try WinKill('QL_UNC_PROBE')
+    }
+}
+
+/* 即便关了窗口，pushd 的临时映射偶尔还是会被系统留着（进程被杀时来不及还）。
+   记下跑之前的盘符，跑完把「这一轮新冒出来、且指向本次测试共享」的映射删掉 ——
+   只删自己刚弄出来的，用户原有的映射一个都不碰。 */
+UReleaseNew(before) {
+    global A_Temp
+    after := DriveGetList()
+    Loop Parse, after {
+        if InStr(before, A_LoopField)
+            continue                          ; 跑之前就有，不是我们的
+        f := A_Temp . '\netuse-probe.txt'
+        try FileDelete(f)
+        try RunWait(A_ComSpec ' /c net use ' A_LoopField ': > "' f '" 2>&1', , 'Hide')
+        s := FileExist(f) ? FileRead(f, 'UTF-8') : ''
+        if InStr(s, '\\localhost\')
+            try RunWait(A_ComSpec ' /c net use ' A_LoopField ': /delete /y', , 'Hide')
+    }
+}
+
 UWait(p, ms := 6000) {
     Loop ms // 100 {
         if FileExist(p)
@@ -45,6 +79,10 @@ UNC_Probe() {
     node := 'C:\Users\Administrator\.workbuddy\binaries\node\versions\22.22.2-6\node.exe'
     UAppend('==== UNC 实测 ====')
     UAppend('base=' . base)
+    /* pushd 靠临时映射盘符绕过「cmd 不认 UNC 工作目录」，所以 B4/C1 成败取决于
+       有没有空闲盘符。这台机器常年被 webdav 占掉 A/I/X/Y，测试脚本自己漏下的
+       映射再占几个就见底了 —— 先把现状写进日志，免得 FAIL 时无从判断。 */
+    UAppend('空闲盘符=' . UFreeLetters() . '  已用=' . DriveGetList())
 
     ; 辅助脚本：读 cwd / 回显 argv
     jsCwd := tmp . '\cwdprobe.js'
@@ -102,24 +140,34 @@ UNC_Probe() {
     }
 
     try FileDelete(base . '\bat_out.txt')
-    try {
+    if (UFreeLetters() < 1)
+        UKv('B4 UNC 上的 .bat（UNC cwd） ', 'SKIP 没有空闲盘符，pushd 映不出来（先 net use 清临时映射）')
+    else try {
+        lettersB := DriveGetList()
         Launch('app', base . '\probe.bat', '', base, [], '')
-        UKv('B4 UNC 上的 .bat（UNC cwd） ', UWait(base . '\bat_out.txt') ? 'ok' : 'FAIL 没生成 bat_out.txt')
+        ok := UWait(base . '\bat_out.txt')
+        UKv('B4 UNC 上的 .bat（UNC cwd） ', ok ? 'ok' : 'FAIL 没生成 bat_out.txt')
     } catch as e {
         UKv('B4 UNC 上的 .bat（UNC cwd） ', 'THROW ' . e.Message)
     }
+    if IsSet(lettersB)
+        UReleaseNew(lettersB)
 
     ; ---------- C. 命令行 cwd 在 UNC 上（cmd 类型的常见配置）----------
     ; cmd 是 /k，窗口会一直开着 —— 打个专属标题，测完自己关掉
     try FileDelete(tmp . '\cwd2.txt')
-    try {
+    if (UFreeLetters() < 1)
+        UKv('C1 cmd 类型 + UNC workdir   ', 'SKIP 没有空闲盘符，pushd 映不出来（先 net use 清临时映射）')
+    else try {
+        letters := DriveGetList()
         Launch('cmd', 'title QL_UNC_PROBE && cd > "' . tmp . '\cwd2.txt"', '', base, [], '')
         UKv('C1 cmd 类型 + UNC workdir   ', UWait(tmp . '\cwd2.txt') ? ('ok cwd=' . URead(tmp . '\cwd2.txt')) : 'FAIL')
     } catch as e {
         UKv('C1 cmd 类型 + UNC workdir   ', 'THROW ' . e.Message)
     }
-    if WinWait('QL_UNC_PROBE', , 3)
-        WinClose('QL_UNC_PROBE')
+    UCloseCmd()
+    if IsSet(letters)
+        UReleaseNew(letters)
 
     ; 对照：本地 workdir 不能被这一改弄坏
     try FileDelete(tmp . '\cwd3.txt')
@@ -129,8 +177,7 @@ UNC_Probe() {
     } catch as e {
         UKv('C2 cmd 类型 + 本地 workdir  ', 'THROW ' . e.Message)
     }
-    if WinWait('QL_UNC_PROBE', , 3)
-        WinClose('QL_UNC_PROBE')
+    UCloseCmd()
 
     ; ---------- D. 传参 ----------
     ; D1 bat 里 %~1（cmd 解析引号）

@@ -13,7 +13,10 @@
 ; ============================================================================
 
 #Requires AutoHotkey v2.0
-#SingleInstance Force
+; 不用 #SingleInstance Force：那样"重复启动 = 杀掉旧进程重开"，
+; 正在跑的 webhook/download、用户敲了一半的查询、刚写一半的 usage.json 全丢。
+; 单例改为自己拿命名互斥体实现，后来的进程一律当客户端把请求投递进来（见文末「命令行」段）。
+#SingleInstance Off
 #Warn All, Off
 #Include lib\WebView2\WebView2.ahk
 
@@ -28,7 +31,13 @@ global DATA_DIR   := SCRIPT_DIR '\.webview2'
 global ICON_DIR   := A_Temp '\quicklaunch-icons'
 global HTTP_DIR   := A_Temp '\quicklaunch-http'
 global PULL_DIR   := A_Temp '\quicklaunch-pull'   ; 「拉取在线配置」先落到这里，校验过了才换掉本地文件
+global CLI_DIR    := A_Temp '\quicklaunch-cli'    ; 客户端的回执文件放这里（跨进程用，别用脚本目录）
 global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
+
+; 单实例 / 进程间通信的标识：跟着脚本目录走，同一份程序的多个副本互不干扰
+global INST_KEY   := HashText(StrLower(SCRIPT_DIR))
+global MUTEX_NAME := 'Local\QuickLaunch-' INST_KEY
+global IPC_TITLE  := 'QuickLaunch/ipc/' INST_KEY
 
 ; ---------------------------- 运行时状态 ------------------------------------
 global g := ""
@@ -39,14 +48,50 @@ global lastNavOK := -1        ; 最近一次导航结果（-1 = 还没导航过�
 global lastNavErr := -1
 global ncDrag := false        ; WebView2 原生非客户区拖拽是否可用
 global httpJobs := Map()      ; 进行中的 webhook 请求：id -> {dir, pid, deadline}
+global ipcGui := 0            ; 收件箱窗口（接收命令行请求）
+global mutexHandle := 0
+global cliQueue := []         ; 还没投递给页面的请求
+global cliRec := Map()        ; rid -> 请求记录 {rid, reply, show, exitAfter}
+global wakePending := false   ; 有客户端只是要求"打开一下"
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
+
+; 命令行参数先只做解析，不产生任何副作用
+CLI := CliParse(A_Args)
+
+if (CLI.help) {
+    CliUsage()
+    ExitApp(0)
+}
+if (CLI.err != '') {
+    FileAppend('参数错误：' CLI.err '`n`n', '**', 'UTF-8')
+    CliUsage()
+    ExitApp(6)
+}
+
+; 拿不到单例锁 = 已经有实例在跑，本进程只当客户端把请求投进去
+/* 带命令的启动一律走客户端通道：投递完就退场。
+   客户端绝不"自己变成常驻实例" —— 否则 `ql run 记事本` 这条命令会因为没有
+   --wait 而一直挂在终端里不返回（批处理在等这个进程结束）。 */
+if (CLI.mode != 'none')
+    CliClient(CLI)                       ; 内部会 ExitApp
+
+if !AcquireInstance(CLI.replace ? 3000 : 0) {
+    ; 没有命令行、但已经有实例在跑（双击 run.bat）：唤醒它，不要重启
+    CLI.mode := 'wake'
+    CliClient(CLI)
+}
+
+CreateInbox()                            ; 收件箱要早于 WebView2，后来者才找得到人
+
 settings := LoadSettings()
 A_IconTip := 'QuickLaunch　' settings.hotkey ' 呼出'
 SetupTray()
 
 if !FileExist(UI_PATH) {
+    if (CLI.mode != 'none')
+        CliFail(5, '找不到界面文件：' UI_PATH)
     MsgBox('找不到界面文件：`n' UI_PATH, 'QuickLaunch', 'Icon!')
     ExitApp()
 }
@@ -54,6 +99,24 @@ if !FileExist(UI_PATH) {
 ; 清掉上次运行留下的 webhook 临时目录（响应正文可能不小，不清理会越积越多）
 try DirDelete(HTTP_DIR, true)
 try DirDelete(PULL_DIR, true)
+CleanStaleCli()                          ; 只清过期回执，别把整个目录端掉（见函数注释）
+
+/* 窗口显不显示由命令本身决定，不看 ini：
+     search → 一定显示（人要看结果）
+     list   → 不显示（输出走 stdout，是给脚本用的）
+     run    → 只有 --show 才显示
+   --hide 是"被客户端拉起"时用的：先藏起来，等请求里的 cli-applied 再决定要不要露脸，
+   免得 `ql run 记事本` 冷启动时先闪一下空窗口。
+   完全没有命令行参数时维持原来的 ShowOnStart 行为。 */
+if (CLI.mode = 'none') {
+    if CLI.show
+        settings.showOnStart := 1
+    else if CLI.hide
+        settings.showOnStart := 0
+} else if (CLI.mode = 'search')
+    settings.showOnStart := 1                     ; 打开就要看到过滤结果
+else
+    settings.showOnStart := CLI.show ? 1 : 0      ; list / run：默认不露窗
 
 BuildUi(settings)
 RegisterHotkey(settings.hotkey)
@@ -199,9 +262,21 @@ OnProcFailed(sender, args) {
 }
 
 ReadyWatchdog() {
-    global uiReady, wv, lastNavOK, lastNavErr
+    global uiReady, wv, lastNavOK, lastNavErr, cliQueue
     if (uiReady)
         return
+    if (cliQueue.Length) {
+        ; 界面起不来：把攒着的请求全部按失败回执掉，别让调用方干等到 30 秒超时。
+        ; 也不能弹模态框 —— 由命令行拉起的实例通常是隐藏的，弹了没人关。
+        pending := cliQueue.Clone()
+        cliQueue := []
+        for it in pending
+            CliReply('{"rid":' JsonQuote(it.rid) ',"code":5,"text":'
+                . JsonQuote('界面初始化失败，命令没有执行（详见 launcher.log）') ',"json":""}')
+        try FileAppend(FormatTime() ' 界面 9 秒未就绪（WebErrorStatus=' lastNavErr '）`n'
+            , SCRIPT_DIR '\launcher.log', 'UTF-8')
+        return
+    }
     MsgBox('界面在 9 秒内没有完成初始化，可能显示为白屏。`n`n'
         . '导航成功 = ' lastNavOK '`nWebErrorStatus = ' lastNavErr '`n'
         . '当前地址 = ' (wv ? wv.Source : '(无)') '`n`n'
@@ -407,11 +482,14 @@ SetupTray() {
 }
 
 RestartApp() {
-    ; 起一个新实例，新实例会等旧进程退出后接管（AHK 的 /restart 开关）
+    ; 起一个新实例，新实例带 --replace：它会等本进程退出、释放单例锁后接管。
+    ; 不能再用 AHK 的 /restart —— 单例改成自己管之后，新进程会把自己当客户端
+    ; 去投递请求，结果是"重启完什么也没发生"。
     global g
     if IsObject(g)
         try g.Hide()
-    try Run('"' A_AhkPath '" /restart "' A_ScriptFullPath '"')
+    try Run((A_IsCompiled ? '' : '"' A_AhkPath '" ')
+        . '"' A_ScriptFullPath '" --replace')
     catch {
         Reload()
         return
@@ -544,6 +622,13 @@ OnWebMessage(sender, args) {
         case 'ready':
             uiReady := true
             try wvc.Fill()
+            FlushCli()                      ; 页面就绪后把攒着的命令行请求投进去
+        case 'cli-result':
+            CliReply(raw)
+        case 'cli-applied':
+            ; 查询已经填好了再显示窗口，避免先闪一帧完整列表
+            if CliWantsWindow(JsonStr(raw, 'rid'))
+                ShowLauncher()
         case 'hide':
             HideLauncher()
         case 'close':
@@ -579,15 +664,24 @@ OnWebMessage(sender, args) {
 
 DoRun(raw) {
     global settings
+    ; 带 cli 字段说明是命令行发起的：执行结果要回执给调用方，而且不能顺手把
+    ; 用户要求显示着的窗口藏起来（--show 场景）
+    rid := JsonStr(raw, 'cli')
     try {
         ; argv 是"本次运行"的参数（app/ahk 用 token 数组，逐个加引号）；
         ; argvRaw 是用户在参数区敲的原文（cmd 类型直接拼在命令行末尾）
         Launch(JsonStr(raw, 'kind'), JsonStr(raw, 'target'), JsonStr(raw, 'args')
             , JsonStr(raw, 'workdir'), JsonStrArray(raw, 'argv'), JsonStr(raw, 'argvRaw'))
-        if settings.hideAfterLaunch
+        if (settings.hideAfterLaunch && rid = '')
             HideLauncher()
+        if (rid != '')
+            JsSend('{"type":"run-ack","rid":' JsonQuote(rid) ',"ok":1,"msg":""}')
     } catch as e {
-        Notify('启动失败：' e.Message)
+        msg := CleanComError(e.Message)
+        if (rid != '')
+            JsSend('{"type":"run-ack","rid":' JsonQuote(rid) ',"ok":0,"msg":' JsonQuote(msg) '}')
+        else
+            Notify('启动失败：' msg)
     }
 }
 
@@ -1241,4 +1335,449 @@ CleanComError(msg) {
     if p
         msg := SubStr(msg, 1, p - 1)
     return Trim(StrReplace(StrReplace(msg, "`r", ' '), "`n", ' '))
+}
+
+; ============================================================================
+;  命令行接口（A_Args）+ 单实例
+;  ---------------------------------------------------------------------------
+;  两个角色：
+;    实例   —— 拿到单例锁、跑着 WebView2 的那个进程，负责收请求；
+;    客户端 —— 锁被占用时启动的进程，只解析参数、投递、按需等回执，约 100ms 退场。
+;
+;  执行一律交给页面里的 JS：评分、参数分配、模板替换、URL 拼装、启动全在 JS 里，
+;  AHK 侧重写一遍就是两套会漂移的实现。所以命令行做的事只有"把意图翻译成一条
+;  __cli() 调用"。
+;
+;  通信走 WM_COPYDATA（0x004A）：收件箱是一个隐藏的小 Gui，标题里带脚本目录的
+;  哈希，翻遍全机也不会撞名。载荷是 UTF-8 的 JSON。
+;  ⚠ 收件箱的消息处理必须"只入队、立刻返回"：SendMessage 是同步的，handler 里
+;    只要做一点耗时的事，发起方就跟着一起卡（实测 Timeout 参数对此不生效）。
+; ============================================================================
+
+AcquireInstance(waitMs) {
+    ; 命名互斥体：CreateMutex 的 LAST_ERROR 是 183（ERROR_ALREADY_EXISTS）就说明
+    ; 已经有人持锁。拿不到时要把刚打开的句柄关掉，否则我们自己会把这个互斥体
+    ; "续命"，旧进程退出后新进程永远等不到它消失。
+    global MUTEX_NAME, mutexHandle
+    deadline := A_TickCount + waitMs
+    loop {
+        h := DllCall('kernel32\CreateMutexW', 'ptr', 0, 'int', 0, 'wstr', MUTEX_NAME, 'ptr')
+        err := A_LastError
+        if (h) {
+            if (err != 183) {
+                mutexHandle := h
+                return true
+            }
+            DllCall('kernel32\CloseHandle', 'ptr', h)
+        }
+        if (A_TickCount > deadline)
+            return false
+        Sleep 60
+    }
+}
+
+CreateInbox() {
+    global ipcGui, IPC_TITLE
+    ; 摆到屏幕外"显示"着：隐藏窗口一样能收 SendMessage，但可见窗口在排查时
+    ; 更容易被 WinExist/Spy 找到，行为也跟普通窗口一致
+    ipcGui := Gui('-Caption +ToolWindow -DPIScale', IPC_TITLE)
+    ipcGui.Show('x-32000 y-32000 w1 h1 NA')
+    OnMessage(0x004A, OnCopyData)
+}
+
+OnCopyData(wp, lp, msg, hwnd) {
+    global ipcGui
+    if (ipcGui && hwnd != ipcGui.Hwnd)
+        return
+    if !lp
+        return 1
+    size := NumGet(lp, A_PtrSize, 'uint')
+    ptr := NumGet(lp, A_PtrSize * 2, 'ptr')
+    if (size < 2 || size > 65536 || !ptr)
+        return 1
+    text := StrGet(ptr, size, 'UTF-8')
+    ; 任何进程都能往这里塞消息，先做最低限度的形状校验
+    if (SubStr(text, 1, 1) != '{' || JsonStr(text, 'type') != 'cli')
+        return 1
+    QueueReq(text)
+    return 1                                   ; 回一个 1 表示"收到了"
+}
+
+SendCopyData(hwnd, text) {
+    ; COPYDATASTRUCT { ULONG_PTR dwData; DWORD cbData; PVOID lpData; }
+    ; x64 上 cbData 后面有 4 字节填充，所以按 A_PtrSize*3 申请、按偏移取字段
+    data := Buffer(StrPut(text, 'UTF-8'), 0)
+    StrPut(text, data, 'UTF-8')
+    cds := Buffer(A_PtrSize * 3, 0)
+    NumPut('ptr', 0, cds, 0)
+    NumPut('uint', data.Size, cds, A_PtrSize)
+    NumPut('ptr', data.Ptr, cds, A_PtrSize * 2)
+    try {
+        r := SendMessage(0x004A, A_ScriptHwnd, cds.Ptr, , 'ahk_id ' hwnd, , , 3000)
+        return (r = 1)
+    }
+    return false
+}
+
+WaitInbox(ms) {
+    global IPC_TITLE
+    prev := A_DetectHiddenWindows
+    DetectHiddenWindows(true)                  ; 收件箱本身是"屏幕外显示"的，这里只是保险
+    h := 0
+    deadline := A_TickCount + ms
+    loop {
+        h := WinExist(IPC_TITLE)
+        if (h || A_TickCount > deadline)
+            break
+        Sleep 50
+    }
+    DetectHiddenWindows(prev)
+    return h
+}
+
+; ---------------------------------------------------------------- 参数解析
+
+/* 命令行语法：
+     ql                      → 打开/唤醒
+     ql <查询>               → 打开并预填（语法同搜索框：>命令 @分组 拼音）
+     ql search <查询>        → 显式写法
+     ql list <查询>          → 列出候选
+     ql run <条目> [选项]     → 直接执行
+   子命令只认第一个参数，所以搜 "run" 用 `ql search run` 或 `ql -- run`。 */
+CliParse(argv) {
+    a := {mode: '', q: '', args: '', hasArgs: false, show: false, hide: false
+        , wait: false, json: false, first: false, ephemeral: false, timeout: 30000
+        , replace: false, help: false, err: ''}
+
+    n := IsObject(argv) ? argv.Length : 0
+    i := 1
+
+    if (n >= 1) {
+        s := StrLower(argv[1])
+        if (s = 'run' || s = 'search' || s = 'list') {
+            a.mode := s
+            i := 2
+        }
+    }
+
+    pos := [], rawParts := [], isRaw := false
+    while (i <= n) {
+        t := argv[i]
+        if (isRaw) {
+            rawParts.Push(t)
+        } else if (t = '--') {
+            isRaw := true
+        } else if (RegExMatch(t, 'i)^--args=(.*)$', &m)) {
+            a.args := m[1], a.hasArgs := true
+        } else if (t = '--args' || t = '-a') {
+            if (i >= n) {
+                a.err := '--args 后面要跟参数内容'
+                return a
+            }
+            i++
+            a.args := argv[i], a.hasArgs := true
+        } else if (RegExMatch(t, 'i)^--timeout=(\d+)$', &m)) {
+            a.timeout := Integer(m[1])
+        } else if (t = '--timeout') {
+            if (i >= n) {
+                a.err := '--timeout 后面要跟毫秒数'
+                return a
+            }
+            i++
+            a.timeout := Integer(argv[i])
+        } else if (t = '--show') {
+            a.show := true
+        } else if (t = '--hide' || t = '--no-show') {
+            a.show := false
+            a.hide := true
+        } else if (t = '--wait') {
+            a.wait := true
+        } else if (t = '--json') {
+            a.json := true
+        } else if (t = '--first') {
+            a.first := true
+        } else if (t = '--ephemeral') {
+            a.ephemeral := true
+        } else if (t = '--replace') {
+            a.replace := true
+        } else if (t = '--help' || t = '-h' || t = '/?' || t = '-?') {
+            a.help := true
+            return a
+        } else if (SubStr(t, 1, 2) = '--') {
+            a.err := '不认识的选项：' t
+            return a
+        } else {
+            pos.Push(t)
+        }
+        i++
+    }
+
+    if (a.mode = '')
+        a.mode := pos.Length ? 'search' : 'none'
+
+    a.q := PosJoin(pos)
+
+    /* `--` 后面的原文：run 模式下是运行时参数（原样拼给程序，不切分引号）；
+       其它模式下并回查询串，这样 `ql -- run` 就是搜 "run" */
+    if (rawParts.Length) {
+        r := RawJoin(rawParts)
+        if (a.mode = 'run')
+            a.args := r, a.hasArgs := true
+        else
+            a.q := (a.q = '' ? r : a.q ' ' r)
+    }
+
+    if (a.mode = 'run' && a.q = '')
+        a.err := 'run 后面要跟条目 id 或关键词'
+    if (a.mode = 'list')
+        a.wait := true                          ; 要拿结果回来，必然得等
+    a.timeout := Max(1000, Min(a.timeout, 600000))
+    return a
+}
+
+PosJoin(list) {
+    s := ''
+    for v in list
+        s .= (s = '' ? '' : ' ') v
+    return s
+}
+
+RawJoin(list) {
+    /* 和 PosJoin 的区别：带空白的 token 要重新套上引号。
+       cmd 交过来的 A_Args 已经把引号剥掉了，`-- "x y"` 会被拆成一个元素 'x y'，
+       直接空格拼回去就变成两个参数了 —— 这里把'组'的边界补回来。 */
+    s := ''
+    for v in list {
+        if (v = '' || RegExMatch(v, '\s'))
+            v := '"' v '"'
+        s .= (s = '' ? '' : ' ') v
+    }
+    return s
+}
+
+CliUsage() {
+    L := [
+        '用法：ql [命令] [参数...]'
+        , ''
+        , '  ql                          打开 / 唤醒启动器'
+        , '  ql <查询>                   打开并预填查询（语法同搜索框：>命令  @分组  拼音）'
+        , '  ql search <查询>            同上，显式写法'
+        , '  ql list <查询>              列出匹配的条目（id、名称、类型，制表符分隔）'
+        , '  ql run <id|名称|查询> [选项]  直接执行条目'
+        , ''
+        , 'run 的选项：'
+        , '  --args "<原文>"      直接给出运行时参数（等同参数态里敲完再回车）'
+        , '  -- <原文>            -- 之后的全部内容原样作为参数，不用套引号'
+        , '  --show               执行时把窗口显示出来（默认不显示）'
+        , '  --wait               等执行结束，结果打到 stdout，退出码反映成败'
+        , '  --json               结果以 JSON 输出（配合 --wait / list）'
+        , '  --timeout <毫秒>     等待上限，默认 30000'
+        , '  --first              有多个候选时直接取最高分那条'
+        , '  --ephemeral          若为此新建了实例，处理完就退出（不常驻）'
+        , ''
+        , '退出码：0 成功 / 1 没找到 / 2 有歧义 / 3 缺参数 / 4 执行失败 / 5 无响应或权限不同 / 6 用法错误'
+    ]
+    for l in L
+        try FileAppend(l '`n', '*', 'UTF-8')
+}
+
+; ---------------------------------------------------------------- 客户端
+
+CliClient(a) {
+    ; 本进程只做投递，永不常驻：
+    ;   已有实例 → 直接投；没有 → 拉起一个隐藏实例，等它开门再投。
+    ; mode=none（双击 run.bat）当成"唤醒"，不再像以前那样把旧进程杀掉重开。
+    global CLI_DIR
+    mode := (a.mode = 'none') ? 'wake' : a.mode
+
+    ; 先短等一下：可能是另一个实例正在启动（互斥体已占用但窗口还没建）
+    hwnd := WaitInbox(1500)
+    if !hwnd {
+        if !SpawnInstance()
+            CliFail(5, '没能启动启动器进程。')
+        hwnd := WaitInbox(20000)
+        if !hwnd
+            CliFail(5, '启动器进程没有在 20 秒内就绪（WebView2 初始化失败？详见 launcher.log）。')
+    }
+
+    rid := MakeRid()
+    needWait := a.wait || a.mode = 'list'
+    reply := ''
+    if needWait {
+        try DirCreate(CLI_DIR)
+        reply := CLI_DIR '\' rid '.json'
+        try FileDelete(reply)
+    }
+
+    if !SendCopyData(hwnd, CliReqJson(a, rid, mode, reply))
+        CliFail(5, '无法把请求交给已有进程。最常见的原因是它正以管理员身份运行，'
+            . '权限不同的进程之间收不到这类消息。')
+
+    if !needWait
+        ExitApp(0)
+
+    deadline := A_TickCount + a.timeout
+    loop {
+        if FileExist(reply) {
+            txt := ''
+            try txt := FileRead(reply, 'UTF-8')
+            try FileDelete(reply)
+            if (txt = '') {
+                ; 刚好读到改名的一瞬间也不是没可能，给一次重试
+                Sleep 40
+                if (A_TickCount <= deadline)
+                    continue
+            }
+            PrintReply(txt, a.json)
+            ExitApp(JsonNum(txt, 'code', 0))
+        }
+        if (A_TickCount > deadline)
+            CliFail(5, '等待执行结果超时（' a.timeout ' ms）。')
+        Sleep 50
+    }
+}
+
+SpawnInstance() {
+    ; --hide：先藏起来，要不要露脸由随后到达的请求（cli-applied）决定
+    exe := A_IsCompiled ? A_ScriptFullPath : '"' A_AhkPath '" "' A_ScriptFullPath '"'
+    try {
+        Run(exe ' --hide', SCRIPT_DIR, 'Hide')
+        return true
+    }
+    return false
+}
+
+MakeRid() {
+    return 'c' ProcessExist() '-' A_TickCount '-' Random(1000, 9999)
+}
+
+CliReqJson(a, rid, mode, reply) {
+    ; show / exitAfter 都随请求走：决定权在发起方，实例只管照做
+    show := (mode = 'search' || a.show)
+    return '{"type":"cli","rid":' JsonQuote(rid)
+        . ',"mode":' JsonQuote(mode)
+        . ',"q":' JsonQuote(a.q)
+        . ',"args":' JsonQuote(a.args)
+        . ',"first":' (a.first ? 1 : 0)
+        . ',"show":' (show ? 1 : 0)
+        . ',"exitAfter":' (a.ephemeral ? 1 : 0)
+        . ',"reply":' JsonQuote(reply) '}'
+}
+
+PrintReply(json, asJson) {
+    out := asJson ? json : JsonStr(json, 'text')
+    if (out != '')
+        try FileAppend(out '`n', '*', 'UTF-8')
+}
+
+CliFail(code, msg) {
+    try FileAppend(msg '`n', '**', 'UTF-8')
+    ExitApp(code)
+}
+
+; ---------------------------------------------------------------- 实例端
+
+QueueReq(text) {
+    global cliRec, cliQueue, wakePending
+    rid := JsonStr(text, 'rid')
+    if (rid = '')
+        rid := MakeRid()
+    if (JsonStr(text, 'mode') = 'wake') {
+        ; "打开一下"不需要麻烦页面，但也别在这个消息处理里做窗口操作
+        wakePending := true
+        SetTimer(FlushCli, -1)
+        return
+    }
+    cliRec[rid] := {rid: rid, reply: JsonStr(text, 'reply')
+        , show: JsonNum(text, 'show', 0) ? true : false
+        , exitAfter: JsonNum(text, 'exitAfter', 0) ? true : false}
+    cliQueue.Push({text: text, rid: rid})
+    SetTimer(FlushCli, -1)
+}
+
+FlushCli() {
+    global cliQueue, wv, uiReady, wakePending
+    if wakePending {
+        wakePending := false
+        ShowLauncher()
+    }
+    if (!uiReady || !wv)
+        return
+    while cliQueue.Length {
+        it := cliQueue.RemoveAt(1)
+        ; 不能 await：await 会阻塞 AHK 消息循环，页面跑完之前整个界面都是死的
+        try wv.ExecuteScriptAsync('window.__cli&&window.__cli(' it.text ')')
+        catch as e
+            CliReply('{"rid":' JsonQuote(it.rid) ',"code":5,"text":'
+                . JsonQuote('注入页面失败：' CleanComError(e.Message)) ',"json":""}')
+    }
+}
+
+CliWantsWindow(rid) {
+    global cliRec
+    if (rid = '' || !cliRec.Has(rid))
+        return false
+    return cliRec[rid].show ? true : false
+}
+
+CliReply(raw) {
+    global cliRec
+    rid := JsonStr(raw, 'rid')
+    if (rid = '' || !cliRec.Has(rid))
+        return
+    rec := cliRec[rid]
+    code := JsonNum(raw, 'code', 0)
+    json := JsonStr(raw, 'json')
+
+    if (rec.reply != '' && json != '')
+        WriteReply(rec.reply, json)
+
+    cliRec.Delete(rid)
+
+    /* 本进程要不要退场完全由发起方说了算（--ephemeral）：
+       它可能是被人从命令行临时拉起来的，干完活就该走，不该在后台常驻。 */
+    if rec.exitAfter {
+        Sleep 200                    ; 给 usage.json 落盘和子进程收尾留一点时间
+        ExitApp(code)
+    }
+}
+
+WriteReply(path, json) {
+    ; 先写 .tmp 再改名：客户端可能恰好在写的过程中来读，看到半截 JSON 会解析出错。
+    ; 目录可能被清理过（冷启动时客户端比实例先建好路径），必须自己确保它在。
+    try DirCreate(RegExReplace(path, '\\[^\\]*$'))
+    tmp := path '.tmp'
+    try {
+        f := FileOpen(tmp, 'w', 'UTF-8-RAW')
+        if !IsObject(f)
+            return
+        f.Write(json)
+        f.Close()
+        FileMove(tmp, path, 1)
+    }
+}
+
+HashText(s) {
+    ; djb2，只求稳定不重复，不用于安全用途
+    h := 5381
+    Loop Parse, s
+        h := Mod((h * 33) + Ord(A_LoopField), 0x7FFFFFFF)
+    return Format('{:08x}', h)
+}
+
+CleanStaleCli() {
+    /* 回执目录是客户端和实例共用的。以前这里直接 DirDelete(...,true) 把整个
+       目录端掉 —— 冷启动时客户端先建好回执路径、再去拉起实例，实例一启动就把
+       目录连根删了，于是动作照跑、回执永远写不出来，调用方只能等到超时。
+       现在只清一天以上的陈货。 */
+    global CLI_DIR
+    if !DirExist(CLI_DIR)
+        return
+    cutoff := DateAdd(A_Now, -1, 'Days')
+    Loop Files, CLI_DIR '\*.json*', 'F' {
+        try {
+            if (A_LoopFileTimeModified < cutoff)
+                FileDelete(A_LoopFilePath)
+        }
+    }
 }
