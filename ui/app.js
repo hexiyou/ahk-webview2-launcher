@@ -67,7 +67,8 @@
     noSplit: false,       /* 刚按 Esc 退出参数态，别立刻又自动进去 */
     usage: {},            /* 使用记录：id -> { n 次数, t 上次时间戳(秒), args 参数历史 } */
     index: {},            /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
-    cfg: null             /* 原始配置：定时调度那段要重新解析，所以要留一份 */
+    cfg: null,            /* 原始配置：定时调度那段要重新解析，所以要留一份 */
+    offCount: 0           /* 配置里 enabled:false 的条目数（只用于提示，不参与搜索） */
   };
 
   const $ = id => document.getElementById(id);
@@ -520,6 +521,9 @@
       args: it.args || '',
       workdir: absPath(it.workdir || '') || scriptDir,
       pinned: it.pinned === true,
+      /* 临时停用：写 "enabled": false 就不进候选。只有布尔 false 才算停用，
+         漏写 / 写成别的值一律当启用（老配置里根本没有这个字段） */
+      enabled: it.enabled !== false,
       accent: it.accent || '',
       group: it.group ? String(it.group) : '',
       /* webhook 专用 */
@@ -555,15 +559,22 @@
     /* 定时调度要从原始配置里取 schedules；老式的顶层数组没有这段，就当没配 */
     state.cfg = (cfg && !Array.isArray(cfg) && typeof cfg === 'object') ? cfg : null;
     const items = cfg && (Array.isArray(cfg) ? cfg : cfg.items);
+    /* 停用的条目在「进 state.all 之前」就剔掉：搜索、分组、置顶、命令行
+       （ql list / ql run）全都读 state.all，一处过滤等于处处生效，不用在
+       每个入口各写一遍。归一化在前、过滤在后 —— id 缺省值是按原始下标生成的，
+       先过滤会让后面条目的 id 悄悄变样。 */
+    const norm = (arr) => arr.map(normalizeItem);
+    const on = (arr) => arr.filter(it => it.enabled);
     if (!items) {
       state.groups = DEMO_GROUPS;
-      state.all = DEMO_ITEMS.map(normalizeItem);
+      state.all = on(norm(DEMO_ITEMS));
     } else {
       state.groups = (cfg && Array.isArray(cfg.groups) ? cfg.groups : [])
         .filter(g => g && g.id)
         .map(g => ({ id: String(g.id), name: String(g.name || g.id) }));
-      state.all = items.map(normalizeItem);
+      state.all = on(norm(items));
     }
+    state.offCount = items ? items.length - state.all.length : 0;
 
     state.pinned = state.all.filter(x => x.pinned);
     if (!state.pinned.length) state.pinned = state.all.slice(0, 5);
@@ -2520,7 +2531,8 @@
 
   window.__applyConfig = function (cfg) {
     applyConfig(cfg);
-    toast('配置已更新，共 ' + state.all.length + ' 项');
+    toast('配置已更新，共 ' + state.all.length + ' 项'
+      + (state.offCount ? '（另有 ' + state.offCount + ' 项已停用）' : ''));
   };
 
   /* 测试用：暴露纯函数，方便 node 侧抽出来跑用例 */

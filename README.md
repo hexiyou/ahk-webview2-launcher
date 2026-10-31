@@ -141,6 +141,7 @@ wv2-launcher/
 │  ├─ download.test.js   download 类型用例（30 条）
 │  ├─ cli.test.js        命令行条目解析（id/名称/打分/歧义/--first，27 条）
 │  ├─ sched.test.js      定时任务配置解析（at/every/days、非法条目，57 条）
+│  ├─ enabled.test.js    条目停用归一化（enabled 缺省/false/写错，13 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
 │  ├─ gen-pinyin.ps1     从 pinyin-data 重新生成 ui/pinyin.js
@@ -149,7 +150,7 @@ wv2-launcher/
 │  ├─ unc-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 │  ├─ dl-check.js        下载专项实测：本地起 HTTP 服务，验证字节一致性/跳过/覆盖/备份
 │  ├─ dl-probe.ahk       上面那个脚本注入到 launcher.ahk 副本里的检查项
-│  ├─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/--ephemeral（42 项）
+│  ├─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/停用条目（52 项）
 │  ├─ out-check.js       控制台输出实测：AllocConsole 造真控制台，写进去再读回来比对
 │  ├─ out-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 │  └─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，验证触发/日志/不弹窗（22 项）
@@ -167,10 +168,11 @@ wv2-launcher/
 > node tests/download.test.js  # 30 条
 > node tests/cli.test.js       # 27 条（命令行解析/匹配/歧义）
 > node tests/sched.test.js     # 57 条（定时任务配置解析）
+> node tests/enabled.test.js   # 13 条（条目 enabled 归一化）
 > node tools/e2e.js            # 会弹一个真窗口跑 18 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
-> node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性（42 项）
+> node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用条目（52 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log）
 > ```
@@ -206,6 +208,7 @@ wv2-launcher/
   "args": "",                  // 启动参数
   "workdir": "",               // 工作目录，相对路径按脚本目录解析
   "pinned": true,              // 是否进"常用"卡片
+  "enabled": false,            // 临时停用（可选，默认 true），见下
   "accent": "#4f8cff"          // 卡片/头像的强调色（可选）
 }
 ```
@@ -223,6 +226,33 @@ wv2-launcher/
 
 顶层除了 `items`，还可以有 `groups`（分组，见下）和 `schedules`（定时任务，
 见「[七、定时调度](#七定时调度)」）。两个都是可选的，不写就是没有。
+
+### 停用条目（`enabled`）
+
+想临时关掉一条配置、又不想删掉它（参数、历史、备注都还在），就在那条上加
+`"enabled": false`：
+
+```json
+{ "id": "sync", "name": "同步配置", "type": "download", "enabled": false, "...": "..." }
+```
+
+停用的语义是**当它不存在**：
+
+| 地方 | 表现 |
+|---|---|
+| 主界面搜索 / 分组胶囊 / 常用卡片 | 不出现 |
+| `ql list` / `ql <关键词>` | 搜不到，`list` 直接返回"没有匹配的条目"（退出码 1） |
+| `ql run <id 或名称>` | 报"没找到匹配的条目"（退出码 1），**不会执行**，`--first` 也救不了 |
+| 定时任务 | 同上：任务照常触发，但取不到条目，`sched.log` 记一行 fail |
+
+几条约定：
+
+- 这个字段**可选**，不写就是 `true`，老配置一个字都不用改。
+- 只有布尔 `false` 才算停用。写成 `"false"`（字符串）、`0`、`null` 一律按**启用**处理 ——
+  手写 JSON 容易多敲引号，与其猜成停用让人对着配置找半天，不如当写错照常跑。
+- 界面**没有**开关，改这个只能手改 `config.json`；改完点窗口底部的「重载配置」
+  （或托盘「重载配置」）即时生效，不用重启。
+- 重载时的提示会带上数量：`配置已更新，共 12 项（另有 3 项已停用）`。
 
 ### 分组（`groups` + 条目的 `group`）
 
@@ -1034,6 +1064,9 @@ ql run marker --wait -- C:/a b\c.txt "D:/带 空格/x.txt"
 - **`--show` 和 `--wait` 同时用**，且这次是冷启动时，进程会在打印结果后退出，窗口也跟着关。
   想边看面板边要退出码，先 `ql` 把实例唤起来再执行。
 - 隐藏执行照样要 WebView2 起来，所以它不是一个"零依赖的一次性命令"。
+- **停用的条目光学不存在**：`"enabled": false` 的条目 `ql list` 列不出来、`ql run`
+  报"没找到匹配的条目"（退出码 1），`--first` 也不会把它捞出来。外部脚本要按退出码
+  判断的时候，这一点和"配置写错 id"的表现完全一样 —— 见「停用条目（`enabled`）」。
 
 ---
 

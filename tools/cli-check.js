@@ -145,6 +145,10 @@ function prep() {
       { id: 'marker2', name: '标记二', type: 'ahk', target: 'mark.ahk', group: 't' },
       { id: 'dupA', name: '重复 一', type: 'ahk', target: 'mark.ahk', group: 't' },
       { id: 'dupB', name: '重复 二', type: 'ahk', target: 'mark.ahk', group: 't' },
+      /* enabled:false 的条目：搜索、list、run 都不该看见它；
+         下面那条显式写 true，用来验证"写了也不影响" */
+      { id: 'hidden', name: '停用条目', type: 'ahk', target: 'mark.ahk', group: 't', enabled: false },
+      { id: 'shown', name: '显式启用', type: 'ahk', target: 'mark.ahk', group: 't', enabled: true },
       { id: 'badtarget', name: '坏目标', type: 'app', target: 'C:\\nope\\missing.exe', group: 't' },
       {
         id: 'hook', name: '测试请求', type: 'webhook', group: 't',
@@ -232,6 +236,34 @@ function killInstances(pid) {
   const t7 = await run(['run']);
   eq('写法不对退出码 6', t7.code, 6);
   ok('打印了用法', /用法：ql/.test(t7.out + t7.err), t7.out + t7.err);
+
+  /* enabled:false 的语义就是"当它不存在"：不列、不搜、不执行。
+     完全按外部调用方的视角验，而不是只看页面里过滤了没。 */
+  console.log('— enabled: false');
+  const t6a = await run(['list', '停用条目', '--json']);
+  eq('list 看不到停用的条目', t6a.code, 1);
+  ok('提示没有匹配', /没有匹配的条目/.test(t6a.out + t6a.err), t6a.out + t6a.err);
+
+  clearMark();
+  await sleep(600);                    /* 上一条用例的 mark 可能还在路上，先让路 */
+  const t6b = await run(['run', 'hidden', '--wait']);
+  eq('按 id run 停用条目退出码 1', t6b.code, 1);
+  ok('提示没找到', /没找到匹配的条目/.test(t6b.out + t6b.err), t6b.out + t6b.err);
+  await sleep(600);
+  eq('停用条目确实没被执行', readMark(), '');
+
+  const t6c = await run(['run', '停用条目', '--wait', '--first']);
+  eq('按名称 run 停用条目也是 1', t6c.code, 1);
+  await sleep(600);
+  eq('--first 也不会去碰它', readMark(), '');
+
+  const t6d = await run(['run', 'shown', '--wait']);
+  eq('显式 enabled:true 照常执行', t6d.code, 0);
+  eq('显式启用的条目真的跑了', await waitMark('args=[]'), 'args=[]');
+  const t6e = await run(['list', '显式', '--json']);
+  eq('显式启用的条目能被 list 到', (() => {
+    try { return (JSON.parse(t6e.out).items || []).map(x => x.id); } catch (e) { return []; }
+  })(), ['shown']);
 
   console.log('— 参数与目标错误');
   const t8 = await run(['run', 'hook', '--wait']);
