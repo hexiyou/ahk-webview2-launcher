@@ -355,5 +355,35 @@
       "id": "tool",
       "name": "工具"
     }
+  ],
+  "schedules": [
+    {
+      "id": "示例-每天查公网IP",
+      "run": "http-ip",
+      "at": "09:30",
+      "enabled": false
+    },
+    {
+      "id": "示例-工作日早晚各一次",
+      "run": "http-github",
+      "at": [
+        "09:30",
+        "18:00"
+      ],
+      "days": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri"
+      ],
+      "enabled": false
+    },
+    {
+      "id": "示例-每6小时检查一次",
+      "run": "pull-config",
+      "every": "6h",
+      "enabled": false
+    }
   ]
 }

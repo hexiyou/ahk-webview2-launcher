@@ -66,7 +66,8 @@
     param: null,          /* 参数态：{ item, head }，列表锁定单条 */
     noSplit: false,       /* 刚按 Esc 退出参数态，别立刻又自动进去 */
     usage: {},            /* 使用记录：id -> { n 次数, t 上次时间戳(秒), args 参数历史 } */
-    index: {}             /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
+    index: {},            /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
+    cfg: null             /* 原始配置：定时调度那段要重新解析，所以要留一份 */
   };
 
   const $ = id => document.getElementById(id);
@@ -551,6 +552,8 @@
     if (typeof cfg === 'string') {
       try { cfg = JSON.parse(cfg); } catch (e) { cfg = { items: [] }; }
     }
+    /* 定时调度要从原始配置里取 schedules；老式的顶层数组没有这段，就当没配 */
+    state.cfg = (cfg && !Array.isArray(cfg) && typeof cfg === 'object') ? cfg : null;
     const items = cfg && (Array.isArray(cfg) ? cfg : cfg.items);
     if (!items) {
       state.groups = DEMO_GROUPS;
@@ -578,6 +581,154 @@
     if (els.result) els.result.hidden = true;
 
     render();
+    postSchedules();          /* 配置换了，排程表整张重装 */
+  }
+
+  /* ---------------------------------------------------------- 定时调度
+
+     配置在 config.json 的 schedules 里（顶层，和 items / groups 平级）。
+     这里只做「校验 + 规范化」，逐条上报给 AHK —— 排程和触发由 AHK 的
+     原生定时器负责：窗口平时是藏着的，Chromium 对隐藏页面的 setTimeout
+     会做后台节流，靠页面自己计时根本不准。
+
+     规范化后的每条任务是"扁平字段"，AHK 用现有的 JsonStr / JsonNum 就能取，
+     不用为它写一套嵌套 JSON 解析：
+       { id, q, args, first, mode:'at'|'every', days:'1,2,3', times:'093000,180000', every:秒 }
+     写错的条目不在页面里报错（多半是无人值守时才发现），而是带上 err 一起
+     报给 AHK，由它写进 sched.log —— 那条被跳过，不影响别的任务。
+     ---------------------------------------------------------- */
+
+  const DAY_MAP = {
+    sun: 0, sunday: 0, 周日: 0, 周天: 0, 日: 0,
+    mon: 1, monday: 1, 周一: 1, 一: 1,
+    tue: 2, tuesday: 2, 周二: 2, 二: 2,
+    wed: 3, wednesday: 3, 周三: 3, 三: 3,
+    thu: 4, thursday: 4, 周四: 4, 四: 4,
+    fri: 5, friday: 5, 周五: 5, 五: 5,
+    sat: 6, saturday: 6, 周六: 6, 六: 6
+  };
+
+  /* 星期 → "0,1,2,3,4,5,6" 这种逗号串（0 = 周日，跟 AHK 的 WDay 对齐）。
+     写法不对返回 null，由调用方决定怎么报错。 */
+  function parseDays(v) {
+    if (v == null || v === '') return '0,1,2,3,4,5,6';
+    if (typeof v === 'string') {
+      const s = v.trim().toLowerCase();
+      if (s === '*' || s === 'daily' || s === '每天' || s === 'all') return '0,1,2,3,4,5,6';
+      if (s === 'weekdays' || s === 'workday' || s === '工作日') return '1,2,3,4,5';
+      if (s === 'weekend' || s === '周末') return '0,6';
+      if (!(s in DAY_MAP)) return null;
+      return String(DAY_MAP[s]);
+    }
+    if (!Array.isArray(v) || !v.length) return null;
+    const set = [];
+    v.forEach(x => {
+      const k = typeof x === 'number' ? x : DAY_MAP[String(x).trim().toLowerCase()];
+      if (k == null || k < 0 || k > 6 || set.indexOf(k) >= 0) return;
+      set.push(k);
+    });
+    if (!set.length) return null;
+    return set.sort().join(',');
+  }
+
+  /* 时刻 → "HHMMSS,HHMMSS"（数组表示一天跑多次）。支持 "9:30" / "09:30:15" */
+  function parseAt(v) {
+    const arr = Array.isArray(v) ? v : [v];
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+      const m = /^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/.exec(String(arr[i] == null ? '' : arr[i]).trim());
+      if (!m) return null;
+      const h = +m[1], mi = +m[2], se = m[3] == null ? 0 : +m[3];
+      if (h > 23 || mi > 59 || se > 59) return null;
+      const t = ('0' + h).slice(-2) + ('0' + mi).slice(-2) + ('0' + se).slice(-2);
+      if (out.indexOf(t) < 0) out.push(t);
+    }
+    return out.length ? out.sort().join(',') : null;
+  }
+
+  /* 间隔 → 秒。写数字按秒算；带单位时支持 s/m/h（也认秒/分/小时）。
+     下限 30 秒：再小没意义，还容易把一个手滑的 "0m" 变成狂刷。 */
+  function parseEvery(v) {
+    let sec = NaN;
+    if (typeof v === 'number') {
+      sec = v;
+    } else {
+      const m = /^(\d+(?:\.\d+)?)\s*(s|m|h|秒|分|分钟|小时)?$/i.exec(String(v == null ? '' : v).trim());
+      if (!m) return null;
+      const n = parseFloat(m[1]);
+      const u = (m[2] || 's').toLowerCase();
+      sec = u === 'h' || u === '小时' ? n * 3600
+        : u === 'm' || u === '分' || u === '分钟' ? n * 60
+          : n;
+    }
+    if (!isFinite(sec)) return null;
+    sec = Math.round(sec);
+    if (sec < 30 || sec > 2592000) return null;      /* 30 秒 ~ 30 天 */
+    return sec;
+  }
+
+  /* 把 config.schedules 变成一组可执行的任务；写错的条目保留 id + err，
+     好让 AHK 在日志里说清楚是哪一条、错在哪。 */
+  function normalizeSchedules(cfg) {
+    const out = [];
+    const list = cfg && Array.isArray(cfg.schedules) ? cfg.schedules : [];
+    list.forEach((raw, i) => {
+      const s = (raw && typeof raw === 'object') ? raw : {};
+      const run = String(s.run == null ? '' : s.run).trim();
+      const title = String(s.id || run || ('#' + (i + 1))).trim();
+      if (s.enabled === false) return;               /* 显式停用：不装，也不报错 */
+      if (!run) { out.push({ id: title, err: '缺少 run（要执行的条目）' }); return; }
+
+      const hasAt = s.at != null && String(s.at).trim() !== '';
+      const hasEvery = s.every != null && String(s.every).trim() !== '';
+      if (hasAt === hasEvery) {
+        out.push({ id: title, err: hasAt ? 'at 与 every 只能写一个' : 'at 与 every 至少要写一个' });
+        return;
+      }
+
+      const first = s.first === false ? 0 : 1;
+      const args = s.args == null ? '' : String(s.args);
+
+      if (hasEvery) {
+        if (s.days != null) { out.push({ id: title, err: 'days 只能和 at 一起用' }); return; }
+        const every = parseEvery(s.every);
+        if (every == null) {
+          out.push({ id: title, err: 'every 写法不对（示例 "30s" / "15m" / "2h"，最小 30 秒）' });
+          return;
+        }
+        out.push({ id: title, q: run, args: args, first: first, mode: 'every', every: every });
+        return;
+      }
+
+      const times = parseAt(s.at);
+      if (times == null) {
+        out.push({ id: title, err: 'at 写法不对（示例 "09:30" 或 "09:30:00"）' });
+        return;
+      }
+      const days = parseDays(s.days);
+      if (days == null) {
+        out.push({ id: title, err: 'days 写法不对（示例 ["mon","fri"] / "weekdays" / "weekend"）' });
+        return;
+      }
+      out.push({ id: title, q: run, args: args, first: first, mode: 'at', days: days, times: times });
+    });
+    return out;
+  }
+
+  /* 一条一条发：每条都是扁平对象，AHK 那边不用解析数组。
+     sched-begin / sched-end 把整批括起来，AHK 收到 end 才重装排程表。 */
+  function postSchedules() {
+    if (!HAS_BRIDGE) return;                         /* 浏览器预览：没有调度 */
+    const list = normalizeSchedules(state.cfg);
+    post({ type: 'sched-begin' });
+    list.forEach(t => {
+      if (t.err) { post({ type: 'sched-task', id: t.id, err: t.err }); return; }
+      post({
+        type: 'sched-task', id: t.id, q: t.q, args: t.args, first: t.first,
+        mode: t.mode, days: t.days || '', times: t.times || '', every: t.every || 0
+      });
+    });
+    post({ type: 'sched-end' });
   }
 
   /* ---------------------------------------------------------- 图标 */
@@ -1407,6 +1558,8 @@
     /* 命令行发起的执行：缺参数时不能"送进参数态"（窗口多半是隐藏的，没人能接着敲），
        必须直接失败并把原因回给调用方 */
     const cli = !!(opts && opts.cli);
+    /* 定时调度发起的执行：同样没人看着，而且不能动界面（不弹结果面板、不计使用频率） */
+    const quiet = !!(opts && opts.quiet);
 
     /* webhook / download 都要先把参数灌进模板再发请求 */
     if (item.type === 'webhook' || item.type === 'download') {
@@ -1419,9 +1572,9 @@
         toast('还缺参数：' + w.missing.join('、'));
         return false;
       }
-      if (item.type === 'download') runDownload(w.item, cli);
-      else runWebhook(w.item, raw, cli);
-      bumpUsage(item);
+      if (item.type === 'download') runDownload(w.item, cli, quiet);
+      else runWebhook(w.item, raw, cli, quiet);
+      if (!quiet) bumpUsage(item);
       return true;
     }
 
@@ -1439,7 +1592,8 @@
       /* 带 rid 时 AHK 会把启动结果回执回来（见 run-ack） */
       cli: cli && cliCur ? cliCur.rid : ''
     });
-    bumpUsage(item);
+    /* 自动跑的不计入"使用频率"：否则每天定时跑的任务会把搜索排序顶到最前面 */
+    if (!quiet) bumpUsage(item);
     return true;
   }
 
@@ -1511,15 +1665,19 @@
     return lines;
   }
 
-  function runWebhook(item, raw, cli) {
+  function runWebhook(item, raw, cli, quiet) {
     const id = 'r' + (++state.reqSeq).toString(36) + '-' + Date.now().toString(36);
-    state.pending.set(id, { item: item, cli: !!cli });
+    state.pending.set(id, { item: item, cli: !!cli, quiet: !!quiet });
 
-    state.result = {
-      id: id, item: item, loading: true, ok: true,
-      status: 0, ms: 0, body: '', error: '', truncated: 0, view: 'body'
-    };
-    renderResult();
+    /* 定时调度触发的请求不碰结果面板：窗口是藏着的，占了面板反而让用户
+       下次开窗看到一条莫名其妙的旧结果。结果摘要已经进 sched.log 了。 */
+    if (!quiet) {
+      state.result = {
+        id: id, item: item, loading: true, ok: true,
+        status: 0, ms: 0, body: '', error: '', truncated: 0, view: 'body'
+      };
+      renderResult();
+    }
 
     if (!HAS_BRIDGE) {
       /* 浏览器预览：给一份假响应，方便调样式 */
@@ -1549,6 +1707,12 @@
     const pend = state.pending.get(msg.id);
     state.pending.delete(msg.id);
     const wasCli = !!(pend && pend.cli);
+    if (pend && pend.quiet) {
+      cliDone(msg.ok ? 0 : 4, msg.ok
+        ? ('HTTP ' + (msg.status | 0) + ' · ' + (msg.ms | 0) + 'ms')
+        : ('请求失败：' + (msg.error || '未知错误')));
+      return;
+    }
     if (!state.result || state.result.id !== msg.id) {   /* 过期结果直接丢 */
       if (wasCli) cliDone(4, '结果面板已被关闭，取不到这次请求的结果');
       return;
@@ -1577,18 +1741,21 @@
 
   /* ---------------------------------------------------------- Download */
 
-  function runDownload(item, cli) {
+  function runDownload(item, cli, quiet) {
     const id = 'd' + (++state.reqSeq).toString(36) + '-' + Date.now().toString(36);
-    state.pending.set(id, { item: item, kind: 'download', cli: !!cli });
+    state.pending.set(id, { item: item, kind: 'download', cli: !!cli, quiet: !!quiet });
 
-    state.result = {
-      id: id, item: item, loading: true, ok: true, download: true,
-      status: 0, ms: 0, error: '', url: buildUrl(item),
-      file: '', name: '', size: 0, skipped: 0, backup: '', view: 'body'
-    };
-    renderResult();
+    if (!quiet) {
+      state.result = {
+        id: id, item: item, loading: true, ok: true, download: true,
+        status: 0, ms: 0, error: '', url: buildUrl(item),
+        file: '', name: '', size: 0, skipped: 0, backup: '', view: 'body'
+      };
+      renderResult();
+    }
 
     if (!HAS_BRIDGE) {
+      if (quiet) { state.pending.delete(id); return; }
       setTimeout(() => {
         state.pending.delete(id);
         state.result = Object.assign({}, state.result, {
@@ -1628,6 +1795,12 @@
     const pend = state.pending.get(msg.id);
     state.pending.delete(msg.id);
     const wasCli = !!(pend && pend.cli);
+    if (pend && pend.quiet) {
+      cliDone(msg.ok ? 0 : 4, msg.ok
+        ? ((msg.skipped ? '文件已存在，已跳过：' : '已下载：') + (msg.file || ''))
+        : ('下载失败：' + (msg.error || '未知错误')));
+      return;
+    }
     if (!state.result || state.result.id !== msg.id) {
       if (wasCli) cliDone(4, '结果面板已被关闭，取不到这次下载的结果');
       return;
@@ -2232,7 +2405,7 @@
     /* 先让 AHK 决定要不要把窗口显示出来，再执行 */
     post({ type: 'cli-applied', rid: req.rid });
 
-    const ok = launch(item, String(req.args || ''), { cli: true });
+    const ok = launch(item, String(req.args || ''), { cli: true, quiet: !!req.quiet });
     if (!ok) return;                 /* launch 内部已经 cliDone */
     if (item.type === 'webhook' || item.type === 'download') return;  /* 结果回调收尾 */
     /* app / cmd / ahk / folder / url：等 AHK 的 run-ack 收尾 */
@@ -2356,7 +2529,9 @@
     scoreOf: scoreOf, scoreOne: scoreOne, fieldQuality: fieldQuality,
     subseqQuality: subseqQuality, lastTokenRange: lastTokenRange,
     splitForComplete: splitForComplete, histComplete: histComplete,
-    cliRank: cliRank, cliResolve: cliResolve
+    cliRank: cliRank, cliResolve: cliResolve,
+    parseAt: parseAt, parseEvery: parseEvery, parseDays: parseDays,
+    normalizeSchedules: normalizeSchedules
   };
 
   /* ---------------------------------------------------------- 启动 */

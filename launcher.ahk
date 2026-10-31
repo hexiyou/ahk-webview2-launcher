@@ -32,6 +32,7 @@ global ICON_DIR   := A_Temp '\quicklaunch-icons'
 global HTTP_DIR   := A_Temp '\quicklaunch-http'
 global PULL_DIR   := A_Temp '\quicklaunch-pull'   ; 「拉取在线配置」先落到这里，校验过了才换掉本地文件
 global CLI_DIR    := A_Temp '\quicklaunch-cli'    ; 客户端的回执文件放这里（跨进程用，别用脚本目录）
+global SCHED_LOG  := SCRIPT_DIR '\sched.log'      ; 定时任务的执行记录（一行一条，主界面没有入口，靠它查）
 global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
 
 ; 单实例 / 进程间通信的标识：跟着脚本目录走，同一份程序的多个副本互不干扰
@@ -51,8 +52,11 @@ global httpJobs := Map()      ; 进行中的 webhook 请求：id -> {dir, pid, d
 global ipcGui := 0            ; 收件箱窗口（接收命令行请求）
 global mutexHandle := 0
 global cliQueue := []         ; 还没投递给页面的请求
-global cliRec := Map()        ; rid -> 请求记录 {rid, reply, show, exitAfter}
+global cliRec := Map()        ; rid -> 请求记录 {rid, reply, show, exitAfter, task}
 global wakePending := false   ; 有客户端只是要求"打开一下"
+global schedTasks := []       ; 已安装的定时任务
+global schedStage := []       ; sched-begin..sched-end 之间攒的条目
+global schedInside := false
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
@@ -622,7 +626,25 @@ OnWebMessage(sender, args) {
         case 'ready':
             uiReady := true
             try wvc.Fill()
+            /* 页面重载了：重载前投出去的调度请求不可能再有回执，先把 busy 放掉，
+               否则那条任务会永远"上一次还没结束" */
+            SchedReset('界面重载，上一次调度请求作废')
             FlushCli()                      ; 页面就绪后把攒着的命令行请求投进去
+        /* 三个调度消息走同一个 try：排程代码出错绝不能把消息循环卡死。
+           AHK 的异常在回调里会弹一个模态错误框，那个框会把整个脚本冻住 ——
+           页面随后连 ready 都发不进来，表现出来就是"界面一直不初始化"。
+           （第一版就是这么翻车的：对象字面量写成 t.Has('err')。） */
+        case 'sched-begin', 'sched-task', 'sched-end':
+            try {
+                if (type = 'sched-begin')
+                    SchedBegin()
+                else if (type = 'sched-task')
+                    SchedTask(raw)
+                else
+                    SchedEnd()
+            } catch as e {
+                SchedLog('-', 'bad', '内部错误：' CleanComError(e.Message))
+            }
         case 'cli-result':
             CliReply(raw)
         case 'cli-applied':
@@ -1739,7 +1761,8 @@ QueueReq(text) {
     }
     cliRec[rid] := {rid: rid, reply: JsonStr(text, 'reply')
         , show: JsonNum(text, 'show', 0) ? true : false
-        , exitAfter: JsonNum(text, 'exitAfter', 0) ? true : false}
+        , exitAfter: JsonNum(text, 'exitAfter', 0) ? true : false
+        , task: 0}
     cliQueue.Push({text: text, rid: rid})
     SetTimer(FlushCli, -1)
 }
@@ -1780,6 +1803,10 @@ CliReply(raw) {
 
     if (rec.reply != '' && json != '')
         WriteReply(rec.reply, json)
+
+    /* 定时任务发起的执行：结果进 sched.log，并把该任务的 busy 放掉 */
+    if (rec.task)
+        SchedDone(rec.task, code, JsonStr(raw, 'text'))
 
     cliRec.Delete(rid)
 
@@ -1829,4 +1856,295 @@ CleanStaleCli() {
                 FileDelete(A_LoopFilePath)
         }
     }
+}
+
+; ============================================================================
+;  定时调度
+;  ---------------------------------------------------------------------------
+;  config.json 顶层 schedules 里的任务，由页面 JS 校验、展开后逐条报上来
+;  （sched-begin / sched-task… / sched-end），这里只负责排程与触发。
+;
+;  为什么不用页面的 setTimeout：窗口平时是藏着的，Chromium 对隐藏页面的定时器
+;  会做后台节流（不可见久了降到一分钟一次甚至更稀），调度从一开始就不准。
+;  AHK 的 SetTimer 是 Win32 定时器，藏不藏窗口都一样。
+;
+;  触发时不另开一套执行逻辑：把一条 cli 请求塞进现有的 cliQueue，由页面的
+;  window.__cli 走和 `ql run` 完全相同的路（含参数分配、歧义处理）。
+;  区别只有 show=0 + quiet=1：不弹窗、不写结果面板、不计使用频率。
+;
+;  约定（README「定时调度」一节有同一份说明）：
+;    · 不补跑：下次时刻永远严格大于现在；晚了 90 秒以上就只记一行 miss
+;    · 不重试：失败就是一行 fail 日志
+;    · 同一任务上一次还没收尾就跳过本次（skip），避免 webhook 卡住时堆一串
+;    · 到点精度 < 1 秒（一次性精确定时），另有 60 秒兜底重算
+; ============================================================================
+
+SchedBegin() {
+    global schedStage, schedInside
+    ; 整批替换：先攒在新表里，收到 sched-end 才换掉旧的（配置重载走同一条路）
+    schedStage := []
+    schedInside := true
+}
+
+SchedTask(raw) {
+    global schedStage, schedInside
+    if !schedInside
+        return
+    id := JsonStr(raw, 'id')
+    err := JsonStr(raw, 'err')
+    if (err != '') {
+        schedStage.Push({id: id, err: err})
+        return
+    }
+    schedStage.Push({
+        id: id
+        , q: JsonStr(raw, 'q')
+        , args: JsonStr(raw, 'args')
+        , first: JsonNum(raw, 'first', 1) ? 1 : 0
+        , mode: JsonStr(raw, 'mode')
+        , days: JsonStr(raw, 'days')
+        , times: JsonStr(raw, 'times')
+        , every: Integer(JsonNum(raw, 'every', 0))
+        , next: ''
+        , last: ''
+        , busy: false
+    })
+}
+
+SchedEnd() {
+    global schedTasks, schedStage, schedInside
+    schedInside := false
+    stage := schedStage
+    schedStage := []
+
+    now := A_Now
+    list := []
+    for t in stage {
+        /* 注意用 HasOwnProp：AHK 的对象字面量没有 Has()（那是 Map 的方法），
+           写成 t.Has('err') 会抛 "no method named Has" —— 而这个异常发生在
+           消息回调里，会弹一个错误框把整个消息循环卡住（页面随后连 ready 都发不进去） */
+        if (IsObject(t) && t.HasOwnProp('err')) {
+            SchedLog(t.id, 'bad', t.err '（已跳过）')
+            continue
+        }
+        if (t.q = '') {
+            SchedLog(t.id, 'bad', '缺少要执行的条目（已跳过）')
+            continue
+        }
+        SchedAdvance(t, now)
+        list.Push(t)
+        SchedLog(t.id, 'plan', SchedDescribe(t))
+    }
+    schedTasks := list
+    /* 一条任务都没有就什么都不写：没配定时器的用户不该多出一个 sched.log */
+    SchedArm()
+}
+
+SchedAdvance(t, now) {
+    /* 把 t.next 推到"严格大于 now"的下一个时刻。严格大于这点很关键：
+       它同时保证了「不补跑」和「不会在同一秒里触发两次」。 */
+    if (t.mode = 'every') {
+        cand := ''
+        if (t.last != '')
+            cand := DateAdd(t.last, t.every, 'Seconds')
+        if (cand = '' || cand <= now)
+            cand := DateAdd(now, t.every, 'Seconds')
+        t.next := cand
+        return
+    }
+    t.next := SchedNextAt(now, t.days, t.times)
+}
+
+SchedNextAt(now, days, times) {
+    /* at 模式：从今天起往后数 8 天，找第一个「星期几命中 且 时刻晚于 now」的组合。
+       8 天足够覆盖最坏情况（今天是唯一命中的那天、且时刻已过 → 要跳到下周）。 */
+    if (days = '' || times = '')
+        return ''
+    tlist := StrSplit(times, ',')
+    Loop 8 {
+        d := DateAdd(now, A_Index - 1, 'Days')
+        wd := Integer(FormatTime(d, 'WDay')) - 1        ; WDay 是 1..7（1=周日），换成 0..6
+        if !InStr(',' days ',', ',' wd ',')
+            continue
+        ymd := FormatTime(d, 'yyyyMMdd')
+        for t in tlist {
+            cand := ymd . t
+            if (cand > now)
+                return cand
+        }
+    }
+    return ''
+}
+
+SchedArm() {
+    global schedTasks
+    best := ''
+    for t in schedTasks {
+        if (t.next = '')
+            continue
+        if (best = '' || t.next < best)
+            best := t.next
+    }
+    if (best = '') {
+        SetTimer(SchedTick, 0)
+        return
+    }
+    /* 一次性定时对准最近的那一个（精度到秒）；离得远就每 60 秒回来重算一次，
+       既省得排一个几天长的定时器，也能兜住系统时间跳变和休眠唤醒。 */
+    sec := DateDiff(best, A_Now, 'Seconds')
+    ms := sec * 1000 + 100
+    if (ms < 100)
+        ms := 100
+    if (ms > 60000)
+        ms := 60000
+    SetTimer(SchedTick, -ms)
+}
+
+SchedTick() {
+    global schedTasks
+    SchedReap()
+    now := A_Now
+    for t in schedTasks {
+        if (t.next = '' || t.next > now)
+            continue
+        due := t.next
+        late := DateDiff(now, due, 'Seconds')
+        t.last := due
+        SchedAdvance(t, now)                ; 先把指针推走，这一轮就不会重复触发
+        /* 晚了 90 秒以上只可能是休眠/关机/时间跳变。按「不补跑」处理：
+           记一行，跳过，等下一次正常时刻。 */
+        if (late > 90) {
+            SchedLog(t.id, 'miss', '晚了 ' late ' 秒才处理（休眠或程序没在跑），本次不补')
+            continue
+        }
+        SchedFire(t)
+    }
+    SchedArm()
+}
+
+SchedFire(t) {
+    global cliQueue, cliRec, uiReady
+    if !uiReady {
+        SchedLog(t.id, 'fail', '界面还没就绪，本次跳过')
+        return
+    }
+    if t.busy {
+        SchedLog(t.id, 'skip', '上一次还没结束，本次跳过')
+        return
+    }
+    rid := 'sched-' A_TickCount '-' Random(1000, 9999)
+    req := '{"type":"cli","rid":' JsonQuote(rid)
+        . ',"mode":"run","q":' JsonQuote(t.q)
+        . ',"args":' JsonQuote(t.args)
+        . ',"first":' t.first
+        . ',"show":0,"quiet":1,"exitAfter":0,"reply":""}'
+    t.busy := true
+    cliRec[rid] := {rid: rid, reply: '', show: false, exitAfter: false
+        , task: t, since: A_Now}
+    cliQueue.Push({text: req, rid: rid})
+    SetTimer(FlushCli, -1)
+}
+
+SchedDone(t, code, text) {
+    try t.busy := false
+    text := Trim(StrReplace(StrReplace(text, "`r", ' '), "`n", ' '))
+    if (StrLen(text) > 300)
+        text := SubStr(text, 1, 300) '…'
+    if (text = '')
+        text := (code = 0) ? '已执行' : '执行失败（没有更多信息）'
+    SchedLog(t.id, code = 0 ? 'ok' : 'fail', text)
+}
+
+SchedReset(reason) {
+    /* 页面重载：重载前投出去的请求不可能再有回执了。不把 busy 放掉的话，
+       那条任务会永远停在"上一次还没结束"上，从此再也不执行。 */
+    global cliRec
+    stale := []
+    for rid, rec in cliRec {
+        if rec.task
+            stale.Push(rid)
+    }
+    for rid in stale {
+        rec := cliRec[rid]
+        try rec.task.busy := false
+        cliRec.Delete(rid)
+        SchedLog(rec.task.id, 'fail', reason)
+    }
+}
+
+SchedReap() {
+    /* 兜底：页面活着但一直没回执（请求卡死）。5 分钟还没结果就按失败处理，
+       别让一条任务因为一次异常就永久停摆。 */
+    global cliRec
+    stale := []
+    for rid, rec in cliRec {
+        if (!rec.task || !rec.HasOwnProp('since'))
+            continue
+        if (DateDiff(A_Now, rec.since, 'Seconds') > 300)
+            stale.Push(rid)
+    }
+    for rid in stale {
+        rec := cliRec[rid]
+        try rec.task.busy := false
+        cliRec.Delete(rid)
+        SchedLog(rec.task.id, 'fail', '5 分钟没有收到结果，按失败处理')
+    }
+}
+
+SchedDescribe(t) {
+    when := (t.next = '') ? '(算不出下次时间)' : FormatTime(t.next, 'MM-dd HH:mm:ss')
+    if (t.mode = 'every')
+        return SchedEveryText(t.every) '，下次 ' when
+    return SchedDaysText(t.days) ' ' SchedTimesText(t.times) '，下次 ' when
+}
+
+SchedEveryText(sec) {
+    if (Mod(sec, 3600) = 0)
+        return '每 ' (sec // 3600) ' 小时'
+    if (Mod(sec, 60) = 0)
+        return '每 ' (sec // 60) ' 分钟'
+    return '每 ' sec ' 秒'
+}
+
+SchedTimesText(times) {
+    out := ''
+    for x in StrSplit(times, ',') {
+        c := SubStr(x, 1, 2) ':' SubStr(x, 3, 2)
+        if (SubStr(x, 5, 2) != '00')
+            c .= ':' SubStr(x, 5, 2)
+        out .= (out = '' ? '' : ',') c
+    }
+    return out
+}
+
+SchedDaysText(days) {
+    if (days = '0,1,2,3,4,5,6')
+        return '每天'
+    if (days = '1,2,3,4,5')
+        return '工作日'
+    if (days = '0,6')
+        return '周末'
+    names := ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+    out := ''
+    for x in StrSplit(days, ',') {
+        n := Integer(x) + 1
+        if (n < 1 || n > 7)
+            continue
+        out .= (out = '' ? '' : ',') names[n]
+    }
+    return (out = '') ? '每天' : out
+}
+
+SchedLog(id, kind, text) {
+    /* 一行一条，主界面没有入口，这个文件就是"它到底跑没跑"的唯一凭据。
+       超过 512 KB 轮转成 sched.log.1，只留一份 —— 排查用的日志不需要历史。 */
+    global SCHED_LOG
+    try {
+        if (FileExist(SCHED_LOG) && FileGetSize(SCHED_LOG) > 512000)
+            FileMove(SCHED_LOG, SCHED_LOG '.1', 1)
+    }
+    line := FormatTime(A_Now, 'yyyy-MM-dd HH:mm:ss') '  '
+    line .= SubStr(kind '      ', 1, 6)
+    line .= (id = '' ? '-' : id) '  ' text "`n"
+    try FileAppend(line, SCHED_LOG, 'UTF-8')
 }

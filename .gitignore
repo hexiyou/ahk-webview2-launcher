@@ -15,6 +15,10 @@ _*.js
 # ── 页面报错时会写的日志（排障用，不提交） ──
 launcher.log
 
+# ── 定时任务的执行记录（本机运行状态，不进仓库） ──
+sched.log
+sched.log.1
+
 # ── 使用记录（每台机器各不相同，跟着使用习惯走，不进仓库） ──
 usage.json
 usage.json.tmp
