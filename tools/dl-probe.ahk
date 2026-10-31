@@ -164,10 +164,13 @@ DL_Probe() {
     ok := DLDone('t12')
     DLW('T12 缺请求头 403    -> ' (ok ? DLMeta('t12') : '超时'))
 
-    ; 收尾：给还没跑完的 job 一点时间，避免 ExitApp 和子进程收尾撞在一起
+    ; 收尾：给还没跑完的 job 一点时间，避免和子进程收尾撞在一起
     Sleep(600)
     DLW('DONE')
-    ExitApp(0)
+    /* 这里不用 ExitApp：它会走 AHK 的收尾流程（释放 WebView2 那些 COM 对象），
+       下载线程有余温时偶尔以 0xC0000409 快速失败退出。日志早就落盘了，
+       但退出码会污染检查结果 —— 探针只需要日志，直接 ExitProcess 更确定。 */
+    DllCall('kernel32\ExitProcess', 'uint', 0)
 }
 
 DLText(p) {

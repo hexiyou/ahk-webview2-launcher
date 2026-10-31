@@ -65,7 +65,7 @@ if (CLI.help) {
     ExitApp(0)
 }
 if (CLI.err != '') {
-    FileAppend('参数错误：' CLI.err '`n`n', '**', 'UTF-8')
+    StdOut('参数错误：' CLI.err '`n`n', true)
     CliUsage()
     ExitApp(6)
 }
@@ -1555,6 +1555,55 @@ RawJoin(list) {
     return s
 }
 
+/* ------------------------------------------------------------------ 输出
+   为什么不直接用 FileAppend(text, '*')：那玩意儿在真控制台里会翻车。
+   实测（真 cmd 窗口）：FileAppend 抛「(6) 句柄无效」或者写进去的字节不被渲染，
+   而外面套着 try，错误被吞掉 —— 表现就是命令跑完了、窗口一个字都没打印。
+   管道里却一切正常，所以以前那些自动化测试永远测不出来。
+
+   这里自己拿句柄写：
+     · 控制台（FILE_TYPE_CHAR）→ 按 GetConsoleOutputCP 转成该代码页的字节，
+       换行用 CRLF（控制台只给 LF 有些环境不换行）；
+     · 管道 / 重定向（其他类型）→ UTF-8，换行只用 LF（和既有测试的期望一致）。 */
+StdStream(toErr := false) {
+    h := DllCall('kernel32\GetStdHandle', 'int', toErr ? -12 : -11, 'ptr')
+    if (h && h != 0 && h != -1)
+        return h
+    /* 没有 stdout 的进程（GUI 子系统被别的东西拉起时见过）：
+       主动挂到父进程的控制台上，再打开 CONOUT$/CONERR$ */
+    if !DllCall('kernel32\AttachConsole', 'uint', -1, 'int')
+        return 0
+    h := DllCall('kernel32\CreateFileW', 'wstr', toErr ? 'CONERR$' : 'CONOUT$'
+        , 'uint', 0xC0000000                     ; GENERIC_READ | GENERIC_WRITE
+        , 'uint', 3, 'ptr', 0, 'uint', 3, 'uint', 0, 'ptr', 0, 'ptr')
+    return (h = -1 ? 0 : h)
+}
+
+StdOut(text, toErr := false) {
+    h := StdStream(toErr)
+    if !h
+        return false
+    isConsole := (DllCall('kernel32\GetFileType', 'ptr', h, 'int') = 2)
+    cp := 0
+    if isConsole {
+        cp := DllCall('kernel32\GetConsoleOutputCP', 'int')
+        text := StrReplace(text, '`r`n', '`n')     ; 先规整，再统一成 CRLF
+        text := StrReplace(text, '`n', '`r`n')
+    }
+    if (!cp)
+        cp := isConsole ? 936 : 65001
+    try {
+        buf := Buffer(StrPut(text, 'CP' cp))
+        n := StrPut(text, buf, 'CP' cp) - 1        ; 不含结尾 0
+    } catch
+        return false
+    if (n <= 0)
+        return true
+    wrote := 0
+    DllCall('kernel32\WriteFile', 'ptr', h, 'ptr', buf, 'uint', n, 'uint*', &wrote, 'ptr', 0)
+    return wrote > 0
+}
+
 CliUsage() {
     L := [
         '用法：ql [命令] [参数...]'
@@ -1578,7 +1627,7 @@ CliUsage() {
         , '退出码：0 成功 / 1 没找到 / 2 有歧义 / 3 缺参数 / 4 执行失败 / 5 无响应或权限不同 / 6 用法错误'
     ]
     for l in L
-        try FileAppend(l '`n', '*', 'UTF-8')
+        StdOut(l '`n')
 }
 
 ; ---------------------------------------------------------------- 客户端
@@ -1667,11 +1716,11 @@ CliReqJson(a, rid, mode, reply) {
 PrintReply(json, asJson) {
     out := asJson ? json : JsonStr(json, 'text')
     if (out != '')
-        try FileAppend(out '`n', '*', 'UTF-8')
+        StdOut(out '`n')
 }
 
 CliFail(code, msg) {
-    try FileAppend(msg '`n', '**', 'UTF-8')
+    StdOut(msg '`n', true)
     ExitApp(code)
 }
 

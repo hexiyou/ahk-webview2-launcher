@@ -147,7 +147,9 @@ wv2-launcher/
 │  ├─ unc-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 │  ├─ dl-check.js        下载专项实测：本地起 HTTP 服务，验证字节一致性/跳过/覆盖/备份
 │  ├─ dl-probe.ahk       上面那个脚本注入到 launcher.ahk 副本里的检查项
-│  └─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/--ephemeral（42 项）
+│  ├─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/--ephemeral（42 项）
+│  ├─ out-check.js       控制台输出实测：AllocConsole 造真控制台，写进去再读回来比对
+│  └─ out-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 ├─ docs/screenshot.png
 └─ run.bat               启动（= 唤醒已有实例）
 ```
@@ -160,9 +162,12 @@ wv2-launcher/
 > node tests/search.test.js    # 58 条
 > node tests/unc.test.js       # 45 条
 > node tests/download.test.js  # 30 条
+> node tests/cli.test.js       # 27 条（命令行解析/匹配/歧义）
 > node tools/e2e.js            # 会弹一个真窗口跑 18 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
+> node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性（42 项）
+> node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > ```
 
 ---
@@ -889,6 +894,26 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     现在超时给到 120 秒，并且**进程非 0 退出（含被信号杀掉）一律判失败**：
     "没有 FAIL 行"不等于"测过了"。
 
+43. **⭐ `FileAppend(..., '*')` 在真控制台里一个字都写不出来（管道里却永远成功）**：
+    `ql list` / `ql --help` 在 cmd 窗口里完全没输出，而 42 项自动化全绿 —— 因为
+    `spawn` 给的 stdout 是**管道**，管道和真控制台是两种句柄，`FileAppend(x,'*','UTF-8')`
+    只在管道上可靠；真控制台里它写不出去，外面又套着 `try`，错误被吞得干干净净。
+    排查时最坑的是：**所有用 node spawn 跑出来的结果都看不见这个 bug**。
+    验证的办法只有一个 —— 从外面把那个窗口的屏幕缓冲区读回来：
+    `AttachConsole(该窗口的 pid)` → 打开 `CONOUT$` → `ReadConsoleOutputCharacterW`
+    逐行读（`COORD` 是按值传的 4 字节结构，DllCall 里要按指针大小给整数，给 Buffer
+    指针会直接失败、返回 0 字符，别被它骗了）。
+    改法：`StdOut()` 自己 `GetStdHandle`，拿不到就 `AttachConsole(-1)` + `CONOUT$`；
+    控制台按 `GetConsoleOutputCP` 转码（这台机器上 936）再 `WriteFile`，管道仍写 UTF-8。
+    回归测试是 `tools/out-check.js`：`AllocConsole` 造一个真控制台，写完再把屏幕缓冲区
+    读回来比对中文 —— 旧代码在这里会因为乱码/空而挂。
+
+44. **`ExitApp` 偶尔以 `0xC0000409` 退出**：`tools/dl-check.js` 的退出码时而 0、时而
+    `3221226525`（0xC0000409，快速失败），但 14 项全过。原因是探针收尾的 `ExitApp(0)`
+    会走 AHK 的完整清理（释放 WebView2 那些 COM 对象），下载线程还有余温时就会撞。
+    测试探针只关心日志，日志是 `FileAppend` 直写的、早就落盘了，所以改成
+    `ExitProcess(0)` 确定性收尾。**真程序退出仍走 `ExitApp`**，别因为测试这么干就跟着改。
+
 ---
 
 ## 六、命令行（`ql`）
@@ -904,6 +929,9 @@ ql run <id|名称|查询> [选项]  直接执行条目
 ```
 
 `ql` 就是项目目录里的 `ql.cmd`。把它所在的目录加进 `PATH`，或者直接用全路径调用都行。
+
+输出直接打到当前控制台，可以直接看，也可以 `> out.txt` 重定向或管道给别的程序：
+控制台里按控制台代码页转换（中文不乱码），被重定向时写 UTF-8。
 
 ### 选项
 
@@ -1017,6 +1045,8 @@ ql run marker --wait -- C:/a b\c.txt "D:/带 空格/x.txt"
 - 命令行同一时刻只处理一条请求，后面的排队（本来就是一条一条来的场景，没做并发）。
 - 命令行没有 `--timeout` 之外的超时控制；`--wait` 到期就放弃，已经发出去的请求不会取消。
 - 命令行不做参数补全和交互（`Tab`/`→` 那套只在窗口里有）。
+- 命令行输出需要"有控制台可写"：从 `cmd` / 终端里跑没问题；被没有控制台的宿主（某些服务、
+  IDE 的任务面板）直接拉起时，打印会静默丢掉，只能靠退出码判断成败（`--json` 也救不了）。
 - 服务/计划任务里以"不登录也运行"方式调用时没有交互桌面，WebView2 起不来，命令行也会失败。
 - 请求只能同步等待，没有"取消请求"按钮（Esc 只是关面板，进程会跑到超时）。
 - `WinHttp` 走**系统代理设置**（IE/系统级代理），没有单独的代理配置项。代理只在浏览器里生效、
