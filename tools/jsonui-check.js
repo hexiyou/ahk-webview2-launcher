@@ -53,12 +53,20 @@ function prepare(port) {
   copyDir(path.join(ROOT, 'runtime'), path.join(SANDBOX, 'runtime'));
   fs.copyFileSync(path.join(ROOT, 'launcher.ahk'), path.join(SANDBOX, 'launcher.ahk'));
 
-  /* 一条条目就够：这个工具主要关心结果面板，列表只是顺便 */
+  /* 一条可见 + 一条 hidden：这个工具关心结果面板，顺带守住 hidden 的两件事
+     —— 界面里不出现，但命令行仍然解析得到（hidden 条目故意写了 pinned，
+     用来验证它不会从常用卡片里冒出来） */
   const cfg = {
-    items: [{
-      id: 'jsonui', name: 'JSON 渲染检查', type: 'webhook', group: 'net',
-      target: 'http://127.0.0.1:' + port + '/big', method: 'GET', timeout: 10
-    }]
+    items: [
+      {
+        id: 'jsonui', name: 'JSON 渲染检查', type: 'webhook', group: 'net',
+        target: 'http://127.0.0.1:' + port + '/big', method: 'GET', timeout: 10
+      },
+      {
+        id: 'quiet', name: '静默后台任务', type: 'cmd', target: 'echo hi',
+        group: 'net', hidden: true, pinned: true
+      }
+    ]
   };
   fs.writeFileSync(path.join(SANDBOX, 'config.json'), JSON.stringify(cfg, null, 2), 'utf8');
   fs.writeFileSync(path.join(SANDBOX, 'launcher.ini'),
@@ -220,6 +228,33 @@ const PAGE_JS = `(async () => {
     } else {
       ok('找得到深浅两行（能量缩进）', false, 'shallow=' + !!shallow + ' deep=' + !!deep);
     }
+
+    /* ---------- hidden：界面里不出现，命令行照样调得到 ----------
+       这两种"看不见"必须分开验：jsonui-check 的配置里同时有一条 normal 和
+       一条 hidden（而且 hidden 那条故意写了 pinned），任何一处漏过滤都会在这里露馅 */
+    const qi = $('q');
+    const typeIn = v => { qi.value = v; qi.dispatchEvent(new Event('input')); };
+    const rowNames = () => Array.from($('list').querySelectorAll('.row-name')).map(e => e.textContent);
+
+    typeIn('');
+    ok('列表里没有 hidden 条目', rowNames().indexOf('静默后台任务') < 0, rowNames().join(' | '));
+    ok('可见条目照常列出', rowNames().indexOf('JSON 渲染检查') >= 0, rowNames().join(' | '));
+
+    /* 写了 pinned 也不该冒到卡片上 —— 否则藏起来就白藏了 */
+    const pinnedNames = Array.from(document.querySelectorAll('#pinned .card-name')).map(e => e.textContent);
+    ok('常用卡片里也没有它', pinnedNames.indexOf('静默后台任务') < 0, pinnedNames.join(' | '));
+
+    typeIn('静默');
+    ok('搜它的名字也搜不到', $('list').querySelectorAll('.row').length === 0,
+      $('list').querySelectorAll('.row').length + ' 行');
+    ok('空列表时说清了有几条被藏起来', /hidden/.test($('emptyText').textContent),
+      $('emptyText').textContent);
+    typeIn('');
+
+    /* 界面上藏了，命令行这条路必须还通 —— 定时任务走的也是这条 */
+    const cr = T.cliResolve('静默后台任务', false);
+    ok('命令行仍然解析得到它', !!(cr && cr.item && cr.item.id === 'quiet'),
+      JSON.stringify(cr && cr.item ? cr.item.id : cr));
   } catch (e) {
     log('EXCEPTION ' + ((e && e.stack) || e));
   }

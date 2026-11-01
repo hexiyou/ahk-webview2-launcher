@@ -121,6 +121,9 @@ function writeConfig(withSchedules) {
     groups: [{ id: 't', name: '测试' }],
     items: [
       { id: 'marker', name: '标记', subtitle: '写一行日志', type: 'ahk', target: 'mark.ahk', group: 't', pinned: true },
+      /* hidden:true 只影响界面，定时器必须照旧能调到它 —— 这正是 hidden 的
+         典型用法（后台维护任务：平时不想在搜索框里看见，但每天要跑） */
+      { id: 'quiet', name: '静默后台任务', type: 'ahk', target: 'mark.ahk', group: 't', hidden: true },
       { id: 'hook', name: '测试请求', type: 'webhook', target: base + '/ping', group: 't' }
     ]
   };
@@ -131,6 +134,9 @@ function writeConfig(withSchedules) {
       /* runOnStart：不等排程，启动后应该马上跑一次。every 故意放长到 10 分钟，
          这样"启动跑一次"和"到点再跑"在观察窗口里不会混在一起 */
       { id: 'boot-task', run: 'marker', args: 'from-boot', every: '10m', runOnStart: true },
+      /* hidden 条目 + 启动即跑：一次就够，既能证明"定时器找得到它"，
+         又不会在观察窗口里反复触发把行数搅乱 */
+      { id: 'hidden-task', run: 'quiet', args: 'from-quiet', every: '10m', runOnStart: true },
       { id: 'hook-task', run: 'hook', every: '30s' },
       { id: 'bad-at', run: 'marker', at: '99:99' },
       { id: 'both', run: 'marker', at: '09:00', every: '1h' },
@@ -193,12 +199,12 @@ async function phaseWithSchedules() {
   ok('runOnStart 在启动后立刻执行', /from-boot/.test(bootSeen), bootSeen.slice(0, 200));
   ok('比第一次排程（30s）早得多', bootMs < 12000, bootMs + 'ms');
 
-  /* 等三条任务都跑完：every 是安装后 30 秒，at 是开机后 25 秒 */
+  /* 等四条任务都跑完：every 是安装后 30 秒，at 是开机后 25 秒 */
   const t0 = Date.now();
   let lines = [];
   while (Date.now() - t0 < 75000) {
     lines = read(MARK).split('\n').filter(x => x.trim());
-    if (lines.length >= 3) break;
+    if (lines.length >= 4) break;
     await sleep(500);
   }
 
@@ -206,8 +212,9 @@ async function phaseWithSchedules() {
   ok('at 任务执行了', /from-at/.test(marks), 'mark.log:\n' + marks);
   ok('every 任务执行了', /from-every/.test(marks), 'mark.log:\n' + marks);
   ok('runOnStart 任务执行了', /from-boot/.test(marks), 'mark.log:\n' + marks);
+  ok('hidden 条目照样被定时器执行了', /from-quiet/.test(marks), 'mark.log:\n' + marks);
   ok('enabled:false 的任务没执行', !/from-off/.test(marks), 'mark.log:\n' + marks);
-  ok('只跑了三次（runOnStart 没有重复触发）', lines.length === 3, '实际 ' + lines.length + ' 行：\n' + marks);
+  ok('只跑了四次（runOnStart 没有重复触发）', lines.length === 4, '实际 ' + lines.length + ' 行：\n' + marks);
   ok('runOnStart 只跑了一次', lines.filter(x => /from-boot/.test(x)).length === 1, marks);
 
   /* 精度：mark 里记的触发时刻 vs 目标时刻 */
@@ -246,6 +253,9 @@ async function phaseWithSchedules() {
   ok('停用的任务不出现在日志里', !/\boff\b/.test(log), log);
   /* runOnStart 那次在日志里单独记一行 boot，和按时刻触发的 ok 区分开 */
   ok('runOnStart 在日志里记成 boot', /boot\s+boot-task/.test(log), log);
+  /* hidden 条目被排程调起来时，日志里该有它的名字 —— 界面藏了，日志不藏 */
+  ok('hidden 任务的执行记了日志', /ok\s+hidden-task[^\n]*静默后台任务/.test(log),
+    log.split('\n').filter(l => /hidden-task/.test(l)).join('\n') || log);
 
   /* 不显示窗口 */
   const st = probe(pid);

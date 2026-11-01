@@ -144,6 +144,7 @@ wv2-launcher/
 │  ├─ cli.test.js        命令行条目解析（id/名称/打分/歧义/--first，27 条）
 │  ├─ sched.test.js      定时任务配置解析（at/every/days、runOnStart、非法条目，62 条）
 │  ├─ enabled.test.js    条目停用归一化（enabled 缺省/false/写错，13 条）
+│  ├─ hidden.test.js     条目隐藏归一化 + 交互池/命令行池的分界（27 条）
 │  ├─ tpl.test.js        模板变量四条边界（替换范围/消耗/报错/转义，56 条）
 │  ├─ json.test.js       JSON 树的行模型（层级/逗号归属/路径/空容器/截断，60 条）
 │  ├─ keys.test.js       空格键语义 / 切范围保选择（14 条）
@@ -156,14 +157,14 @@ wv2-launcher/
 │  ├─ unc-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 │  ├─ dl-check.js        下载专项实测：本地起 HTTP 服务，验证字节一致性/跳过/覆盖/备份
 │  ├─ dl-probe.ahk       上面那个脚本注入到 launcher.ahk 副本里的检查项
-│  ├─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/停用条目/模板（60 项）
+│  ├─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/停用与隐藏条目/模板（66 项）
 │  ├─ out-check.js       控制台输出实测：AllocConsole 造真控制台，写进去再读回来比对
 │  ├─ out-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
-│  ├─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，含 runOnStart（27 项）
+│  ├─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，含 runOnStart 与 hidden 条目（29 项）
 │  ├─ hdr-check.js       请求头动态值：抽出 AHK 函数单跑，用 crypto 对照摘要/HMAC/Base64（36 项）
 │  ├─ hdr-e2e.js         请求头动态值端到端：本地回显服务看真实收到的头（加 --exe 测编译版）
 │  ├─ wh-cli-check.js    --webhook 的 --json/--body：真跑子进程，验输出与退出码（37 项，加 --exe 测编译版）
-│  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进（39 项）
+│  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进，并验证 hidden 条目不上界面（45 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -181,6 +182,7 @@ wv2-launcher/
 > node tests/cli.test.js       # 27 条（命令行解析/匹配/歧义）
 > node tests/sched.test.js     # 62 条（定时任务配置解析，含 runOnStart）
 > node tests/enabled.test.js   # 13 条（条目 enabled 归一化）
+> node tests/hidden.test.js    # 27 条（条目 hidden 归一化 + 交互池/命令行池分界）
 > node tests/tpl.test.js       # 56 条（模板变量四条边界）
 > node tests/json.test.js      # 60 条（JSON 树的行模型）
 > node tests/keys.test.js      # 14 条（空格认高亮行 / 切范围保选择，见踩坑 50）
@@ -188,9 +190,9 @@ wv2-launcher/
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
-> node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用条目/模板（60 项）
+> node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用与隐藏条目/模板（66 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
-> node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log）
+> node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log；含 hidden 条目）
 > node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC 与 crypto 对照（36 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
@@ -230,6 +232,7 @@ wv2-launcher/
   "workdir": "",               // 工作目录，相对路径按脚本目录解析
   "pinned": true,              // 是否进"常用"卡片
   "enabled": false,            // 临时停用（可选，默认 true），见下
+  "hidden": false,             // 只在界面里隐藏，ql / 定时任务照旧（可选，默认 false），见下
   "accent": "#4f8cff"          // 卡片/头像的强调色（可选）
 }
 ```
@@ -283,7 +286,45 @@ wv2-launcher/
   手写 JSON 容易多敲引号，与其猜成停用让人对着配置找半天，不如当写错照常跑。
 - 界面**没有**开关，改这个只能手改 `config.json`；改完点窗口底部的「重载配置」
   （或托盘「重载配置」）即时生效，不用重启。
-- 重载时的提示会带上数量：`配置已更新，共 12 项（另有 3 项已停用）`。
+- 重载时的提示会带上数量：`配置已更新，共 12 项（3 项已停用）`；两种都配了就是
+  `共 15 项（3 项 hidden、1 项已停用）`。
+
+### 隐藏条目（`hidden`）
+
+`enabled` 回答的是"这条还要不要"。但有一类条目不是不要了，而是**平时不用手点**：
+每天拉一次配置、清日志、报心跳、备份。它们必须存在、必须被定时器调到，
+只是不该占着搜索框 —— 那就加 `"hidden": true`：
+
+```json
+{ "id": "sync-cfg", "name": "同步配置", "type": "download", "hidden": true, "...": "..." }
+```
+
+两种"看不见"的差别就是这张表：
+
+| 地方 | `enabled: false` | `hidden: true` |
+|---|---|---|
+| 主界面搜索 / 分组 / 常用卡片 | 不出现 | **不出现** |
+| 列表空的时候 | — | 会补一句「另有 N 项设了 hidden」，免得以为配置丢了 |
+| `ql list` / `ql <关键词>` | 没有 | **照旧列出**（结果里带 `"hidden": true`） |
+| `ql run <id 或名称>` | 没找到（退出码 1） | **照旧执行** |
+| 定时任务 | 取不到条目，`sched.log` 记 fail | **照旧触发**，日志里正常记 ok |
+
+一句话：`enabled:false` 是"**当它不存在**"，`hidden:true` 是"**别在界面上烦我**"。
+
+几条约定：
+
+- 只有布尔 `true` 才算隐藏（`"true"`、`1` 一律当没写）。方向和 `enabled` 刻意相反：
+  `enabled` 写错只是多跑一条，`hidden` 写错会让人在界面上彻底找不着它。
+- 两个一起写等于停用 —— `enabled:false` 在更早一步就把条目剔掉了，`hidden` 管不着它。
+- `pinned: true` 对 hidden 条目无效，否则常用卡片会把它又摆出来。
+- 界面里没有"临时显示一下"的开关。要手动跑一次就 `ql run <id>`；想让它回到界面，
+  改 `hidden` 再重载配置。
+- 重载提示会带上数量：`配置已更新，共 15 项（3 项 hidden、1 项已停用）`。
+- 隐藏条目**仍然参加模板体检**：`{{x}}` 拼错照样在重载时提醒 ——
+  后台任务悄悄不跑了，比界面上多一条更麻烦。
+- 一个副作用值得知道：`ql` 的模糊匹配也包含 hidden 条目。所以 `ql run 维护`
+  如果同时命中一条可见条目和一条隐藏条目，会按"歧义"报错（退出码 2），写全 id 即可。
+  这是有意的 —— 宁可报歧义，也不替人猜该跑哪条。
 
 ### 分组（`groups` + 条目的 `group`）
 
@@ -1303,6 +1344,18 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     `tools/wh-cli-check.js` 里改成先看 BOM 再决定 `utf16le` 还是 `utf8`。
     对比：`body.txt` 是 `FileAppend(..., 'UTF-8-RAW')`，同一个目录两种编码，别想当然。
 
+62. **⭐ `hidden` 不能照抄 `enabled` 的过滤位置**：`enabled:false` 是在**进 `state.all` 之前**
+    就剔掉的 —— 因为语义是"当它不存在"，而搜索、`ql list`、`ql run`、定时器全都读
+    `state.all`，一处过滤等于处处生效，很省事。照这个位置放 `hidden` 就掉坑里了：
+    `ql run` 和定时任务走的是 `window.__cli` → `cliResolve` → `state.all`，
+    于是**后台维护任务会跟着一起从命令行消失** —— 界面看着一切正常，只是那些任务
+    再也不跑了，`sched.log` 里一行 `fail 没找到匹配的条目`，很难联想到是"藏了一下"。
+    正确做法是把过滤挪到**交互入口**这一层：`state.all` 原样保留，另算一份
+    `state.vis`（`visibleOf`），只有 `sourceFor(..., interactive)` 用它。
+    所以 `sourceFor` 现在有三个调用点要分清：`renderNormal` / `splitArgs` 是交互（true），
+    `cliRank` 是命令行（不传）。新增"界面入口"时忘了传 true，这条就会漏到界面上；
+    删掉 `state.vis` 的回退分支，测试夹具又会全部炸 —— `tests/hidden.test.js` 两边都钉住了。
+
 ---
 
 ## 六、命令行（`ql`）
@@ -1402,6 +1455,9 @@ ql run marker --wait -- C:/a b\c.txt "D:/带 空格/x.txt"
 - **停用的条目光学不存在**：`"enabled": false` 的条目 `ql list` 列不出来、`ql run`
   报"没找到匹配的条目"（退出码 1），`--first` 也不会把它捞出来。外部脚本要按退出码
   判断的时候，这一点和"配置写错 id"的表现完全一样 —— 见「停用条目（`enabled`）」。
+- **隐藏的条目命令行照旧能调**：`"hidden": true` 只影响界面，`ql list` / `ql run`
+  完全不受影响（`list --json` 里会带 `"hidden": true` 标明身份）。后台维护任务
+  适合这么放 —— 见「隐藏条目（`hidden`）」。
 
 ---
 
@@ -1559,6 +1615,8 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 - **UNC 路径**：只有 `workdir` 是 UNC 时才需要特殊照顾（已自动 `pushd`），但共享掉线时
   `FileExist` 会阻塞约 2 秒才失败；首次访问共享的冷启动也可能要好几秒（系统 SMB + 杀软扫描）。
   补全 `\\服务器` 只列共享，**不列网络上的服务器名**（那要靠"浏览网络"，会慢且可能弹框）。
+- `hidden` 没有"临时显示"的开关：界面上看不到、也搜不到，只能 `ql run <id>` 手动跑一次，
+  或者改配置再重载。想"平时藏、偶尔挑一条点一下"，目前没有这个中间态。
 - 参数态一次只能运行一条，不能批量（要做批量得先在 `cmd` 里写循环）。
 - 命令行同一时刻只处理一条请求，后面的排队（本来就是一条一条来的场景，没做并发）。
 - 命令行没有 `--timeout` 之外的超时控制；`--wait` 到期就放弃，已经发出去的请求不会取消。

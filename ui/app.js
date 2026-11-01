@@ -69,7 +69,9 @@
     usage: {},            /* 使用记录：id -> { n 次数, t 上次时间戳(秒), args 参数历史 } */
     index: {},            /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
     cfg: null,            /* 原始配置：定时调度那段要重新解析，所以要留一份 */
+    vis: [],              /* 界面可见的条目（state.all 去掉 hidden 之后） */
     offCount: 0,          /* 配置里 enabled:false 的条目数（只用于提示，不参与搜索） */
+    hidCount: 0,          /* 配置里 hidden:true 的条目数（同上，只在空列表时提示） */
     tplBad: [],           /* 模板变量写错的条目（执行时会被拒绝） */
     tplWarn: []           /* 用了 {{…}} 但没声明 params 的条目（只提醒） */
   };
@@ -197,8 +199,22 @@
 
   const CMD_TYPES = { cmd: 1, ahk: 1, webhook: 1, download: 1 };
 
-  function sourceFor(scope, group) {
-    let list = state.all;
+  /* 界面可见的条目：启用、且没写 hidden。
+
+     为什么 hidden 不像 enabled 那样在进 state.all 之前就剔掉：
+     `ql run` / 定时任务走的是 window.__cli，而它按 id / 名称 / 打分去 state.all
+     里找条目 —— 在 state.all 这层过滤，等于顺手把命令行和定时器一起弄坏。
+     所以 hidden 只在「交互入口」这一层生效，见 sourceFor 的第三个参数。 */
+  function visibleOf(list) {
+    return (list || []).filter(it => !it.hidden);
+  }
+
+  /* interactive = true 时只给界面用（搜索框、置顶卡片、空格切参数态）；
+     命令行与定时器不传这个参数，拿到的是完整池子，hidden 条目照样能跑。 */
+  function sourceFor(scope, group, interactive) {
+    /* state.vis 由 applyConfig 预先算好（每次按键都过滤一遍没必要）；
+       测试夹具里没有这个字段，退回现算 */
+    let list = interactive ? (state.vis || visibleOf(state.all)) : state.all;
     if (scope === 'cmd' || scope === 'group-cmd')
       list = list.filter(it => CMD_TYPES[it.type]);
     if (group && (scope === 'group' || scope === 'group-cmd'))
@@ -287,7 +303,7 @@
       const tail = s.slice(gaps[i] + 1);
       const hq = parseQuery(head);
       if (!hq.term) continue;
-      const pool = sourceFor(hq.scope, findGroup(hq.groupId));
+      const pool = sourceFor(hq.scope, findGroup(hq.groupId), true);
       const item = uniqueMatch(hq.term, pool);
       if (item) return { item: item, head: head, tail: tail };
     }
@@ -672,6 +688,10 @@
       /* 临时停用：写 "enabled": false 就不进候选。只有布尔 false 才算停用，
          漏写 / 写成别的值一律当启用（老配置里根本没有这个字段） */
       enabled: it.enabled !== false,
+      /* 只在界面里藏起来（搜索、置顶卡片都不出现），`ql` 与定时任务照旧能调。
+         和 enabled 相反：只有布尔 true 才算隐藏 —— 写成 "true" / 1 / "false"
+         一律当没写，免得手滑把一条常用条目藏没了却找不到原因 */
+      hidden: it.hidden === true,
       accent: it.accent || '',
       group: it.group ? String(it.group) : '',
       /* webhook 专用 */
@@ -733,13 +753,19 @@
       state.all = on(norm(items));
     }
     state.offCount = items ? items.length - state.all.length : 0;
+    /* hidden 不在这里剔：命令行和定时器要读 state.all（见 visibleOf 的注释），
+       只把"界面能看见的那批"单独存一份，交互路径统一用它 */
+    state.vis = visibleOf(state.all);
+    state.hidCount = state.all.length - state.vis.length;
     /* 模板写错的条目（启用中的）：重载时汇总提示一声，执行时还会逐个拦 */
     state.tplBad = state.all.filter(x => x.tplErr.length);
     /* 有 {{x}} 但没声明 params：不拦，只提醒 —— 也可能它就是给别的工具用的字面量 */
     state.tplWarn = state.all.filter(x => x.tplWarn.length);
 
-    state.pinned = state.all.filter(x => x.pinned);
-    if (!state.pinned.length) state.pinned = state.all.slice(0, 5);
+    /* 常用卡片也是交互入口：hidden 条目就算写了 pinned 也不上卡片，
+       否则"藏起来"就白藏了。没配 pinned 时的前 5 条同理，只能从可见的里挑。 */
+    state.pinned = state.vis.filter(x => x.pinned);
+    if (!state.pinned.length) state.pinned = state.vis.slice(0, 5);
     state.sel = 0;
     state.param = null;
     state.noSplit = false;
@@ -1156,7 +1182,7 @@
   }
 
   function renderNormal(scope, group, term) {
-    const base = sourceFor(scope, group);
+    const base = sourceFor(scope, group, true);
     const q = term.toLowerCase();
 
     if (q) {
@@ -1656,6 +1682,21 @@
     });
   }
 
+  /* 当前范围里有多少 hidden 条目（给了 term 就只算能命中它的）。
+     用途只有一个：列表空的时候解释「为什么搜不到」—— 只报个数，不列名字，
+     这些条目本来就不想让人在界面里看到。 */
+  function hiddenHitCount(term) {
+    let pool = state.all.filter(it => it.hidden);
+    if (state.scope === 'cmd' || state.scope === 'group-cmd')
+      pool = pool.filter(it => CMD_TYPES[it.type]);
+    if (state.scope === 'group' || state.scope === 'group-cmd') {
+      const g = findGroup(state.groupId);
+      if (g) pool = pool.filter(it => it.group === g.id);
+    }
+    const q = String(term || '').toLowerCase();
+    return q ? pool.filter(it => scoreOf(it, q) > 0).length : pool.length;
+  }
+
   function renderList() {
     const box = els.list;
     box.innerHTML = '';
@@ -1668,6 +1709,15 @@
         els.emptyText.textContent = state.groupId ? '这个分组还没有条目' : '没有这个分组';
       else
         els.emptyText.textContent = state.q ? '没有匹配的结果' : '配置里还没有条目';
+
+      /* 空列表本身是对的（hidden 就该搜不到），但必须给个解释 ——
+         否则用户会以为配置没生效，转头去翻 JSON 找半天 */
+      const hid = hiddenHitCount(state.term);
+      if (hid) {
+        els.emptyText.textContent += state.term
+          ? '（另有 ' + hid + ' 项设了 hidden，不在界面显示）'
+          : '（有 ' + hid + ' 项设了 hidden，不在界面显示；ql 与定时任务照旧可用）';
+      }
       return;
     }
     els.empty.hidden = true;
@@ -3058,7 +3108,10 @@
       if (!hit.length) { cliDone(1, '没有匹配的条目：' + (req.q || '')); return; }
       const items = hit.map(x => ({
         id: x.it.id, name: x.it.name, type: x.it.type,
-        subtitle: x.it.subtitle, score: Math.round(x.s)
+        subtitle: x.it.subtitle, score: Math.round(x.s),
+        /* hidden 只是"界面里别出现"，命令行照样列出来 —— 顺带告诉调用方它藏了，
+           免得脚本里翻不到这条为什么在界面上没见过 */
+        hidden: !!x.it.hidden
       }));
       const lines = items.map(x => x.id + '\t' + x.name + '\t' + x.type);
       cliDone(0, lines.join('\n'), { items: items });
@@ -3073,7 +3126,7 @@
     }
     if (r.amb) {
       const list = r.amb.slice(0, 12);
-      const items = list.map(it => ({ id: it.id, name: it.name, type: it.type }));
+      const items = list.map(it => ({ id: it.id, name: it.name, type: it.type, hidden: !!it.hidden }));
       const lines = items.map(x => x.id + '\t' + x.name + '\t' + x.type);
       cliDone(2, '有多个条目匹配，请写全 id 或名称，或加 --first 取第一条：\n'
         + lines.join('\n'), { items: items });
@@ -3204,8 +3257,13 @@
 
   window.__applyConfig = function (cfg) {
     applyConfig(cfg);
+    /* hidden 条目也算"配置里有"，所以总数照旧报 state.all；再单独点一下有几条藏了，
+       否则用户加完 hidden 发现界面少了几条会以为配置丢了 */
+    const marks = [];
+    if (state.hidCount) marks.push(state.hidCount + ' 项 hidden');
+    if (state.offCount) marks.push(state.offCount + ' 项已停用');
     let msg = '配置已更新，共 ' + state.all.length + ' 项'
-      + (state.offCount ? '（另有 ' + state.offCount + ' 项已停用）' : '');
+      + (marks.length ? '（' + marks.join('、') + '）' : '');
     if (state.tplBad.length) msg += '；有 ' + state.tplBad.length + ' 个条目的模板变量写错了';
     else if (state.tplWarn.length) msg += '；有 ' + state.tplWarn.length + ' 个条目用了 {{…}} 但没声明 params';
     toast(msg, state.tplBad.length || state.tplWarn.length ? 6000 : 2000);
@@ -3222,6 +3280,7 @@
     cliRank: cliRank, cliResolve: cliResolve,
     parseAt: parseAt, parseEvery: parseEvery, parseDays: parseDays,
     normalizeSchedules: normalizeSchedules,
+    visibleOf: visibleOf, sourceFor: sourceFor,
     fillTemplate: fillTemplate, tplVars: tplVars, templateIssues: templateIssues,
     applyParams: applyParams, joinTokens: joinTokens
   };

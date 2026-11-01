@@ -147,6 +147,9 @@ function prep() {
       /* enabled:false 的条目：搜索、list、run 都不该看见它；
          下面那条显式写 true，用来验证"写了也不影响" */
       { id: 'hidden', name: '停用条目', type: 'ahk', target: 'mark.ahk', group: 't', enabled: false },
+      /* hidden:true 的条目：界面里不出现，但命令行要照旧看得见、跑得动。
+         这条是上面那条的"反面教材"，两条放在一起才好区分两种语义 */
+      { id: 'quiet', name: '静默后台任务', type: 'ahk', target: 'mark.ahk', group: 't', hidden: true },
       { id: 'shown', name: '显式启用', type: 'ahk', target: 'mark.ahk', group: 't', enabled: true },
       { id: 'badtarget', name: '坏目标', type: 'app', target: 'C:\\nope\\missing.exe', group: 't' },
       /* 模板变量：声明了 params，args 里的 {{tag}} 该被替换，且 tag 不再追加 */
@@ -269,6 +272,28 @@ function killInstances(pid) {
   eq('显式启用的条目能被 list 到', (() => {
     try { return (JSON.parse(t6e.out).items || []).map(x => x.id); } catch (e) { return []; }
   })(), ['shown']);
+
+  /* hidden:true 是另一码事：界面里不出现，但命令行该怎么用还怎么用。
+     这两条"看起来都不见了"的条目必须表现不同 —— 混了就等于把后台任务弄哑。 */
+  console.log('— hidden: true');
+  const t6f = await run(['list', '静默', '--json']);
+  eq('list 照样列得出来', t6f.code, 0);
+  let q6f = [];
+  try { q6f = JSON.parse(t6f.out).items || []; } catch (e) {}
+  eq('列出来的就是它', q6f.map(x => x.id), ['quiet']);
+  eq('结果里标了 hidden', q6f.length === 1 && q6f[0].hidden, true);
+
+  clearMark();
+  await sleep(600);
+  const t6g = await run(['run', 'quiet', '--wait']);
+  eq('按 id run 退出码 0', t6g.code, 0);
+  eq('隐藏条目真的执行了', await waitMark('args=[]'), 'args=[]');
+
+  const t6h = await run(['run', '静默后台任务', '--wait', '--first']);
+  eq('按名称 run 也认', t6h.code, 0);
+  /* --wait 等到的是"进程起来了"，mark 可能还在路上。这里等一拍再让下一段
+     clearMark，否则上一条的 mark 会落到下一个用例的文件里，看起来像"多跑了一次" */
+  await sleep(600);
 
   /* 模板变量：声明了 params 的条目 target/args 里的 {{x}} 会被替换，
      没声明的整条不替换（老配置零影响），拼错变量则拒绝执行。 */

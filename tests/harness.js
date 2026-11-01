@@ -32,7 +32,7 @@ const DEFAULT_NAMES = [
   /* 匹配 / 拼音 */
   'pyCall', 'isBoundaryAt', 'subseqQuality', 'fieldQuality', 'fieldsOf', 'scoreOne', 'scoreOf',
   /* 查询解析 + 参数切分 */
-  'splitQuoted', 'takesArgs', 'uniqueMatch', 'splitArgs', 'parseQuery', 'sourceFor', 'findGroup',
+  'splitQuoted', 'takesArgs', 'uniqueMatch', 'splitArgs', 'parseQuery', 'sourceFor', 'visibleOf', 'findGroup',
   /* 空格语义 / 切范围保选择 */
   'spaceTarget', 'selIndexById',
   /* 拖文件进来：file:// URI → 本地路径 */
