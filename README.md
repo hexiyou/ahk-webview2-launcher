@@ -137,14 +137,15 @@ wv2-launcher/
 │  └─ WebView2Loader.dll      x64 加载器（x86 版见 WebView2Loader_x86.dll）
 ├─ runtime/              免安装 AutoHotkey v2（可删，改用系统装的 AHK）
 ├─ tests/
-│  ├─ args.test.js       参数/查询语义用例（38 条）
+│  ├─ args.test.js       参数/查询语义用例（39 条）
 │  ├─ search.test.js     拼音/打分/频率/补全用例（58 条）
 │  ├─ unc.test.js        UNC 路径用例（45 条）
 │  ├─ download.test.js   download 类型用例（30 条）
 │  ├─ cli.test.js        命令行条目解析（id/名称/打分/歧义/--first，27 条）
-│  ├─ sched.test.js      定时任务配置解析（at/every/days、非法条目，57 条）
+│  ├─ sched.test.js      定时任务配置解析（at/every/days、runOnStart、非法条目，62 条）
 │  ├─ enabled.test.js    条目停用归一化（enabled 缺省/false/写错，13 条）
 │  ├─ tpl.test.js        模板变量四条边界（替换范围/消耗/报错/转义，56 条）
+│  ├─ json.test.js       JSON 树的行模型（层级/逗号归属/路径/空容器/截断，60 条）
 │  ├─ keys.test.js       空格键语义 / 切范围保选择（14 条）
 │  ├─ drop.test.js       file:// URI → 本地路径（中文/空格/UNC/坏转义，14 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
@@ -158,9 +159,11 @@ wv2-launcher/
 │  ├─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/停用条目/模板（60 项）
 │  ├─ out-check.js       控制台输出实测：AllocConsole 造真控制台，写进去再读回来比对
 │  ├─ out-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
-│  ├─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，验证触发/日志/不弹窗（22 项）
+│  ├─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，含 runOnStart（27 项）
 │  ├─ hdr-check.js       请求头动态值：抽出 AHK 函数单跑，用 crypto 对照摘要/HMAC/Base64（36 项）
 │  ├─ hdr-e2e.js         请求头动态值端到端：本地回显服务看真实收到的头（加 --exe 测编译版）
+│  ├─ wh-cli-check.js    --webhook 的 --json/--body：真跑子进程，验输出与退出码（37 项，加 --exe 测编译版）
+│  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进（39 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -176,9 +179,10 @@ wv2-launcher/
 > node tests/unc.test.js       # 45 条
 > node tests/download.test.js  # 30 条
 > node tests/cli.test.js       # 27 条（命令行解析/匹配/歧义）
-> node tests/sched.test.js     # 57 条（定时任务配置解析）
+> node tests/sched.test.js     # 62 条（定时任务配置解析，含 runOnStart）
 > node tests/enabled.test.js   # 13 条（条目 enabled 归一化）
 > node tests/tpl.test.js       # 56 条（模板变量四条边界）
+> node tests/json.test.js      # 60 条（JSON 树的行模型）
 > node tests/keys.test.js      # 14 条（空格认高亮行 / 切范围保选择，见踩坑 50）
 > node tests/drop.test.js      # 14 条（file:// URI → 本地路径，见踩坑 51）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
@@ -189,6 +193,8 @@ wv2-launcher/
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log）
 > node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC 与 crypto 对照（36 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
+> node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
+> node tools/jsonui-check.js   # 真 WebView2 里点折叠/搜索/量缩进（加 --shot 停住方便截图）
 > node tools/build-exe.js      # 编译成 dist\QuickLaunch.exe（需要 Ahk2Exe，见「九」）
 > ```
 
@@ -622,9 +628,20 @@ global SIG_KEYS := Map(
 }
 ```
 
-结果面板会显示 **方法 / URL / 状态码 / 耗时**，JSON 自动格式化 + 语法着色，
-可以「复制」或切「完整响应」；`jsonPath` 取不到值时会把原因写在正文里（比如"数组下标越界""没有字段 xxx"）。
-非 JSON 响应按原文显示，不做 HTML 渲染。
+结果面板会显示 **方法 / URL / 状态码 / 耗时**，JSON 响应画成一棵可以折叠的树：
+
+| 想做的事 | 怎么做 |
+|---|---|
+| 折叠一整块 | 点行首的 `▾`；折叠后显示成 `{… 12 个字段}`，收起的子树不再占地方 |
+| 搜索 | 右上角放大镜或 `Ctrl+F`。`Enter` 下一个、`Shift+Enter` 上一个，命中会自动展开祖先节点 |
+| 复制单个字段 | 鼠标移到那一行，点行尾的 `⧉`。字符串复制原文，对象/数组复制整段缩进好的 JSON |
+| 复制当前视图 | 右上角「复制」 |
+| 只看 `jsonPath` 取到的值 | 「只看结果 / 完整响应」切换（配了 `jsonPath` 才有） |
+
+超过 60 行的响应当默认只展开前两层，其余折叠 —— 否则几万行一次铺满，什么也看不清。
+超过 8000 行就不建树、退回纯文本（几万个 DOM 节点只会让面板卡住），并在元信息里说明原因。
+非 JSON 响应按原文显示，不做 HTML 渲染。`jsonPath` 取不到值时会把原因写在正文里
+（比如"数组下标越界""没有字段 xxx"）。
 
 > 自带的三条示例（`http-ip` / `http-github` / `http-post`）分别演示「取值」「完整 JSON」「POST + 自定义头」，
 > 需要能访问对应域名；不通可以换成内网接口或删掉。
@@ -633,6 +650,36 @@ global SIG_KEYS := Map(
 而是给**短标签 + 错误码**，正文里写清这是哪一层失败、怎么排查：
 
 ![请求失败时的面板](docs/screenshot-error.png)
+
+### 响应不对劲？在终端手跑一遍
+
+界面里点一次请求，出问题时你只看到一个状态码。想看清"到底发了什么、回了什么"，
+可以直接把子进程那份 spec 手工跑一遍 —— 不用开界面、不用翻临时目录：
+
+```bat
+:: spec 可以自己造一份，也可以从 %TEMP%\ql-http\<id>\spec.ini 拷出来改
+ql --webhook C:\path\spec.ini            :: 什么都不打，只写 meta.ini / body.txt（老行为）
+ql --webhook C:\path\spec.ini --json     :: 结果以 JSON 打到 stdout
+ql --webhook C:\path\spec.ini --body     :: 只打响应正文，给管道用
+ql --webhook C:\path\spec.ini --body | jq .data.items[0]
+```
+
+`--json` 输出**一行**，字段固定：
+
+| 字段 | 含义 |
+|---|---|
+| `ok` | 请求本身跑完了没有（连接层）。4xx/5xx 也是 `true` —— 那是"有响应的失败"，正文照给 |
+| `status` / `ms` / `len` | 状态码 / 耗时（毫秒）/ 正文长度 |
+| `error` | 连接层错误（超时、DNS、TLS…），成功时是空串 |
+| `body` | 响应正文。download 模式没有这个字段，换成 `file` / `name` / `size` / `skipped` |
+| `spec` | 实际用的 spec 路径 —— 相对路径没解析对、引号被吃这类问题一眼看出来 |
+
+退出码不变：`0` 正常 / `2` spec 读不到 / `3` 缺 `Url` 或 `OutDir`。
+但带 `--json` 时**失败也会往 stdout 打一个 `{"ok":false,...}`**，脚本可以直接解析，
+不用靠退出码猜（不带 `--json` 时保持安静，和以前一样）。
+
+开关只决定"打印什么"，不影响请求本身，也不影响 `meta.ini` 的写法 ——
+主进程调子进程时压根不带它们。两个开关都给时 `--json` 优先。
 
 ### download 类型（下载小文件）
 
@@ -1233,6 +1280,29 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     修法：读进来先 `.replace(/\r\n/g, '\n')` 再抽。所有“按行首/行尾匹配”的正则都有这个隐患，
     开发机（LF）和用户机（CRLF）表现会不一样。
 
+59. **⭐ 函数里少一行 `global`，整批排程会静默失效**：`runOnStart` 是在 `SchedEnd()` 里
+    判断的，我在函数里用了 `schedBoot` 却没把它加进那行的 `global` 声明。AHK 于是把它当成
+    局部变量，`if !schedBoot` 读一个没赋值的局部变量 —— 直接抛
+    `This local variable has not been assigned a value`。
+    要命的是这行异常被 `OnWebMessage` 的 `try` 兜住了，只往 `sched.log` 记一句
+    「内部错误：…」，**排程表本身也就没装上**（`schedTasks` 停在上一批）。表现是
+    runOnStart 完全不生效、所有任务都不触发，而界面看起来一切正常。
+    教训：调度这类"藏在回调里、失败只写日志"的代码，改完必须真跑一次
+    `tools/sched-check.js`，看 `sched.log` 里有没有 `bad  -  内部错误`。这条已经加进那个脚本
+    的断言里了（它一出现就失败）。
+
+60. **量"缩进有没有生效"不能看 `offsetLeft`**：`padding-left` 在盒子内部，改它不会动
+    `offsetLeft`，所以深一层和浅一层量出来一模一样（都是 10），看着像 CSS 没生效。
+    正确做法是读 `getComputedStyle(el).paddingLeft`，或者量内部第一个子元素。
+    顺带一个：`.jline` 是 flex 容器，子元素的 `display: inline` 会被**块化**成 `block`，
+    所以"折叠摘要有没有显示"只能比 `none` / 非 `none`，别断言等于 `inline`。
+
+61. **`IniWrite` 写的是 UTF-16 LE（带 BOM）**：`meta.ini` 里是 `[resp]\r\nStatus=200`，
+    但字节是 `FF FE [ \0 r \0 e \0 s \0 p \0 ] \0 …`。测试脚本按 `utf8` 读会全是乱码，
+    `/Status=200/` 永远匹配不到 —— 看起来像"主进程没写 meta"，其实是读错了。
+    `tools/wh-cli-check.js` 里改成先看 BOM 再决定 `utf16le` 还是 `utf8`。
+    对比：`body.txt` 是 `FileAppend(..., 'UTF-8-RAW')`，同一个目录两种编码，别想当然。
+
 ---
 
 ## 六、命令行（`ql`）
@@ -1348,7 +1418,7 @@ ql run marker --wait -- C:/a b\c.txt "D:/带 空格/x.txt"
 ```json
 "schedules": [
   { "id": "morning-ip", "run": "http-ip", "at": "09:30", "days": ["mon","tue","wed","thu","fri"] },
-  { "id": "sync-cfg",   "run": "pull-config", "every": "6h" },
+  { "id": "sync-cfg",   "run": "pull-config", "every": "6h", "runOnStart": true },
   { "id": "evening",    "run": "http-github", "at": ["18:00", "22:00"] }
 ]
 ```
@@ -1360,6 +1430,7 @@ ql run marker --wait -- C:/a b\c.txt "D:/带 空格/x.txt"
 | `at` | 二选一 | `"HH:MM"` 或 `"HH:MM:SS"`；也可以写成数组，表示一天跑多次 |
 | `days` | 否 | 只在 `at` 模式下有效。省略 = 每天；`["mon","fri"]`；或 `"weekdays"`（工作日）/ `"weekend"`（周末） |
 | `every` | 二选一 | `"30s"` / `"15m"` / `"2h"`，最短 30 秒，从程序启动那一刻起算 |
+| `runOnStart` | 否 | 写 `true`：启动器一启动就先跑一次，然后照常按 `at` / `every` 排程 |
 | `id` | 否 | 日志里显示的名字；省略就用 `run` |
 | `enabled` | 否 | 写 `false` 就临时停用（不装、也不报错） |
 | `first` | 否 | 默认 `true`：多个条目都能匹配时取最高分那条；写 `false` 则要求唯一命中，歧义就算失败 |
@@ -1369,6 +1440,25 @@ ql run marker --wait -- C:/a b\c.txt "D:/带 空格/x.txt"
 
 > 项目自带的 `config.json` 里那三条示例都写着 `"enabled": false`，是**故意**的：
 > 想启用就把那一行删掉。别让人拷一份配置就莫名多了几个后台请求。
+
+### `runOnStart`：启动就跑一次
+
+有些任务的意义就在于"开机之后马上有一次"——同步配置、报一次到、刷新缓存。
+加 `"runOnStart": true` 即可：
+
+```json
+{ "id": "sync-cfg", "run": "pull-config", "every": "6h", "runOnStart": true }
+```
+
+三条容易踩的细节：
+
+- **只认布尔 `true`**。写 `"true"` 这个字符串、写 `1`，都不算 —— 免得把 `"false"` 也当成真值；
+- **只在本次进程第一次装载配置时跑**。之后「重载配置」不会再来一遍，否则你改一行配置
+  就把所有开机任务重跑一次；想再触发就重启启动器；
+- 跑完会**把 `every` 的下次时刻从"现在"重新算**。否则"启动跑了，两分钟后又按原计划跑一次"，
+  间隔短得像出错。`at` 任务不受影响（重算会把它推到下一个时刻，本该在 09:00 那次就丢了）。
+
+延时约 1 秒才执行：那是给首屏渲染让路，启动瞬间就跑 webhook 会和界面抢那一下。
 
 ### 两种调度模式
 
@@ -1387,6 +1477,7 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 | 错过（关机 / 休眠 / 程序没在跑） | **不补跑**。下次时刻永远严格大于当前时间；晚了 90 秒以上只记一行 `miss` |
 | 执行失败 | **不重试**，记一行 `fail` |
 | 到点时上一条还没跑完 | 跳过本次，记一行 `skip` |
+| 启动器刚启动 | 只有写了 `runOnStart: true` 的任务会先跑一次，记一行 `boot`；其余等自己的时刻 |
 | 窗口 | 一律不显示、不抢焦点；也不会把你正开着的窗口藏起来 |
 | 结果面板 | 不写。否则你下次开窗会看到上次定时任务的结果盖在界面上 |
 | 使用频率 | 不计。否则每天自动跑的任务会把搜索排序顶到最前面 |
@@ -1401,7 +1492,8 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 `sched.log` 在程序目录，一行一条，纯文本，可以直接 `tail`：
 
 ```
-2026-11-02 09:30:00  plan  morning-ip  工作日 09:30,18:00，下次 11-03 09:30:00
+2026-11-02 08:00:00  plan  morning-ip  工作日 09:30,18:00，下次 11-03 09:30:00
+2026-11-02 08:00:01  boot  sync-cfg    启动时执行一次
 2026-11-02 09:30:00  ok    morning-ip  已启动：查公网 IP
 2026-11-02 15:36:25  ok    sync-cfg    已下载：config.json
 2026-11-02 21:00:03  fail  sync-cfg    下载失败：HTTP 404
@@ -1411,7 +1503,8 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 ```
 
 `plan` 是每次装载配置时打的（程序启动、重新加载配置），核对"装了哪些、下次什么时候"
-看它就够。超过 512 KB 会轮转成 `sched.log.1`，只留一份。
+看它就够。`boot` 只出现在写了 `runOnStart` 的任务上，和按时刻触发的 `ok` 分开记，
+一眼能看出这次是"开机跑的还是到点跑的"。超过 512 KB 会轮转成 `sched.log.1`，只留一份。
 
 ### 它是怎么工作的
 
@@ -1568,12 +1661,10 @@ Run('"' A_AhkPath '" /ErrorStdOut "' A_ScriptFullPath '" --webhook "' spec '"')
 
 - 签名密钥别写死在源码里：改成优先读环境变量 / DPAPI 加密文件，`SIG_KEYS` 只留兜底
   （现在 `/restore` 能把源码翻出来，见「九」的限制 2）
-- `--webhook` 加一个 `--json` 之类的开关，让人能在终端直接手跑一个 `spec.ini` 排查
 - `download`：进度条与中途取消、断点续传（`Range` + `.part` 续写）、`Content-Length`/哈希校验
 - `download`：多文件批量下载（现在一个条目只下一个文件）
 - webhook：请求历史、把常用请求存成条目
-- webhook：响应里可搜索/折叠大 JSON、支持复制单个字段
 - webhook：自定义代理（`WINHTTP_OPTION_PROXY`）与「忽略证书错误」开关（内网自签证书场景）
-- 定时调度：`runOnStart`（启动就跑一次）、错过的补跑、失败重试/退避、cron 表达式、
-  每月某日；再往下还可以做「上次执行状态」的界面展示（现在只有 `sched.log`）
+- 定时调度：错过的补跑、失败重试/退避、cron 表达式、每月某日；
+  再往下还可以做「上次执行状态」的界面展示（现在只有 `sched.log`）
 - 窗口出现动画、亚克力背景（`DwmSetWindowAttribute` + `WS_EX_LAYERED`）

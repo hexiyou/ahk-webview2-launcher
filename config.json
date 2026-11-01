@@ -481,6 +481,7 @@
       "id": "示例-每6小时检查一次",
       "run": "pull-config",
       "every": "6h",
+      "runOnStart": true,
       "enabled": false
     }
   ]

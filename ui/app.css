@@ -694,6 +694,115 @@ kbd {
 .jt-num { color: #b45309; }
 .jt-lit { color: #1d4ed8; }
 .jt-p { color: #6b7280; }
+.jt-brace { color: #57606a; }
+
+/* ---------------- JSON 树（可折叠 / 可搜索 / 单字段复制） ---------------- */
+
+.rpre[hidden] { display: none; }
+
+.rjson {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 10px 14px;
+  font-family: "Cascadia Mono", "Consolas", "Segoe UI Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #24292f;
+  user-select: text;
+}
+.rjson[hidden] { display: none; }
+
+.jline {
+  display: flex;
+  align-items: baseline;
+  min-height: 18px;
+  padding-left: calc(2px + var(--d, 0) * 14px);
+  border-radius: 4px;
+}
+.jline:hover { background: #f5f7fb; }
+
+/* 三角占位固定 14px：没有子节点的行也要留出来，否则同级行的缩进对不齐 */
+.jcaret {
+  flex: 0 0 14px;
+  width: 14px;
+  text-align: center;
+  font-size: 9px;
+  color: #9aa0aa;
+  cursor: pointer;
+  user-select: none;
+  transition: transform .12s;
+}
+.jcaret-none { cursor: default; }
+.jnode.collapsed > .jline > .jcaret { transform: rotate(-90deg); }
+
+/* 折叠 = 子树和收尾括号一起藏起来，首行显示成 {...} 3 项 */
+.jnode.collapsed > .jchildren,
+.jnode.collapsed > .jline-close { display: none; }
+
+.jsum { display: none; margin-left: 6px; font-size: 11px; color: #9aa0aa; }
+.jnode.collapsed > .jline > .jsum { display: inline; }
+
+/* 悬停才露出来的"复制这个字段" */
+.jcopy {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  height: 16px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #9aa0aa;
+  font: inherit;
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .1s, background .1s, color .1s;
+}
+.jline:hover .jcopy { opacity: 1; }
+.jcopy:hover { background: #e8eefb; color: #1d4ed8; }
+
+/* 搜索命中。放在 :hover 之后 —— 两者特异性相同，靠顺序压住悬停色 */
+.jline.hit { background: #fff8dd; }
+.jline.hit.hit-cur { background: #ffe8a3; box-shadow: inset 2px 0 0 #f0a020; }
+
+/* 面板内搜索栏 */
+.rfind {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+}
+.rfind[hidden] { display: none; }
+.rfind input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 11.5px;
+  color: #111;
+  background: #fff;
+  outline: none;
+}
+.rfind input:focus { border-color: #7aa7f0; box-shadow: 0 0 0 3px rgba(59, 130, 246, .12); }
+.rfind-n { flex: 0 0 auto; min-width: 4.5em; text-align: right; font-size: 11px; color: var(--muted); }
+.rfind-n.none { color: #b42318; }
+
+.rbtn-ico {
+  width: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.rbtn-ico[hidden] { display: none; }
 
 /* ---------------- 参数态 ---------------- */
 

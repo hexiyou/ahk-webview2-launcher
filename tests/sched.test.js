@@ -116,6 +116,22 @@ const off = T.normalizeSchedules({
 });
 eq('停用的不安装、也不报错', off.map(x => x.id), ['on']);
 
+console.log('— runOnStart');
+const boot = T.normalizeSchedules({
+  schedules: [
+    { id: 'b1', run: 'a', every: '1h', runOnStart: true },
+    { id: 'b2', run: 'a', every: '1h' },
+    { id: 'b3', run: 'a', every: '1h', runOnStart: false },
+    { id: 'b4', run: 'a', every: '1h', runOnStart: 'true' },
+    { id: 'b5', run: 'a', at: '09:00', runOnStart: true }
+  ]
+});
+eq('只有 runOnStart: true 才算', boot.map(x => x.runOnStart), [1, 0, 0, 0, 1]);
+eq('字符串 "true" 不认（免得把 "false" 也当真的）', boot[3].runOnStart, 0);
+eq('at 与 every 两种都能带', [boot[0].mode, boot[4].mode], ['every', 'at']);
+eq('默认不跑', one[0].runOnStart, 0);
+eq('写错的条目没有 runOnStart', bad[0].runOnStart, undefined);
+
 console.log('— 不是对象的条目');
 const junk = T.normalizeSchedules({ schedules: [null, 42, 'x'] });
 eq('垃圾条目报缺 run，而不是崩掉', junk.length, 3);

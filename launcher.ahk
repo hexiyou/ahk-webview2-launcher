@@ -68,6 +68,8 @@ global wakePending := false   ; 有客户端只是要求"打开一下"
 global schedTasks := []       ; 已安装的定时任务
 global schedStage := []       ; sched-begin..sched-end 之间攒的条目
 global schedInside := false
+global schedBoot := false     ; 本次进程是否已经处理过 runOnStart
+global schedBootTries := 0    ; 等界面就绪的重试计数
 
 ; ------------------------- 内部通道：--webhook --------------------------------
 /*  webhook / download 的 HTTP 请求跑在子进程里（WinHttp 是同步 COM，放主进程里
@@ -79,11 +81,18 @@ global schedInside := false
     以前靠一个独立的 webhook.ahk + 随包解释器；并进主脚本之后，编译版不再需要
     runtime\AutoHotkey64.exe（只剩 "ahk" 类型条目还用它），也就少一个会漂移的实现。
 
+    排查时也可以直接在终端手跑一份 spec.ini（不需要开界面）：
+        ql --webhook C:\path\spec.ini                 什么都不打，只写 meta.ini
+        ql --webhook C:\path\spec.ini --json          结果以 JSON 打到 stdout
+        ql --webhook C:\path\spec.ini --body          只打响应正文（配 | jq）
+    编译版把 ql 换成 QuickLaunch.exe 即可。
+
     ★ 这个分支必须在 DPI / 单例 / 配置 / 界面之前：子进程不建窗口、不抢锁、
       不读 config.json，跑完就带着退出码走人。 */
 whSpec := ''
-if WebhookArg(A_Args, &whSpec)
-    ExitApp(WebhookMain(whSpec))
+whOpt := ''
+if WebhookArg(A_Args, &whSpec, &whOpt)
+    ExitApp(WebhookMain(whSpec, whOpt))
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
@@ -2309,6 +2318,7 @@ SchedTask(raw) {
         , q: JsonStr(raw, 'q')
         , args: JsonStr(raw, 'args')
         , first: JsonNum(raw, 'first', 1) ? 1 : 0
+        , runOnStart: JsonNum(raw, 'runOnStart', 0) ? 1 : 0
         , mode: JsonStr(raw, 'mode')
         , days: JsonStr(raw, 'days')
         , times: JsonStr(raw, 'times')
@@ -2320,7 +2330,7 @@ SchedTask(raw) {
 }
 
 SchedEnd() {
-    global schedTasks, schedStage, schedInside
+    global schedTasks, schedStage, schedInside, schedBoot
     schedInside := false
     stage := schedStage
     schedStage := []
@@ -2346,6 +2356,19 @@ SchedEnd() {
     schedTasks := list
     /* 一条任务都没有就什么都不写：没配定时器的用户不该多出一个 sched.log */
     SchedArm()
+
+    /* runOnStart：只在本次进程第一次装排程表时生效。之后重载配置（sched-end 会
+       再来一次）不重跑 —— 只改了一行配置就把所有开机任务再执行一遍，太意外。
+       延迟 800ms 是为了错开首屏渲染：启动瞬间就跑 webhook 会和界面抢那一下。 */
+    if !schedBoot {
+        schedBoot := true
+        for t in schedTasks {
+            if t.runOnStart {
+                SetTimer(SchedBootFire, -800)
+                break
+            }
+        }
+    }
 }
 
 SchedAdvance(t, now) {
@@ -2428,6 +2451,40 @@ SchedTick() {
         SchedFire(t)
     }
     SchedArm()
+}
+
+/* 启动时执行一次（配置里的 runOnStart: true）。
+   和普通触发走同一个 SchedFire：不弹窗、不写结果面板、照样占用 busy 标志
+   —— 启动那一秒正好撞上一次定时触发，也不会并发跑两遍。 */
+SchedBootFire() {
+    global schedTasks, uiReady, schedBootTries
+    if !uiReady {
+        /* 能收到 sched-end 就说明页面活着，走不到这里；留个兜底，别把任务静默丢掉 */
+        if (schedBootTries < 10) {
+            schedBootTries += 1
+            SetTimer(SchedBootFire, -500)
+            return
+        }
+        for t in schedTasks {
+            if t.runOnStart
+                SchedLog(t.id, 'boot', '界面没有就绪，启动时这一次跳过')
+        }
+        return
+    }
+    for t in schedTasks {
+        if !t.runOnStart
+            continue
+        t.runOnStart := 0                    ; 只跑一次
+        /* every 任务把下一次从"刚刚"重新算：启动跑过一次之后，隔一个完整周期再跑，
+           而不是按刚才排好的那个时刻（可能就在几分钟后）紧接着又来一次。
+           at 任务不动 —— 重算会把它推到下一个时刻，本该在 09:00 跑的那次就丢了。 */
+        if (t.mode = 'every') {
+            t.last := A_Now
+            SchedAdvance(t, A_Now)
+        }
+        SchedLog(t.id, 'boot', '启动时执行一次')
+        SchedFire(t)
+    }
 }
 
 SchedFire(t) {
@@ -2580,23 +2637,57 @@ SchedLog(id, kind, text) {
 ;  注意：这里刻意不做任何 JSON 解析 —— 正文原样落盘，交给前端的 JSON.parse。
 ; ============================================================================
 
-/* 认命令行里的 --webhook。两种写法都吃：`--webhook <spec>`，`--webhook=<spec>` */
-WebhookArg(argv, &spec) {
+/* 认命令行里的 --webhook。写法都吃：`--webhook <spec>`，`--webhook=<spec>`。
+   后面还可以跟两个开关（顺序随意，写不写都一样）：
+     --json   结果以 JSON 打到 stdout，同时照旧写 meta.ini
+     --body   只把响应正文打到 stdout（配 `| jq` 这类管道用，不额外补换行）
+   开关只影响"打印什么"，不影响请求本身 —— 主进程调子进程时不带它们，行为一字不变。 */
+WebhookArg(argv, &spec, &opt) {
     static RE := 'i)^--webhook(?:=(.+))?$'
     spec := ''
+    opt := { json: false, body: false }
     m := ''
     if (argv.Length < 1)
         return false
     if !RegExMatch(argv[1], RE, &m)
         return false
-    spec := Trim(m[1] != '' ? m[1] : (argv.Length >= 2 ? argv[2] : ''), ' `t"')
+
+    i := 2
+    if (m[1] != '')
+        spec := Trim(m[1], ' `t"')
+    else if (argv.Length >= 2 && SubStr(argv[2], 1, 2) != '--') {
+        spec := Trim(argv[2], ' `t"')
+        i := 3
+    }
+
+    ; 剩下的是开关。`--webhook --json spec.ini` 这种把开关写在路径前面的也认。
+    while (i <= argv.Length) {
+        a := argv[i]
+        if (a = '--json')
+            opt.json := true
+        else if (a = '--body')
+            opt.body := true
+        else if (spec = '' && SubStr(a, 1, 2) != '--')
+            spec := Trim(a, ' `t"')
+        i += 1
+    }
     return true
 }
 
-/* 返回进程退出码：0 正常 / 2 spec 读不到 / 3 spec 内容不全 */
-WebhookMain(spec) {
-    if (spec = '' || !FileExist(spec))
+/* 返回进程退出码：0 正常 / 2 spec 读不到 / 3 spec 内容不全
+   opt 是 WebhookArg 给的开关（--json / --body），只决定"往 stdout 打什么"。 */
+WebhookMain(spec, opt := '') {
+    if !IsObject(opt)
+        opt := { json: false, body: false }
+
+    /* 出错也要能被脚本消费：没带 --json 时保持安静（老行为），带了就回一个 ok:false。
+       否则 `ql --webhook x --json` 失败时 stdout 是空的，调用方只能靠退出码猜。 */
+    if (spec = '' || !FileExist(spec)) {
+        if opt.json
+            StdOut('{"ok":false,"error":' JsonQuote('spec 文件不存在：' spec)
+                . ',"spec":' JsonQuote(spec) . '}' '`n')
         return 2
+    }
 
     mode     := IniRead(spec, 'req', 'Mode', 'http')
     method   := IniRead(spec, 'req', 'Method', 'GET')
@@ -2612,8 +2703,12 @@ WebhookMain(spec) {
     onExists := IniRead(spec, 'dl', 'OnExists', 'skip')
     backup   := WhIntOr(IniRead(spec, 'dl', 'Backup', '0'), 0)
 
-    if (outDir = '' || url = '')
+    if (outDir = '' || url = '') {
+        if opt.json
+            StdOut('{"ok":false,"error":"spec 里缺少 [req] Url 或 OutDir","spec":'
+                . JsonQuote(spec) . '}' '`n')
         return 3
+    }
 
     meta := outDir '\meta.ini'
     outBody := outDir '\body.txt'
@@ -2716,6 +2811,29 @@ WebhookMain(spec) {
         IniWrite(dl.size, meta, 'dl', 'Size')
         IniWrite(dl.skipped, meta, 'dl', 'Skipped')
         IniWrite(dl.backup, meta, 'dl', 'Backup')
+    }
+
+    /* 手跑排查用的输出。放在 meta.ini 之后：先保证调用方（主进程）那份契约不变，
+       再考虑人要看的东西 —— 中间任何一步失败都不会影响定时/界面那条路。 */
+    if opt.json {
+        j := '{"ok":' (errMsg = '' ? 'true' : 'false')
+            . ',"mode":' JsonQuote(mode)
+            . ',"method":' JsonQuote(method)
+            . ',"url":' JsonQuote(url)
+            . ',"status":' status
+            . ',"ms":' elapsed
+            . ',"len":' (mode = 'download' ? dl.size : StrLen(body))
+            . ',"error":' JsonQuote(errMsg)
+            . ',"spec":' JsonQuote(spec)
+        if (mode = 'download')
+            j .= ',"file":' JsonQuote(dl.file) ',"name":' JsonQuote(dl.name)
+                . ',"size":' dl.size ',"skipped":' dl.skipped
+                . ',"backup":' JsonQuote(dl.backup)
+        else
+            j .= ',"body":' JsonQuote(body)
+        StdOut(j . '}' '`n')
+    } else if opt.body {
+        StdOut(body)                 ; 不补换行：管道那头（jq 之类）自己会处理
     }
 
     return 0

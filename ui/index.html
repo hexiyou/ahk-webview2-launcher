@@ -96,12 +96,26 @@
         <span class="rurl" id="rUrl"></span>
         <span class="rstat" id="rStatus"></span>
         <span class="rgap"></span>
+        <button class="rbtn rbtn-ico" id="rFind" title="在响应里搜索 (Ctrl+F)" aria-label="搜索" hidden>
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+            <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+          </svg>
+        </button>
         <button class="rbtn" id="rToggle" hidden>完整响应</button>
         <button class="rbtn" id="rCopy">复制</button>
         <button class="rbtn rbtn-close" id="rClose" title="关闭 (Esc)">✕</button>
       </header>
+      <div class="rfind" id="rFindBar" hidden>
+        <input id="rFindInput" type="text" spellcheck="false" autocomplete="off"
+               placeholder="在响应里搜索（Enter 下一个 · Shift+Enter 上一个）">
+        <span class="rfind-n" id="rFindCount"></span>
+        <button class="rbtn" id="rFindPrev" title="上一个">↑</button>
+        <button class="rbtn" id="rFindNext" title="下一个">↓</button>
+        <button class="rbtn rbtn-close" id="rFindClose" title="关闭搜索">✕</button>
+      </div>
       <div class="rmeta" id="rMeta" hidden></div>
       <pre class="rpre" id="rPre"></pre>
+      <div class="rjson" id="rJson" hidden></div>
     </section>
   </main>
 

@@ -766,7 +766,8 @@
 
      规范化后的每条任务是"扁平字段"，AHK 用现有的 JsonStr / JsonNum 就能取，
      不用为它写一套嵌套 JSON 解析：
-       { id, q, args, first, mode:'at'|'every', days:'1,2,3', times:'093000,180000', every:秒 }
+       { id, q, args, first, runOnStart, mode:'at'|'every',
+         days:'1,2,3', times:'093000,180000', every:秒 }
      写错的条目不在页面里报错（多半是无人值守时才发现），而是带上 err 一起
      报给 AHK，由它写进 sched.log —— 那条被跳过，不影响别的任务。
      ---------------------------------------------------------- */
@@ -860,6 +861,9 @@
       }
 
       const first = s.first === false ? 0 : 1;
+      /* 启动就跑一次。写 true 才生效（"1"、1 之类不认，免得误读成数字开关）；
+         不写 = 不跑，老配置行为不变 */
+      const runOnStart = s.runOnStart === true ? 1 : 0;
       const args = s.args == null ? '' : String(s.args);
 
       if (hasEvery) {
@@ -869,7 +873,7 @@
           out.push({ id: title, err: 'every 写法不对（示例 "30s" / "15m" / "2h"，最小 30 秒）' });
           return;
         }
-        out.push({ id: title, q: run, args: args, first: first, mode: 'every', every: every });
+        out.push({ id: title, q: run, args: args, first: first, runOnStart: runOnStart, mode: 'every', every: every });
         return;
       }
 
@@ -883,7 +887,7 @@
         out.push({ id: title, err: 'days 写法不对（示例 ["mon","fri"] / "weekdays" / "weekend"）' });
         return;
       }
-      out.push({ id: title, q: run, args: args, first: first, mode: 'at', days: days, times: times });
+      out.push({ id: title, q: run, args: args, first: first, runOnStart: runOnStart, mode: 'at', days: days, times: times });
     });
     return out;
   }
@@ -898,6 +902,7 @@
       if (t.err) { post({ type: 'sched-task', id: t.id, err: t.err }); return; }
       post({
         type: 'sched-task', id: t.id, q: t.q, args: t.args, first: t.first,
+        runOnStart: t.runOnStart || 0,
         mode: t.mode, days: t.days || '', times: t.times || '', every: t.every || 0
       });
     });
@@ -2177,6 +2182,310 @@
     try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); }
   }
 
+  /* ---------------------------------------------------------- JSON 树
+
+     大响应不折叠就是灾难：一屏几千行，想看清楚"这个字段属于哪个对象"只能靠
+     缩进数空格。这里把 JSON 拍成行模型，再渲染成可折叠的树 —— 点行首三角
+     折叠、悬停行尾复制单个字段、Ctrl+F 在面板里搜。
+
+     拍平这一步是纯函数（jsonRows），node 侧用例可以直接跑；渲染只负责把行
+     变成 DOM。两边不各写一套，改坏一个地方用例会立刻报。
+     ---------------------------------------------------------- */
+
+  const JSON_TREE_MAX = 8000;      /* 超过这么多行就不建树：几万个 div 会把面板拖死 */
+  const JSON_AUTO_LINES = 60;      /* 少于这么多行就全展开，省得用户还要一个个点 */
+  const JSON_AUTO_DEPTH = 2;       /* 否则只展开前两层 */
+  const JSON_STR_MAX = 2000;       /* 单个字符串的显示上限（完整值仍能复制、能搜到） */
+
+  /* 把任意 JSON 值拍成行。每行：
+       { depth, kind:'open'|'close'|'val', key, v, path, count, isArr, trailing, empty }
+     kind='open' 一定有一个 depth 相同的 kind='close' 与它配对。 */
+  function jsonRows(root, maxRows) {
+    const limit = maxRows || JSON_TREE_MAX;
+    const rows = [];
+    let truncated = false;
+
+    /* 每一次落行都过这道闸：上限是"最多画这么多行"，不是"大概这么多"。
+       超了就停在那里（模型可能缺收尾括号，但调用方会看到 truncated 退回纯文本）。 */
+    function put(row) {
+      if (rows.length >= limit) { truncated = true; return false; }
+      rows.push(row);
+      return true;
+    }
+
+    function walk(v, key, depth, path, trailing) {
+      if (truncated) return;
+      if (v !== null && typeof v === 'object') {
+        const isArr = Array.isArray(v);
+        const keys = isArr ? null : Object.keys(v);
+        const n = isArr ? v.length : keys.length;
+        if (!n) {
+          /* 空对象/空数组不占三行 —— 单行 { } 更好读，也少两个可折叠节点 */
+          put({ depth: depth, kind: 'val', key: key, v: v, path: path
+            , empty: isArr ? 'arr' : 'obj', trailing: trailing });
+          return;
+        }
+        if (!put({ depth: depth, kind: 'open', key: key, v: v, path: path
+          , count: n, isArr: isArr }))
+          return;
+        for (let i = 0; i < n; i++) {
+          const k = isArr ? i : keys[i];
+          walk(v[k], isArr ? null : k, depth + 1
+            , path + (isArr ? '[' + i + ']' : keySeg(keys[i])), i !== n - 1);
+          if (truncated) return;
+        }
+        put({ depth: depth, kind: 'close', path: path, isArr: isArr, trailing: trailing });
+        return;
+      }
+      put({ depth: depth, kind: 'val', key: key, v: v, path: path, trailing: trailing });
+    }
+
+    walk(root, null, 0, '$', false);
+    return { rows: rows, truncated: truncated };
+  }
+
+  /* 路径里的一段：普通键名写 .key，带点/括号的写 ["..."]（跟 JSONPath 的习惯一致）。
+     路径只用于 data 属性和调试，复制时用的是行里存的原值。 */
+  function keySeg(k) {
+    return /^[^.[\]]+$/.test(k) ? '.' + k : '[' + JSON.stringify(k) + ']';
+  }
+
+  function jsonValText(v) {
+    if (typeof v === 'string') return v;
+    if (v === null) return 'null';
+    if (typeof v === 'object') { try { return JSON.stringify(v) || ''; } catch (e) { return ''; } }
+    return String(v);
+  }
+
+  function jsonCaret(onToggle) {
+    const s = document.createElement('span');
+    s.className = 'jcaret';
+    if (onToggle) {
+      s.textContent = '▾';
+      s.title = '折叠 / 展开';
+      s.addEventListener('click', e => { e.stopPropagation(); onToggle(); });
+    } else {
+      s.classList.add('jcaret-none');          /* 没有子节点也要占位，缩进才对得齐 */
+    }
+    return s;
+  }
+
+  function jsonKey(k) {
+    const f = document.createDocumentFragment();
+    const a = document.createElement('span');
+    a.className = 'jt-key';
+    a.textContent = JSON.stringify(k);
+    const b = document.createElement('span');
+    b.className = 'jt-p';
+    b.textContent = ': ';
+    f.append(a, b);
+    return f;
+  }
+
+  function jsonPunct(t) {
+    const s = document.createElement('span');
+    s.className = 'jt-p';
+    s.textContent = t;
+    return s;
+  }
+
+  function jsonBrace(t) {
+    const s = document.createElement('span');
+    s.className = 'jt-brace';
+    s.textContent = t;
+    return s;
+  }
+
+  function jsonScalar(v) {
+    const s = document.createElement('span');
+    if (typeof v === 'string') {
+      s.className = 'jt-str';
+      s.textContent = JSON.stringify(v);
+      /* 超长字符串（base64、内嵌 HTML）只截断显示；完整值仍在行模型里，
+         复制和搜索拿到的都是原文 */
+      if (s.textContent.length > JSON_STR_MAX)
+        s.textContent = s.textContent.slice(0, JSON_STR_MAX) + '…';
+    } else if (typeof v === 'number') {
+      s.className = 'jt-num';
+      s.textContent = String(v);
+    } else if (typeof v === 'boolean' || v === null) {
+      s.className = 'jt-lit';
+      s.textContent = String(v);
+    } else {
+      s.className = 'jt-str';
+      s.textContent = String(v);
+    }
+    return s;
+  }
+
+  function jsonCopyBtn(v, label) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'jcopy';
+    b.textContent = '⧉';
+    b.title = (label == null) ? '复制这个值' : '复制「' + label + '」的值';
+    b.addEventListener('click', e => {
+      e.stopPropagation();
+      const text = (typeof v === 'string') ? v : JSON.stringify(v, null, 2);
+      copyText(text == null ? '' : text, label == null ? '已复制值' : '已复制「' + label + '」');
+    });
+    return b;
+  }
+
+  /* 行模型 -> DOM。nest 一层 .jnode（行 + 子容器 + 收尾括号），折叠就是给它加
+     .collapsed —— 子树和收尾括号一起藏起来，首行显示成 {...} 3 项。 */
+  function renderJsonTree(host, rows) {
+    host.textContent = '';
+    const root = document.createElement('div');
+    root.className = 'jroot';
+    host.appendChild(root);
+
+    const stack = [];
+    const autoAll = rows.length <= JSON_AUTO_LINES;
+    let parent = root;
+
+    for (const r of rows) {
+      if (r.kind === 'close') {
+        const top = stack.pop();
+        if (top) {
+          top.close.appendChild(jsonBrace(r.isArr ? ']' : '}'));
+          if (r.trailing) top.close.appendChild(jsonPunct(','));
+          parent = stack.length ? stack[stack.length - 1].body : root;
+        }
+        continue;
+      }
+
+      const line = document.createElement('div');
+      line.className = 'jline';
+      line.style.setProperty('--d', r.depth);
+      line.dataset.path = r.path;
+
+      if (r.kind === 'val') {
+        line.appendChild(jsonCaret(null));
+        if (r.key != null) line.appendChild(jsonKey(r.key));
+        if (r.empty) {
+          line.appendChild(jsonBrace(r.empty === 'arr' ? '[ ]' : '{ }'));
+          if (r.trailing) line.appendChild(jsonPunct(','));
+        } else {
+          line.appendChild(jsonScalar(r.v));
+          if (r.trailing) line.appendChild(jsonPunct(','));
+        }
+        line.__txt = (r.key == null ? '' : r.key) + ' ' + jsonValText(r.v);
+        line.appendChild(jsonCopyBtn(r.v, r.key));
+        parent.appendChild(line);
+        continue;
+      }
+
+      /* kind = open */
+      const node = document.createElement('div');
+      node.className = 'jnode';
+
+      line.appendChild(jsonCaret(() => node.classList.toggle('collapsed')));
+      if (r.key != null) line.appendChild(jsonKey(r.key));
+      line.appendChild(jsonBrace(r.isArr ? '[' : '{'));
+      const sum = document.createElement('span');
+      sum.className = 'jsum';
+      sum.textContent = r.isArr ? (r.count + ' 项') : (r.count + ' 个字段');
+      line.appendChild(sum);
+      line.__txt = (r.key == null ? '' : r.key);
+      line.appendChild(jsonCopyBtn(r.v, r.key));
+      node.appendChild(line);
+
+      const body = document.createElement('div');
+      body.className = 'jchildren';
+      node.appendChild(body);
+
+      const close = document.createElement('div');
+      close.className = 'jline jline-close';
+      close.style.setProperty('--d', r.depth);
+      node.appendChild(close);
+
+      if (!autoAll && r.depth >= JSON_AUTO_DEPTH)
+        node.classList.add('collapsed');
+
+      parent.appendChild(node);
+      stack.push({ node: node, body: body, close: close });
+      parent = body;
+    }
+    return rows;
+  }
+
+  /* ---------------------------------------------------------- 面板内搜索 */
+
+  const jview = { hits: [], idx: -1, q: '' };
+
+  function updateFindCount() {
+    if (!els.rFindCount) return;
+    const n = jview.hits.length;
+    els.rFindCount.textContent = !jview.q ? ''
+      : (n ? (jview.idx + 1) + ' / ' + n : '没有匹配');
+    els.rFindCount.classList.toggle('none', !!jview.q && !n);
+  }
+
+  /* 命中行的祖先全展开 —— 否则搜到了却看不见 */
+  function findReveal(el) {
+    let p = el.parentElement;
+    while (p && p !== els.rJson) {
+      if (p.classList.contains('jnode'))
+        p.classList.remove('collapsed');
+      p = p.parentElement;
+    }
+  }
+
+  function jsonFindGo(i) {
+    if (!jview.hits.length) return;
+    jview.idx = ((i % jview.hits.length) + jview.hits.length) % jview.hits.length;
+    jview.hits.forEach((el, n) => el.classList.toggle('hit-cur', n === jview.idx));
+    const el = jview.hits[jview.idx];
+    /* 先展开再滚，否则 scrollIntoView 拿到的是隐藏元素的位置（会滚到 0） */
+    findReveal(el);
+    el.scrollIntoView({ block: 'center' });
+    updateFindCount();
+  }
+
+  function jsonFind(q) {
+    jview.q = String(q == null ? '' : q).trim().toLowerCase();
+    jview.hits.forEach(el => el.classList.remove('hit', 'hit-cur'));
+    jview.hits = [];
+    jview.idx = -1;
+    if (!jview.q || !els.rJson) { updateFindCount(); return; }
+
+    const lines = els.rJson.querySelectorAll('.jline');
+    for (let i = 0; i < lines.length; i++) {
+      const el = lines[i];
+      /* __txt 是完整文本（长字符串没截断过），所以搜索能命中被截断的那部分 */
+      const t = (el.__txt != null ? el.__txt : el.textContent) || '';
+      if (t.toLowerCase().indexOf(jview.q) >= 0) {
+        el.classList.add('hit');
+        jview.hits.push(el);
+      }
+    }
+    if (jview.hits.length) jsonFindGo(0);
+    else updateFindCount();
+  }
+
+  function clearFind() {
+    jview.hits.forEach(el => el.classList.remove('hit', 'hit-cur'));
+    jview.hits = [];
+    jview.idx = -1;
+    jview.q = '';
+    if (els.rFindInput) els.rFindInput.value = '';
+    updateFindCount();
+  }
+
+  function openFind() {
+    if (!els.rFindBar || !els.rJson || els.rJson.hidden) return;
+    els.rFindBar.hidden = false;
+    els.rFindInput.focus();
+    els.rFindInput.select();
+  }
+
+  function closeFind() {
+    if (!els.rFindBar) return;
+    els.rFindBar.hidden = true;
+    clearFind();
+  }
+
   function highlightJson(src) {
     const re = /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*")(\s*:)?|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|\b(true|false|null)\b/g;
     let out = '', last = 0, m;
@@ -2297,6 +2606,8 @@
     const an = analyzeResult(res);
     let text = res.body || '';
     let isJsonView = false;
+    let treeVal;                      /* 有值 = 这份 JSON 能画成可折叠的树 */
+    let treeNote = '';
 
     if (isDl) {
       text = downloadSummary(res);
@@ -2306,23 +2617,45 @@
       } else {
         text = prettyValue(an.extracted);
         isJsonView = typeof an.extracted !== 'string';
+        if (isJsonView) treeVal = an.extracted;
       }
     } else if (an.isJson) {
       text = JSON.stringify(an.json, null, 2);
       isJsonView = true;
+      treeVal = an.json;
     }
+
+    /* 行数太多就不建树：几万个 div 只会让面板卡住，不如老老实实显示文本 */
+    let tree = null;
+    if (isJsonView && treeVal !== undefined && !res.loading) {
+      const got = jsonRows(treeVal);
+      if (got.truncated) treeNote = '对象太大（超过 ' + JSON_TREE_MAX + ' 行），按纯文本显示';
+      else tree = got.rows;
+    }
+
+    els.rPre.hidden = !!tree;
+    els.rJson.hidden = !tree;
+    els.rFind.hidden = !tree;
+    if (!tree) els.rFindBar.hidden = true;
 
     if (res.loading) {
       els.rPre.innerHTML = '<span class="jt-p">' + (isDl ? '正在下载…' : '等待响应…') + '</span>';
+      clearFind();
     } else if (!res.ok && !res.body && !isDl) {
       els.rPre.textContent = netErrorText(res);
+      clearFind();
+    } else if (tree) {
+      renderJsonTree(els.rJson, tree);
+      clearFind();
     } else if (isJsonView) {
       els.rPre.innerHTML = highlightJson(text);
+      clearFind();
     } else {
       els.rPre.textContent = text || '（空响应）';
+      clearFind();
     }
 
-    els.rPre.classList.toggle('rpre-json', isJsonView);
+    els.rPre.classList.toggle('rpre-json', isJsonView && !tree);
 
     /* 元信息 */
     const bits = [];
@@ -2334,7 +2667,9 @@
         bits.push('jsonPath: ' + (item.jsonPath || ''));
       if (an.hasPath && an.pathError) bits.push('取路径失败');
       if (res.truncated) bits.push('响应过大已截断');
+      if (treeNote) bits.push(treeNote);
       if (!an.isJson && !res.loading && res.body) bits.push('非 JSON，按原文显示');
+      if (tree && tree.length > JSON_AUTO_LINES) bits.push('点数 = 折叠，行尾 = 复制字段');
     }
     els.rMeta.textContent = bits.join(' · ');
     els.rMeta.hidden = !bits.length;
@@ -2349,29 +2684,40 @@
   function closeResult() {
     state.result = null;
     if (els.result) els.result.hidden = true;
+    closeFind();
+    if (els.rJson) els.rJson.textContent = '';    /* 树不留在内存里，下次是新结果 */
   }
 
-  function copyResult() {
-    const text = state.viewText || '';
-    if (!text) return;
+  /* 整个面板的"复制"和单个字段的复制共用这一条：
+     剪贴板 API 在 WebView2 里偶尔会因为没有用户手势被拒，所以留着 execCommand 兜底 */
+  function copyText(text, okMsg) {
+    text = String(text == null ? '' : text);
+    if (!text) { toast('没有可复制的内容'); return; }
+    const done = () => toast(okMsg || ('已复制 ' + text.length + ' 字符'));
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(
-        () => toast('已复制 ' + text.length + ' 字符'),
-        () => fallbackCopy(text)
-      );
+      navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, okMsg));
     } else {
-      fallbackCopy(text);
+      fallbackCopy(text, okMsg);
     }
   }
 
-  function fallbackCopy(text) {
+  function copyResult() {
+    copyText(state.viewText || '', '');
+  }
+
+  function fallbackCopy(text, okMsg) {
     const ta = document.createElement('textarea');
     ta.value = text;
     ta.style.position = 'fixed';
     ta.style.opacity = '0';
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); toast('已复制'); } catch (e) { toast('复制失败'); }
+    try {
+      document.execCommand('copy');
+      toast(okMsg || '已复制');
+    } catch (e) {
+      toast('复制失败');
+    }
     document.body.removeChild(ta);
   }
 
@@ -2455,6 +2801,11 @@
     els.rPre = $('rPre');
     els.rMeta = $('rMeta');
     els.rToggle = $('rToggle');
+    els.rJson = $('rJson');
+    els.rFind = $('rFind');
+    els.rFindBar = $('rFindBar');
+    els.rFindInput = $('rFindInput');
+    els.rFindCount = $('rFindCount');
     els.pullDlg = $('pullDlg');
     els.pullUrl = $('pullUrl');
     els.pullErr = $('pullErr');
@@ -2510,6 +2861,14 @@
     });
 
     document.addEventListener('keydown', e => {
+      /* Ctrl+F：面板开着就搜面板里的响应，不交给 WebView2 自带的查找 */
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'f' || e.key === 'F')) {
+        if (state.result && els.result && !els.result.hidden) {
+          e.preventDefault();
+          openFind();
+          return;
+        }
+      }
       if (e.key !== 'Escape') return;
       /* 弹层开着时 Esc 只关弹层，别顺手把窗口也藏了 */
       if (els.pullDlg && !els.pullDlg.hidden) { closePull(); return; }
@@ -2525,6 +2884,32 @@
       if (!state.result) return;
       state.result.view = state.result.view === 'body' ? 'full' : 'body';
       renderResult();
+    });
+
+    /* 面板内搜索：Ctrl+F 打开，Enter/↓ 下一个，Shift+Enter/↑ 上一个 */
+    els.rFind.addEventListener('click', openFind);
+    $('rFindClose').addEventListener('click', closeFind);
+    $('rFindPrev').addEventListener('click', () => jsonFindGo(jview.idx - 1));
+    $('rFindNext').addEventListener('click', () => jsonFindGo(jview.idx + 1));
+    els.rFindInput.addEventListener('input', () => jsonFind(els.rFindInput.value));
+    els.rFindInput.addEventListener('keydown', e => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        jsonFindGo(jview.idx + (e.shiftKey ? -1 : 1));
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        jsonFindGo(jview.idx + 1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        jsonFindGo(jview.idx - 1);
+      } else if (e.key === 'Escape') {
+        /* 只关搜索栏，别把整个结果面板一起关掉（document 上那个 Esc 会这么做） */
+        e.preventDefault();
+        e.stopPropagation();
+        closeFind();
+        if (els.q) els.q.focus();
+      }
     });
 
     // 标题栏拖拽
@@ -2829,6 +3214,8 @@
   /* 测试用：暴露纯函数，方便 node 侧抽出来跑用例 */
   window.__qlTest = {
     parseQuery, getByPath, highlightJson, buildUrl, toQueryString,
+    jsonRows, keySeg, jsonValText,
+    renderJsonTree, jsonFind, clearFind,
     scoreOf: scoreOf, scoreOne: scoreOne, fieldQuality: fieldQuality,
     subseqQuality: subseqQuality, lastTokenRange: lastTokenRange,
     splitForComplete: splitForComplete, histComplete: histComplete,
