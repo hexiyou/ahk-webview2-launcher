@@ -78,7 +78,6 @@ function prep() {
   fs.rmSync(BASE, { recursive: true, force: true });
   fs.mkdirSync(path.join(SANDBOX, 'runtime'), { recursive: true });
   fs.copyFileSync(path.join(ROOT, 'launcher.ahk'), path.join(SANDBOX, 'launcher.ahk'));
-  fs.copyFileSync(path.join(ROOT, 'webhook.ahk'), path.join(SANDBOX, 'webhook.ahk'));
   fs.copyFileSync(AHK, path.join(SANDBOX, 'runtime', 'AutoHotkey64.exe'));
   copyDir(path.join(ROOT, 'ui'), path.join(SANDBOX, 'ui'));
   copyDir(path.join(ROOT, 'lib'), path.join(SANDBOX, 'lib'));

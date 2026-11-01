@@ -173,6 +173,14 @@ console.log('— 动态值 {{#函数:参数}} 完全不进前端的模板逻辑'
   eq('不会被替换成空串', T.fillTemplate('X-T: {{#ts}}', { ts: 'wrong' }), 'X-T: {{#ts}}');
   eq('普通变量没受影响', T.fillTemplate('a {{v}} b', { v: 'X' }), 'a X b');
   eq('转义仍然有效', T.fillTemplate('{{{{v}}}}', { v: 'X' }), '{{v}}');
+
+  /* 后来加的一批（环境变量 / 摘要 / Base64）也走同一条路，不该出现任何特例 */
+  eq('{{#env:NAME}} 不进模板', T.tplVars(['X-C: {{#env:COMPUTERNAME}}']).size, 0);
+  eq('{{#base64:…}} 原样保留',
+    T.fillTemplate('X-A: Basic {{#base64:u:p}}', { base64: 'x' }), 'X-A: Basic {{#base64:u:p}}');
+  eq('{{#hmac-sha1:…}} 原样保留',
+    T.fillTemplate('{{#hmac-sha1:demo:{ts}}}', { ts: 'bad' }), '{{#hmac-sha1:demo:{ts}}}');
+  eq('md5 / sha512 都不进模板', T.tplVars(['{{#md5:a}}', '{{#sha512:b}}']).size, 0);
 }
 
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');

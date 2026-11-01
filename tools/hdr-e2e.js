@@ -2,10 +2,11 @@
    请求头动态值的端到端验证（真进程 / 真 WebView2 / 真 HTTP 请求）
 
    tools/hdr-check.js 只验证「函数算得对」，这里验证另一半：
-   这些值真的被写进 h.txt、由 webhook.ahk 发到了服务端。
+   这些值真的被写进 h.txt、由 --webhook 子进程发到了服务端。
 
    做法：沙箱副本 + 本地回显服务，config.json 里的 headers 写成
-   {{ts}} / {{nonce:12}} / {{hmac:demo:{{ts}}}}，然后看服务端收到什么。
+   {{#ts}} / {{#env:…}} / {{#md5:…}} / {{#base64:…}} / {{#hmac:demo:{ts}}}，
+   然后看服务端收到什么。
 
    用法：node tools/hdr-e2e.js
    ============================================================ */
@@ -22,6 +23,7 @@ const DIST = path.join(ROOT, 'dist');
 const USE_EXE = process.argv.includes('--exe');   /* 测编译版：dist\QuickLaunch.exe */
 const SANDBOX = path.join(os.tmpdir(), 'ql-hdr-e2e', USE_EXE ? 'exe' : 'app');
 const SECRET = 'ql-demo-2026-secret';
+const TOKEN = 'tok-e2e-2026';            /* 通过环境变量 QL_E2E_TOKEN 注入 */
 
 let pass = 0, fail = 0;
 function ok(label, cond, extra) {
@@ -50,7 +52,7 @@ function prepare(port) {
     copyDir(path.join(ROOT, 'ui'), path.join(SANDBOX, 'ui'));
     copyDir(path.join(ROOT, 'lib'), path.join(SANDBOX, 'lib'));
     copyDir(path.join(ROOT, 'runtime'), path.join(SANDBOX, 'runtime'));
-    for (const f of ['launcher.ahk', 'webhook.ahk'])
+    for (const f of ['launcher.ahk'])
       fs.copyFileSync(path.join(ROOT, f), path.join(SANDBOX, f));
   }
 
@@ -64,6 +66,11 @@ function prepare(port) {
           'X-Nonce: {{#nonce:12}}',
           'X-Sign: {{#hmac:demo:{ts}}}',
           'X-Fixed: {{#hmac:demo:hello}}',
+          'X-Env: {{#env:QL_E2E_TOKEN}}',
+          'X-Md5: {{#md5:abc}}',
+          'X-Sha1: {{#sha1:abc}}',
+          'X-B64: {{#base64:demo-user:demo-pass}}',
+          'X-B64Ts: {{#base64:{ts}}}',
           'X-Plain: untouched {{#foo:bar}}',
           'X-Who: {{who}}'
         ],
@@ -81,9 +88,12 @@ function prepare(port) {
 
 function runCli(args, timeout = 90000) {
   return new Promise(resolve => {
+    /* 环境变量要一路传下去：主进程 → --webhook 子进程 → {{#env:…}}，
+       正是要验证这条链没断（子进程默认继承父进程环境）。 */
+    const env = Object.assign({}, process.env, { QL_E2E_TOKEN: TOKEN });
     const p = USE_EXE
-      ? spawn(path.join(SANDBOX, 'QuickLaunch.exe'), args, { cwd: SANDBOX, windowsHide: true })
-      : spawn(AHK, [path.join(SANDBOX, 'launcher.ahk')].concat(args), { cwd: SANDBOX, windowsHide: true });
+      ? spawn(path.join(SANDBOX, 'QuickLaunch.exe'), args, { cwd: SANDBOX, windowsHide: true, env })
+      : spawn(AHK, [path.join(SANDBOX, 'launcher.ahk')].concat(args), { cwd: SANDBOX, windowsHide: true, env });
     let out = '', err = '';
     p.stdout.on('data', d => { out += d.toString('utf8'); });
     p.stderr.on('data', d => { err += d.toString('utf8'); });
@@ -124,7 +134,8 @@ function main() {
 
     const h = hits[0];
     console.log('服务端收到的头：');
-    ['x-ts', 'x-nonce', 'x-sign', 'x-fixed', 'x-plain', 'x-who'].forEach(k => console.log('  ' + k + ' = ' + h[k]));
+    ['x-ts', 'x-nonce', 'x-sign', 'x-fixed', 'x-env', 'x-md5', 'x-sha1', 'x-b64', 'x-b64ts', 'x-plain', 'x-who']
+      .forEach(k => console.log('  ' + k + ' = ' + h[k]));
 
     console.log('');
     ok('X-Ts 是 10 位时间戳', /^\d{10}$/.test(h['x-ts'] || ''), h['x-ts']);
@@ -138,6 +149,18 @@ function main() {
     ok('X-Sign 是对应时间戳的 HMAC-SHA256', near.includes(raw), raw);
     ok('X-Fixed 是 hello 的 HMAC', (h['x-fixed'] || '') ===
       crypto.createHmac('sha256', SECRET).update('hello').digest('hex'), h['x-fixed']);
+
+    /* 新增的一批：环境变量 / 摘要 / Base64，全部用 node 的 crypto 独立算一遍 */
+    ok('X-Env 拿到的是进程环境变量', h['x-env'] === TOKEN, h['x-env']);
+    ok('X-Md5 与 crypto 一致', (h['x-md5'] || '') ===
+      crypto.createHash('md5').update('abc').digest('hex'), h['x-md5']);
+    ok('X-Sha1 与 crypto 一致', (h['x-sha1'] || '') ===
+      crypto.createHash('sha1').update('abc').digest('hex'), h['x-sha1']);
+    ok('X-B64 是 "demo-user:demo-pass" 的 Base64', (h['x-b64'] || '') ===
+      Buffer.from('demo-user:demo-pass', 'utf8').toString('base64'), h['x-b64']);
+    ok('X-B64Ts 是时间戳的 Base64', [-2, -1, 0, 1, 2].map(d =>
+      Buffer.from(String(base + d), 'utf8').toString('base64')).includes(h['x-b64ts']), h['x-b64ts']);
+
     ok('认不出来的占位符原样发出', h['x-plain'] === 'untouched {{#foo:bar}}', h['x-plain']);
     ok('params 变量与函数式占位符共存', h['x-who'] === 'alice', h['x-who']);
 

@@ -124,7 +124,7 @@ const PAGE_JS = String.raw`
     log('T16 非法网址           -> 提示=' + JSON.stringify(
         (document.getElementById('pullErr').textContent || '').slice(0, 24)) + ' 仍打开=' + !dlg.hidden);
 
-    /* 合法但必然连不上的地址：验证"JS → AHK → webhook.ahk → 回包 → toast"整条链路 */
+    /* 合法但必然连不上的地址：验证"JS → AHK → --webhook 子进程 → 回包 → toast"整条链路 */
     input.value = 'http://127.0.0.1:1/config.json';
     document.getElementById('pullOk').click(); await wait(250);
     const closed = dlg.hidden;

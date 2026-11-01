@@ -120,8 +120,8 @@ AHK 靠 `DllCall` + 手写 COM vtable 索引就能完成全部调用，没有任
 ```
 wv2-launcher/
 ├─ launcher.ahk          主程序：无边框窗口 + WebView2 宿主 + 热键 + 启动逻辑 + 图标提取 + 目录补全 + 定时调度
+│                        （HTTP 执行器也在里面：`--webhook <spec>` 分支，见「四、webhook 类型」）
 ├─ ql.cmd                命令行入口（ql run …），投递给已运行的实例，不自己起窗口
-├─ webhook.ahk           HTTP 执行器（子进程）：webhook / download 的请求都在这里跑，避免阻塞界面
 ├─ launcher.ini          AHK 侧设置：热键/尺寸/圆角/行为
 ├─ config.json           数据源：应用条目 + 分组 + 定时任务（前端读取解析）
 ├─ usage.json            使用记录：次数 / 上次时间 / 参数历史（首次启动自动生成）
@@ -144,7 +144,7 @@ wv2-launcher/
 │  ├─ cli.test.js        命令行条目解析（id/名称/打分/歧义/--first，27 条）
 │  ├─ sched.test.js      定时任务配置解析（at/every/days、非法条目，57 条）
 │  ├─ enabled.test.js    条目停用归一化（enabled 缺省/false/写错，13 条）
-│  ├─ tpl.test.js        模板变量四条边界（替换范围/消耗/报错/转义，44 条）
+│  ├─ tpl.test.js        模板变量四条边界（替换范围/消耗/报错/转义，56 条）
 │  ├─ keys.test.js       空格键语义 / 切范围保选择（14 条）
 │  ├─ drop.test.js       file:// URI → 本地路径（中文/空格/UNC/坏转义，14 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
@@ -159,7 +159,7 @@ wv2-launcher/
 │  ├─ out-check.js       控制台输出实测：AllocConsole 造真控制台，写进去再读回来比对
 │  ├─ out-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 │  ├─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，验证触发/日志/不弹窗（22 项）
-│  ├─ hdr-check.js       请求头动态值：抽出 AHK 函数单跑，用 crypto 对照 HMAC/SHA-256（22 项）
+│  ├─ hdr-check.js       请求头动态值：抽出 AHK 函数单跑，用 crypto 对照摘要/HMAC/Base64（36 项）
 │  ├─ hdr-e2e.js         请求头动态值端到端：本地回显服务看真实收到的头（加 --exe 测编译版）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
@@ -178,7 +178,7 @@ wv2-launcher/
 > node tests/cli.test.js       # 27 条（命令行解析/匹配/歧义）
 > node tests/sched.test.js     # 57 条（定时任务配置解析）
 > node tests/enabled.test.js   # 13 条（条目 enabled 归一化）
-> node tests/tpl.test.js       # 44 条（模板变量四条边界）
+> node tests/tpl.test.js       # 56 条（模板变量四条边界）
 > node tests/keys.test.js      # 14 条（空格认高亮行 / 切范围保选择，见踩坑 50）
 > node tests/drop.test.js      # 14 条（file:// URI → 本地路径，见踩坑 51）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
@@ -187,7 +187,7 @@ wv2-launcher/
 > node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用条目/模板（60 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log）
-> node tools/hdr-check.js      # 请求头动态值：{{#ts}}/{{#nonce}}/{{#sha256}}/{{#hmac}} 与 crypto 对照（22 项）
+> node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC 与 crypto 对照（36 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/build-exe.js      # 编译成 dist\QuickLaunch.exe（需要 Ahk2Exe，见「九」）
 > ```
@@ -477,6 +477,10 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 请求由 AHK 侧用 `WinHttp.WinHttpRequest.5.1` 发出（不是页面 `fetch` —— `file://` 页面直连外部 API 会被 CORS 拦），
 在**独立子进程**里执行，所以请求期间窗口照样能拖、能按 Esc。
 
+那个子进程就是主程序自己，带一个内部参数 `--webhook <spec.ini>` 启动：
+脚本版是 `AutoHotkey64.exe launcher.ahk --webhook …`，编译版是 `QuickLaunch.exe --webhook …`。
+它不建窗口、不抢单实例锁、不读 `config.json`，发完请求写好结果就退出。
+
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `target` | — | 请求地址，必填 |
@@ -524,7 +528,7 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 - 必填项没填 → 不发请求，预览行变红并说明缺哪个
 - `ip` 留空时 `target` 变成 `http://ip-api.com/json/` —— 这正是 ip-api「查本机」的语义
 
-#### 请求头里的动态值（`{{#ts}}` / `{{#hmac:…}}`）
+#### 请求头里的动态值（`{{#ts}}` / `{{#env:…}}` / `{{#base64:…}}` / `{{#hmac:…}}`）
 
 上面的 `{{name}}` 是「你自己填进去的值」。还有一类值**每次请求都不一样**，而且**不该写在 config.json 里**
 （比如签名密钥）—— 这类由 AHK 在发送前展开。写法是 `{{#函数名:参数}}`，那个 `#` 是关键。
@@ -535,19 +539,36 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 | `{{#tsms}}` | Unix 毫秒（13 位） |
 | `{{#uuid}}` | UUID v4 |
 | `{{#nonce:16}}` | 16 位随机小写字母数字（默认 16，上限 128） |
+| `{{#env:NAME}}` | 环境变量 `NAME` 的值（取不到就报错，不会给空串） |
+| `{{#md5:文本}}` | MD5，十六进制小写 |
+| `{{#sha1:文本}}` | SHA-1，十六进制小写 |
 | `{{#sha256:文本}}` | SHA-256，十六进制小写 |
+| `{{#sha384:文本}}` | SHA-384，十六进制小写 |
+| `{{#sha512:文本}}` | SHA-512，十六进制小写 |
+| `{{#base64:文本}}` | 文本按 UTF-8 编码后的 Base64（不带换行、带 `=` 补位） |
+| `{{#base64url:文本}}` | base64url：`+`→`-`、`/`→`_`、去掉 `=` |
 | `{{#hmac:密钥名:待签内容}}` | HMAC-SHA256，十六进制小写；密钥取自 `launcher.ahk` 的 `SIG_KEYS` |
+| `{{#hmac-md5:密钥名:内容}}` | 同上，换算法。另有 `hmac-sha1` / `hmac-sha256` / `hmac-sha384` / `hmac-sha512` |
 
-待签内容里可以用**单花括号**引用别的动态值，里层先展开、外层拿结果去算：
+这批算法全部走 **Windows 自带实现**，没有第三方 DLL、没有外部 exe：摘要和 HMAC 用 `bcrypt`，
+Base64 用 `crypt32` 的 `CryptBinaryToStringW`。所以编译成 exe 之后一样能用，不用额外打包什么。
+
+摘要 / Base64 / HMAC 这几个"吃文本"的函数，参数里也可以引用**单花括号**动态值，
+里层先展开、外层拿结果去算：
 
 ```json
 "headers": [
   "X-Timestamp: {{#ts}}",
   "X-Nonce: {{#nonce:16}}",
   "X-Signature: {{#hmac:demo:{ts}}}",
-  "X-Trace: {{#uuid}}"
+  "X-Trace: {{#uuid}}",
+  "X-Client: {{#env:COMPUTERNAME}}",
+  "X-Auth: Basic {{#base64:demo-user:demo-pass}}"
 ]
 ```
+
+`X-Client` 用的是机器名（每台机器不同、又总是在），`X-Auth` 是 Basic 认证头最常见的拼法。
+想签「时间戳 + 路径」，`{{#hmac:demo:GET/api/v1{ts}}}` 这种写法就够了。
 
 密钥只写在 `launcher.ahk` 顶部：
 
@@ -569,12 +590,16 @@ global SIG_KEYS := Map(
 那是前端「输出字面 `}}`」的逃生口（见「模板变量」一节），会被吃成 `}}`，签名占位符少两个括号、
 整条失效。单花括号两头都不碰，所以用它。
 
-五条行为约定：
+七条行为约定：
 
-- **认不出来的一律原样保留**：`{{#foo:bar}}`、`{{#TS}}`（大小写敏感）都会一字不改地发出去，
-  老配置里真写了这种字面量不会被误伤；
+- **认不出来的一律原样保留**：`{{#foo:bar}}`、`{{#TS}}`（大小写敏感）、`{{#sha3:abc}}`（没这个算法）
+  都会一字不改地发出去，老配置里真写了这种字面量不会被误伤；
 - **密钥名写错就拒发**：`{{#hmac:nope:abc}}` → 面板直接报「未知的签名密钥名」，不会带着错签名发出去；
   同理 `{{#hmac:名字}}`（少了待签内容）也报错；
+- **环境变量取不到就拒发**：`{{#env:QL_TOKEN}}` 而 `QL_TOKEN` 没定义（或为空）时报错，
+  不会悄悄发一个空 token —— 那样服务端只回 401，排查方向全错；
+- **展开后带换行就拒发**：请求头一条一行，值里冒出 CR/LF 就等于凭空多一个请求头（请求头注入）。
+  环境变量是最可能的来源，所以在写 `h.txt` 之前统一拦一道；
 - **只展开请求头**：`target` / `body` 里的 `{{#ts}}` 不动，那里仍然只认 `params` 变量；
 - 待签内容里**不能有字面 `{}`**，单花括号只认 `{ts}` `{tsms}` `{uuid}` `{nonce:N}` 这四种，
   其余原样保留。要签 JSON 就把 JSON 拼进 `body` 模板；
@@ -611,7 +636,7 @@ global SIG_KEYS := Map(
 
 ### download 类型（下载小文件）
 
-和 `webhook` 共用同一套联网代码（`webhook.ahk` 子进程 + `WinHttp`），区别只有一处：
+和 `webhook` 共用同一套联网代码（`--webhook` 子进程 + `WinHttp`），区别只有一处：
 响应体**按二进制**写进文件，而不是当文本塞进结果面板。
 所以它同样不阻塞界面，超时、错误码翻译、请求头这一套行为全都一样。
 
@@ -874,7 +899,7 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
 
 12. **⭐ webhook 请求必须丢给子进程**：`WinHttp.WinHttpRequest` 是同步调用，
     在主脚本线程里发就是"整个窗口假死到请求结束"（超时 10 秒 = 10 秒拖不动、Esc 也按不了）。
-    现在主进程写 `spec.ini` → 起 `webhook.ahk` 子进程 → 每 120ms 看 `meta.ini` 出没出现。
+    现在主进程写 `spec.ini` → 起一个 `--webhook` 子进程 → 每 120ms 看 `meta.ini` 出没出现。
     顺带发现：**WinHttp 的 `SetTimeouts` 有 ~4 秒地板**——配 1 秒、3 秒都在 4015ms 才报错，
     配 5 秒却能正常等到 6 秒的响应，说明它并不按你给的值精确生效。
     所以真正的超时改成主进程兜底：`deadline = timeout + 1s`，到点直接杀子进程并回「请求超时」。
@@ -889,7 +914,7 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     更阴的是：发生在定时器线程里时表现为**静默失败**（文件根本没写出来，也没有任何提示）。
     排查这类问题建议一开始就挂 `OnError` 把错误写进日志文件。
     同类的还有**函数定义的位置**：AHK v2 执行到第一个函数定义就结束自动执行段，
-    所以函数只能放在脚本末尾。给 `webhook.ahk` 加错误码翻译时，我把 `CleanComError()`
+    所以函数只能放在脚本末尾。给 HTTP 执行器（那时还是独立的 `webhook.ahk`）加错误码翻译时，我把 `CleanComError()`
     定义插在了主流程中间，结果它后面的"写 meta.ini / 退出"全变成死代码——
     进程正常退出（退出码 0），但主进程永远等不到 `meta.ini`，只能撞上超时兜底。
 
@@ -903,7 +928,7 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     —— TCP 三次握手成功，ClientHello 一发出去就被 RST。
     同一台机器同一时刻，`api64.ipify.org`、`ipinfo.io`、`ifconfig.me`、`ip-api.com` 全部 200，
     只有 `api.ipify.org` 不通，是**域名级阻断**，与请求参数、限流都无关。
-    另外用项目自身的 `webhook.ahk` 对两个域名各发一次：`api.ipify.org` 844ms 断、`api64.ipify.org` 2172ms 拿到 `{"ip":"…"}`，
+    另外用项目自身的执行器（那时还是独立的 `webhook.ahk`）对两个域名各发一次：`api.ipify.org` 844ms 断、`api64.ipify.org` 2172ms 拿到 `{"ip":"…"}`，
     证明代码路径没问题。
     处理：示例接口换成 `api64.ipify.org`；错误码补全中文映射（`0x80072EE7/EFD/EFE/F8F/80090308/800B0109/800C0005…`）；
     顺手截掉 AHK COM 异常尾巴（`Source:` / `HelpFile:` / `HelpContext:`），那串东西对用户没用。
@@ -1162,13 +1187,15 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     另外，被 `Cancel` 掉的那次导航**也会走到 `NavigationCompleted`**（`IsSuccess=false`），
     必须用 `dropNav` 标记跳过 —— 否则每次拖文件都会弹一个模态错误框，消息循环当场冻住。
 
-52. **⭐ 编译后 `A_AhkPath` 指向 exe 自己，不再是解释器**：三处 `Run('"' A_AhkPath '" …webhook.ahk…')`
-    在编译版里都变成"再起一个自己"，参数全进了 `A_Args`，目标脚本一次都不会执行。
-    症状是 webhook / download 统一报「请求进程异常退出」，看着像 webhook.ahk 语法坏了。
-    实测验证方式：编一个只有 `FileAppend` 的 `target.ahk`，再用编译版
+52. **⭐ 编译后 `A_AhkPath` 指向 exe 自己，不再是解释器**：以前 webhook / download / ahk 三处
+    `Run('"' A_AhkPath '" …webhook.ahk…')` 在编译版里全变成"再起一个自己"，参数都进了 `A_Args`，
+    目标脚本一次都不会执行。症状是 webhook / download 统一报「请求进程异常退出」，
+    看着像脚本语法坏了。实测验证方式：编一个只有 `FileAppend` 的 `target.ahk`，再用编译版
     `exe.exe /ErrorStdOut target.ahk spec.ini` 去拉它 —— `target-ran.txt` 根本不会出现，
     而 `A_Args` 里躺着 `['/ErrorStdOut', 'target.ahk', 'spec.ini']`。
-    修法见 `AhkInterp()`：编译版走随包解释器，脚本版原样返回 `A_AhkPath`。
+    现在按用途分成两条路：HTTP 执行器并进了主脚本，编译版直接
+    `QuickLaunch.exe --webhook <spec>`（见 `RunWebhook()`），**不再需要解释器**；
+    只有 "ahk" 类型条目还要跑别人写的 `.ahk`，才用 `AhkInterp()` 取随包解释器。
 
 53. **⭐ bcrypt 的属性名是 `HashDigestLength`，不是 `HashLength`**：写错不会报错，
     `BCryptGetProperty` 返回 `STATUS_NOT_SUPPORTED`，而输出缓冲区**保持上一次的旧值** ——
@@ -1185,6 +1212,19 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     `if exist QuickLaunch.exe ( … & exit /b %ERRORLEVEL% )`，退出码永远是 0 ——
     cmd 在解析整个块时就把变量展开了。要么 `goto` 跳出去再 `exit /b`，要么开
     `enabledelayedexpansion` 用 `!ERRORLEVEL!`。现在用的是 `goto`。
+
+56. **⭐ 子进程就用自己，但分支必须放在最前面**：`webhook.ahk` 并进主脚本之后，
+    `--webhook <spec>` 这个分支的位置很关键 —— 它得在 `SetProcessDpi()`、`CliParse()`、
+    单例锁、`LoadSettings()` 之前。放到后面会踩三个坑：建了个用不着的 DPI 上下文、
+    子进程可能去抢单实例锁（抢不到就把自己当客户端，然后挂在那里等超时）、
+    以及在没有 `config.json` 的环境里直接弹窗报错。现在它紧跟全局常量之后，
+    认到参数就 `ExitApp(WebhookMain(spec))`，干净退出。
+
+57. **展开请求头时要防"换行注入"**：`{{#env:…}}` 的值来自进程环境，里面要是带 CR/LF，
+    写进 `h.txt` 就等于凭空多出一行 —— 那条会变成一个**额外的请求头**（RFC 7230 明令禁止）。
+    所以展开后统一过一道 `HdrLine()`：见到换行整条拒发，而不是"悄悄清理掉"。
+    同理，环境变量取不到时选择**报错**而不是给空串：空 token 换来一个 401，
+    排查方向会跑到签名算法上去。
 
 ---
 
@@ -1413,6 +1453,9 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
   变量名只认 `[\w.-]`（字母数字下划线点横线），中文变量名不行。
   自动补引号也只覆盖 `app` / `ahk` 的 `args` 里"独占一个位置"的变量；
   嵌在别的字符中间（`--dir={{d}}`）按原样拼，这是有意的 —— 猜错了会改坏参数结构。
+- `{{#…}}` 动态值只做"算一个字符串"：摘要 / Base64 / HMAC 之外没有加密与公钥签名
+  （AES、RSA、JWT 组装这类需要额外实现，可以按需再加）；`SIG_KEYS` 是源码里的明文表，
+  防的是"翻配置的人"，不是逆向（见「九」限制 2）。
 - **UNC 路径**：只有 `workdir` 是 UNC 时才需要特殊照顾（已自动 `pushd`），但共享掉线时
   `FileExist` 会阻塞约 2 秒才失败；首次访问共享的冷启动也可能要好几秒（系统 SMB + 杀软扫描）。
   补全 `\\服务器` 只列共享，**不列网络上的服务器名**（那要靠"浏览网络"，会慢且可能弹框）。
@@ -1446,7 +1489,7 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 |---|---|---|
 | 改 AHK 代码 | 存盘重启即可 | 要重新编译 |
 | 改 `ui\` 里的 HTML/JS/CSS | 重载配置或重启 | **一样**，不用重编译 |
-| 需要 `runtime\AutoHotkey64.exe` | 要（它就是解释器） | 只有 webhook / download / ahk 类型要 |
+| 需要 `runtime\AutoHotkey64.exe` | 要（它就是解释器） | 只有 `ahk` 类型要；webhook / download 已不需要 |
 | 源码 / 密钥是否可见 | 是 | 否（能解包，但不再是明文文件） |
 
 ### 编译
@@ -1471,27 +1514,32 @@ node tools/build-exe.js
 | `config.json` / `launcher.ini` | ✅ | 重编译**不会覆盖**已存在的，别怕丢配置 |
 | `ui\` | ✅ | 界面；改界面不用重编译 |
 | `lib\WebView2Loader.dll` | ✅ | WebView2 加载器 |
-| `runtime\AutoHotkey64.exe` + `webhook.ahk` | 视情况 | webhook / download / ahk 类型要靠它跑 |
+| `runtime\AutoHotkey64.exe` | 只有 `ahk` 类型要 | 跑别人的 `.ahk` 用。webhook / download 不依赖它，删掉也行 |
 | `ql.cmd` / `run.bat` | 可选 | 自己会判断同目录有没有 exe |
 
 `lib\WebView2\WebView2.ahk`、`ComVar.ahk`、`Promise.ahk` 已经被 `#Include` 编进 exe，**不用带**；
 `pinyin.txt`（985 KB）运行时不读，也不用带。
 
-### webhook 为什么非得带着解释器
+### HTTP 子进程不再需要解释器
 
-编译后 `A_AhkPath` 指向 **exe 自己**，不再是解释器。而代码有三处拿它去跑别的 `.ahk`：
+编译后 `A_AhkPath` 指向 **exe 自己**，不再是解释器。以前那行
+`Run('"' A_AhkPath '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"')` 在编译版里
+等于让 `QuickLaunch.exe` 去"跑一个脚本"—— 它不认这种参数（全进了自己的 `A_Args`），
+目标脚本一次都不会执行，症状是 webhook / download 全部报「请求进程异常退出」。
+
+现在改成**让进程自己当执行器**：`webhook.ahk` 已经并进主脚本，变成一个 `--webhook <spec>` 分支。
 
 ```ahk
-Run('"' A_AhkPath '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"')
+; 编译版
+Run('"' A_ScriptFullPath '" --webhook "' spec '"')
+; 脚本版（得先有解释器才能跑 .ahk）
+Run('"' A_AhkPath '" /ErrorStdOut "' A_ScriptFullPath '" --webhook "' spec '"')
 ```
 
-编译版执行这行等于 `QuickLaunch.exe /ErrorStdOut webhook.ahk spec.ini` —— 它不认
-「跑某个脚本」这种参数（全进了自己的 `A_Args`），目标脚本一次都不会执行。实测症状：
-webhook / download 全部报「请求进程异常退出」。
-
-修法是 `AhkInterp()`：编译版优先返回 `SCRIPT_DIR\runtime\AutoHotkey64.exe`，脚本版原样返回
-`A_AhkPath`。想彻底不带解释器，可以把 `webhook.ahk` 合并进主脚本做成 `--webhook <spec>` 分支 ——
-能省 1.25 MB，但要动联网那条主路径，目前没做。
+那个分支在自动执行段的**最前面**就 `ExitApp`，不建窗口、不抢单实例锁、不读配置，
+所以拿 exe 跑它是安全的。于是 `runtime\AutoHotkey64.exe` 只对 `ahk` 类型条目还有意义：
+把它整个删掉，webhook / download 照样能跑（实测过：把 `dist\runtime\` 移走，
+端到端 13 项全过）。省 1.25 MB，也多了一层"就算解释器被人换掉，联网路径也还是 exe 自己的代码"。
 
 ### 单实例跟着目录走
 
@@ -1511,8 +1559,9 @@ webhook / download 全部报「请求进程异常退出」。
 
 ## 十、可以继续加的东西
 
-- 动态值再来几个：`{{#env:NAME}}`（环境变量）、`{{#md5:…}}`、`{{#base64:…}}`；
-  以及把 `webhook.ahk` 并进主脚本做成 `--webhook <spec>` 分支，这样编译版可以不依赖 runtime
+- 签名密钥别写死在源码里：改成优先读环境变量 / DPAPI 加密文件，`SIG_KEYS` 只留兜底
+  （现在 `/restore` 能把源码翻出来，见「九」的限制 2）
+- `--webhook` 加一个 `--json` 之类的开关，让人能在终端直接手跑一个 `spec.ini` 排查
 - `download`：进度条与中途取消、断点续传（`Range` + `.part` 续写）、`Content-Length`/哈希校验
 - `download`：多文件批量下载（现在一个条目只下一个文件）
 - webhook：请求历史、把常用请求存成条目

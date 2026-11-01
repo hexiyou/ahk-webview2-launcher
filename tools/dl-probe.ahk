@@ -1,7 +1,7 @@
 ; ============================================================================
 ;  download / 拉取在线配置 实测
 ;  由 tools/dl-check.js 拼进 launcher.ahk 副本（_launcher_dl.ahk）后调用，跑完 ExitApp。
-;  测的都是真代码：StartDownload / DoPullConfig / webhook.ahk 子进程 / InstallConfig。
+;  测的都是真代码：StartDownload / DoPullConfig / --webhook 子进程 / InstallConfig。
 ;  文件字节是否一致由 node 侧比对（AHK 这边只报路径和 meta）。
 ; ============================================================================
 

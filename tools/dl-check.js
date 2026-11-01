@@ -2,7 +2,7 @@
    download / 拉取在线配置 真机实测
    ------------------------------------------------------------
    把 launcher.ahk 原样复制一份，注入 tools/dl-probe.ahk 里的检查逻辑，
-   用真 AutoHotkey 跑一遍完整链路（含 webhook.ahk 子进程写盘）。
+   用真 AutoHotkey 跑一遍完整链路（含 --webhook 子进程写盘）。
 
    用法：node tools/dl-check.js
    说明：本地起一个临时 HTTP 服务提供测试文件，跑完自动关；测试文件落在

@@ -3,6 +3,7 @@
 ;  ---------------------------------------------------------------------------
 ;  结构：
 ;    launcher.ahk        本文件：Win32 无边框窗口 + WebView2 宿主 + 全局热键 + 启动逻辑
+;                        + HTTP 执行器（`--webhook <spec>` 分支，见文末同名小节）
 ;    launcher.ini        AHK 侧设置（热键 / 窗口尺寸 / 行为）
 ;    config.json         数据源（应用条目，由前端 JS 读取解析）
 ;    ui/                 前端界面（HTML + CSS + JS）
@@ -67,6 +68,22 @@ global wakePending := false   ; 有客户端只是要求"打开一下"
 global schedTasks := []       ; 已安装的定时任务
 global schedStage := []       ; sched-begin..sched-end 之间攒的条目
 global schedInside := false
+
+; ------------------------- 内部通道：--webhook --------------------------------
+/*  webhook / download 的 HTTP 请求跑在子进程里（WinHttp 是同步 COM，放主进程里
+    10 秒超时就是 10 秒假死）。子进程就是本脚本自己：
+
+      脚本版   AutoHotkey64.exe launcher.ahk --webhook <spec.ini>
+      编译版   QuickLaunch.exe            --webhook <spec.ini>
+
+    以前靠一个独立的 webhook.ahk + 随包解释器；并进主脚本之后，编译版不再需要
+    runtime\AutoHotkey64.exe（只剩 "ahk" 类型条目还用它），也就少一个会漂移的实现。
+
+    ★ 这个分支必须在 DPI / 单例 / 配置 / 界面之前：子进程不建窗口、不抢锁、
+      不读 config.json，跑完就带着退出码走人。 */
+whSpec := ''
+if WebhookArg(A_Args, &whSpec)
+    ExitApp(WebhookMain(whSpec))
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
@@ -923,11 +940,11 @@ DoReload() {
 ;  Webhook：请求交给子进程跑，主进程只轮询结果
 ;  ---------------------------------------------------------------------------
 ;  WinHttp 是同步的，直接在脚本线程里调会冻住整个窗口（超时 10 秒就是 10 秒假死）。
-;  所以：主进程写 spec.ini -> 起 webhook.ahk 子进程 -> 定时看 meta.ini 是否出现。
+;  所以：主进程写 spec.ini -> 起 `--webhook` 子进程 -> 定时看 meta.ini 是否出现。
 ; ============================================================================
 
 DoWebhook(raw) {
-    global HTTP_DIR, SCRIPT_DIR, httpJobs
+    global HTTP_DIR, httpJobs
 
     id := JsonStr(raw, 'id')
     url := JsonStr(raw, 'url')
@@ -956,7 +973,7 @@ DoWebhook(raw) {
     hs := ''
     try {
         for h in JsonStrArray(raw, 'headers')
-            hs .= HdrExpand(h) '`n'
+            hs .= HdrLine(h) '`n'
     } catch as e {
         try DirDelete(dir, true)
         JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
@@ -978,8 +995,7 @@ DoWebhook(raw) {
 
     pid := 0
     try {
-        Run('"' AhkInterp() '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
-            , SCRIPT_DIR, 'Hide', &pid)
+        pid := RunWebhook(spec)
     } catch as e {
         JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
             ',"truncated":0,"error":' JsonQuote('无法启动请求进程：' e.Message) ',"body":""}')
@@ -1000,7 +1016,7 @@ CheckHttp() {
         if FileExist(metaPath) {
             ; 子进程先写 body 再写 meta，看到 meta 说明整套产物都齐了
         } else if !ProcessExist(job.pid) {
-            err := '请求进程异常退出（webhook.ahk 可能报错，检查一下语法）'
+            err := '请求进程异常退出（子进程报错了，用 --webhook 手动跑一遍那个 spec.ini 看输出）'
         } else if (A_TickCount > job.deadline) {
             try ProcessClose(job.pid)
             err := '请求超时（超过 ' job.timeout ' 秒）'
@@ -1091,7 +1107,7 @@ CheckHttp() {
 ; ============================================================================
 ;  Download：webhook 的变种，差别只在"响应体去哪"
 ;  ---------------------------------------------------------------------------
-;  和 DoWebhook 共用同一套骨架：写 spec.ini -> 起 webhook.ahk 子进程 -> 轮询结果。
+;  和 DoWebhook 共用同一套骨架：写 spec.ini -> 起 `--webhook` 子进程 -> 轮询结果。
 ;  多出来的只有 [dl] 段，子进程据此把 ResponseBody 按二进制写进文件。
 ;  有意保持最小：一次性进内存，不做断点续传、校验和、分片。
 ; ============================================================================
@@ -1179,7 +1195,7 @@ StartDownload(cfg) {
     try {
         if cfg.HasOwnProp('headers')
             for h in cfg.headers
-                hs .= HdrExpand(h) '`n'
+                hs .= HdrLine(h) '`n'
     } catch as e {
         try DirDelete(dir, true)
         SendDownloadError(id, cfg.purpose, '请求头展开失败：' e.Message)
@@ -1203,8 +1219,7 @@ StartDownload(cfg) {
 
     pid := 0
     try {
-        Run('"' AhkInterp() '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
-            , SCRIPT_DIR, 'Hide', &pid)
+        pid := RunWebhook(spec)
     } catch as e {
         SendDownloadError(id, cfg.purpose, '无法启动下载进程：' e.Message)
         return
@@ -1955,19 +1970,25 @@ WriteReply(path, json) {
 ;  直接拒绝执行；就算不报错也会被替换成空串。加个 # 之后，
 ;  # 不在 [\w.-] 里，前端从头到尾都不认它，原样送到这里（不需要任何遮罩代码）。
 ;
-;  支持：
+;  支持（全部走 Windows 自带实现，不引第三方 DLL / 外部 exe）：
 ;    {{#ts}}                    Unix 秒
 ;    {{#tsms}}                  Unix 毫秒
 ;    {{#uuid}}                  UUID v4
 ;    {{#nonce:16}}              N 位随机小写字母数字（默认 16，上限 128）
-;    {{#sha256:文本}}           十六进制 SHA-256
+;    {{#env:NAME}}              环境变量 NAME 的值（取不到就报错，不给空串）
+;    {{#md5:文本}}              十六进制摘要；同族还有 sha1 / sha256 / sha384 / sha512
+;    {{#base64:文本}}           UTF-8 文本的 Base64；base64url 版本去掉 +/ 补位（=）
 ;    {{#hmac:密钥名:待签内容}}   十六进制 HMAC-SHA256，密钥取自 SIG_KEYS
+;    {{#hmac-sha1:密钥名:内容}}  同族还有 hmac-md5 / hmac-sha256 / hmac-sha384 / hmac-sha512
+;
+;  所有"吃文本"的函数（摘要 / base64 / hmac）都先过一遍单花括号展开，
+;  所以 {{#base64:{uuid}}}、{{#hmac:demo:GET{ts}}} 都能用。
 ;
 ;  待签内容里可以用**单花括号**引用另一个动态值：{{#hmac:demo:{ts}}}
 ;  —— 为什么不是 {{#hmac:demo:{{#ts}}}}：内层收尾紧跟外层收尾会凑出 }}}}，
 ;  那是前端「输出字面 }}」的逃生口（见 ui/app.js 的 TPL_RE），会被吃成 }}，
 ;  于是签名占位符少两个括号、整条失效。单花括号两头都不碰，最省事。
-;  单花括号只认 ts / tsms / uuid / nonce，不支持再套 hmac。
+;  单花括号只认 ts / tsms / uuid / nonce，不支持再套 hmac（避免递归自套）。
 ; ============================================================================
 HdrExpand(line) {
     if !InStr(line, '{{#')
@@ -1988,6 +2009,17 @@ HdrExpand(line) {
             return out
         line := out
     }
+    return line
+}
+
+/* 展开一整行请求头，并挡住「换行注入」。
+   {{#env:…}} 的值来自进程环境（由外部注入），里面要是带 CR/LF，写进 h.txt 就会
+   凭空多出一行 —— 那条多出来的会变成一个额外的请求头（RFC 7230 明确禁止）。
+   这里直接拒发：报错比悄悄改写成别的请求安全得多。 */
+HdrLine(raw) {
+    line := HdrExpand(raw)
+    if RegExMatch(line, '[\r\n]')
+        throw Error('展开后出现换行，已拒绝发送：' (StrLen(raw) > 60 ? SubStr(raw, 1, 60) '…' : raw))
     return line
 }
 
@@ -2013,19 +2045,45 @@ HdrEval(expr) {
             if (n < 1 || n > 128)
                 n := 16
             return {ok: true, val: RandAlnum(n)}
-        case 'sha256':
-            return {ok: true, val: HashHex(rest)}
-        case 'hmac':
+        case 'env':
+            return {ok: true, val: HdrEnv(rest)}
+        case 'md5', 'sha1', 'sha256', 'sha384', 'sha512':
+            return {ok: true, val: HashHex(HdrInline(rest), HashAlgo(name))}
+        case 'base64', 'base64url':
+            return {ok: true, val: B64Encode(HdrInline(rest), name = 'base64url')}
+        case 'hmac', 'hmac-md5', 'hmac-sha1', 'hmac-sha256', 'hmac-sha384', 'hmac-sha512':
             ; hmac:密钥名:待签内容  —— 只按第一个冒号切，内容里的冒号照旧
             q := InStr(rest, ':')
             if !q
-                throw Error('hmac 少了参数，写法是 {{hmac:密钥名:待签内容}}')
+                throw Error('hmac 少了参数，写法是 {{#hmac:密钥名:待签内容}}')
             kname := Trim(SubStr(rest, 1, q - 1), ' ' . "`t")
             if !SIG_KEYS.Has(kname)
                 throw Error('未知的签名密钥名「' kname '」——在 launcher.ahk 的 SIG_KEYS 里定义')
-            return {ok: true, val: HashHex(HdrInline(SubStr(rest, q + 1)), 'SHA256', SIG_KEYS[kname])}
+            /* 裸 hmac 沿用 SHA-256（和上一版配置兼容）；带后缀的按后缀选算法 */
+            algo := (name = 'hmac') ? 'SHA256' : HashAlgo(SubStr(name, 6))
+            return {ok: true, val: HashHex(HdrInline(SubStr(rest, q + 1)), algo, SIG_KEYS[kname])}
     }
     return {ok: false, val: ''}          ; 不认识：原样留着
+}
+
+/* {{#env:NAME}} —— 读环境变量。
+   取不到时**报错而不是给空串**：空值会让 Authorization 变成 "Bearer "，
+   服务端只回 401，人却会以为是签名算法写错了。宁可拒发并说清是哪个变量没定义。 */
+HdrEnv(name) {
+    name := Trim(name, ' ' . "`t")
+    if (name = '')
+        throw Error('env 少了变量名，写法是 {{#env:NAME}}')
+    v := EnvGet(name)
+    if (v = '')
+        throw Error('环境变量「' name '」没有定义或为空')
+    return v
+}
+
+/* 占位符名 -> bcrypt 的算法标识。
+   bcrypt 认的就是 'MD5' / 'SHA1' / 'SHA256' / 'SHA384' / 'SHA512'，
+   正好是占位符名的大写形式，不用查表。 */
+HashAlgo(name) {
+    return StrUpper(name)
 }
 
 /* 待签内容里的单花括号占位：{ts} {tsms} {uuid} {nonce:8}
@@ -2123,12 +2181,42 @@ HashHex(text, algo := 'SHA256', key := '') {
     }
 }
 
+/* Base64 编码（UTF-8 文本进，ASCII 出）。
+   走 crypt32 的 CryptBinaryToStringW —— 系统自带，不引第三方库，也不用自己查表。
+   urlSafe = true 时转成 base64url（+ -> -、/ -> _、去掉补位 =），JWT 那类场景用。 */
+B64Encode(text, urlSafe := false) {
+    n := StrPut(text, 'utf-8') - 1        ; StrPut 的返回值含结尾 \0
+    if (n <= 0)
+        return ''
+    src := Buffer(n, 0)
+    StrPut(text, src, 'utf-8')
+
+    /* CRYPT_STRING_BASE64(0x1) | CRYPT_STRING_NOCRLF(0x40000000)。
+       不加 NOCRLF 的话每 76 个字符插一次 \r\n —— 写进请求头就是灾难。 */
+    flags := 0x40000001
+    cch := 0
+    if !DllCall('crypt32\CryptBinaryToStringW', 'ptr', src, 'uint', n, 'uint', flags
+        , 'ptr', 0, 'uint*', &cch, 'int')
+        throw Error('Base64 编码失败（取长度）')
+    if (cch <= 1)                         ; 只有结尾 \0，即空串
+        return ''
+    out := Buffer(cch * 2, 0)             ; cch 含结尾 \0，WCHAR 占 2 字节
+    if !DllCall('crypt32\CryptBinaryToStringW', 'ptr', src, 'uint', n, 'uint', flags
+        , 'ptr', out, 'uint*', &cch, 'int')
+        throw Error('Base64 编码失败')
+    s := StrGet(out, 'utf-16')
+    if urlSafe
+        s := RTrim(StrReplace(StrReplace(s, '+', '-'), '/', '_'), '=')
+    return s
+}
+
 AhkInterp() {
-    /* 「跑另一个 .ahk」时用的解释器路径。
+    /* 「跑另一个 .ahk」时用的解释器路径（现在只有 "ahk" 类型条目还会用到它；
+       webhook / download 已经改走本脚本的 --webhook 分支，不再需要解释器）。
        脚本版就是 A_AhkPath；编译版的 A_AhkPath 指向 exe 自己，拿它当解释器
        只会再起一个自己 —— 参数全进 A_Args，目标脚本一次都不会执行（实测过：
        目标脚本的 FileAppend 从没落盘）。所以编译版优先用随包的 runtime 解释器，
-       找不到再退回 A_AhkPath：这样漏带 runtime 时是 webhook 报错，而不是静默跑飞。 */
+       找不到再退回 A_AhkPath：这样漏带 runtime 时是 "ahk" 条目报错，而不是静默跑飞。 */
     global SCRIPT_DIR
     if A_IsCompiled {
         p := SCRIPT_DIR '\runtime\AutoHotkey64.exe'
@@ -2136,6 +2224,21 @@ AhkInterp() {
             return p
     }
     return A_AhkPath
+}
+
+/* 起一个「请求子进程」：还是本脚本，带 --webhook <spec>。
+   编译版直接跑自己（A_ScriptFullPath 就是 exe 路径），因此不依赖随包解释器；
+   脚本版得先有解释器才能跑 .ahk，用 AhkInterp()。
+   返回 pid；起不来会抛异常，由调用方决定怎么报错。 */
+RunWebhook(spec) {
+    global SCRIPT_DIR
+    pid := 0
+    if A_IsCompiled
+        Run('"' A_ScriptFullPath '" --webhook "' spec '"', SCRIPT_DIR, 'Hide', &pid)
+    else
+        Run('"' AhkInterp() '" /ErrorStdOut "' A_ScriptFullPath '" --webhook "' spec '"'
+            , SCRIPT_DIR, 'Hide', &pid)
+    return pid
 }
 
 HashText(s) {
@@ -2452,4 +2555,301 @@ SchedLog(id, kind, text) {
     line .= SubStr(kind '      ', 1, 6)
     line .= (id = '' ? '-' : id) '  ' text "`n"
     try FileAppend(line, SCHED_LOG, 'UTF-8')
+}
+
+; ============================================================================
+;  --webhook <spec.ini>：HTTP 执行器（子进程主体）
+;  ---------------------------------------------------------------------------
+;  以前这里是独立的 webhook.ahk。并进主脚本之后：
+;    · 编译版自己就能当执行器，不用再随包 runtime\AutoHotkey64.exe；
+;    · 只有一份实现，脚本版和编译版不会各跑各的、慢慢漂移。
+;
+;  为什么必须是子进程：WinHttp.WinHttpRequest 是同步 COM，请求期间会冻住
+;  调用线程 —— 放在主进程里就是"10 秒超时 = 界面假死 10 秒"。
+;
+;  两种模式（spec 里的 [req] Mode）：
+;    http      默认。响应正文按文本落盘，交给前端显示（webhook 类型）
+;    download  把响应体按二进制写进文件（download 类型）。和 http 共用同一套
+;              请求逻辑，只是"结果去哪"不同
+;
+;  spec 由主进程写，键名见 DoWebhook / StartDownload。产物（回写给主进程）：
+;    <OutDir>\meta.ini   [resp] Status / Error / Ms / Len
+;                        [dl]   File / Name / Size / Skipped / Backup   （仅 download）
+;    <OutDir>\body.txt   响应正文（UTF-8 无 BOM，仅 http 模式）
+;
+;  注意：这里刻意不做任何 JSON 解析 —— 正文原样落盘，交给前端的 JSON.parse。
+; ============================================================================
+
+/* 认命令行里的 --webhook。两种写法都吃：`--webhook <spec>`，`--webhook=<spec>` */
+WebhookArg(argv, &spec) {
+    static RE := 'i)^--webhook(?:=(.+))?$'
+    spec := ''
+    m := ''
+    if (argv.Length < 1)
+        return false
+    if !RegExMatch(argv[1], RE, &m)
+        return false
+    spec := Trim(m[1] != '' ? m[1] : (argv.Length >= 2 ? argv[2] : ''), ' `t"')
+    return true
+}
+
+/* 返回进程退出码：0 正常 / 2 spec 读不到 / 3 spec 内容不全 */
+WebhookMain(spec) {
+    if (spec = '' || !FileExist(spec))
+        return 2
+
+    mode     := IniRead(spec, 'req', 'Mode', 'http')
+    method   := IniRead(spec, 'req', 'Method', 'GET')
+    url      := IniRead(spec, 'req', 'Url', '')
+    timeout  := WhIntOr(IniRead(spec, 'req', 'Timeout', '15'), 15)
+    hdrsFile := IniRead(spec, 'req', 'HeadersFile', '')
+    bodyFile := IniRead(spec, 'req', 'BodyFile', '')
+    outDir   := IniRead(spec, 'req', 'OutDir', '')
+
+    ; download 专用
+    saveDir  := IniRead(spec, 'dl', 'SaveDir', '')
+    saveName := IniRead(spec, 'dl', 'SaveName', '')
+    onExists := IniRead(spec, 'dl', 'OnExists', 'skip')
+    backup   := WhIntOr(IniRead(spec, 'dl', 'Backup', '0'), 0)
+
+    if (outDir = '' || url = '')
+        return 3
+
+    meta := outDir '\meta.ini'
+    outBody := outDir '\body.txt'
+    try FileDelete(meta)
+    try FileDelete(outBody)
+
+    status := 0
+    errMsg := ''
+    body := ''
+    dl := { file: '', name: '', size: 0, skipped: 0, backup: '' }
+    t0 := A_TickCount
+
+    try {
+        req := ComObject('WinHttp.WinHttpRequest.5.1')
+
+        ; 四个超时都按用户设置（毫秒）：解析 / 连接 / 发送 / 接收
+        ms := Max(timeout, 1) * 1000
+        try req.SetTimeouts(ms, ms, ms, ms)
+
+        req.Open(method, url, false)
+
+        ; 先给一个默认 UA：GitHub 之类没有 UA 会直接 403；用户自己设了就以用户的为准
+        try req.SetRequestHeader('User-Agent', 'QuickLaunch/1.0 (AutoHotkey + WebView2)')
+
+        if (hdrsFile != '' && FileExist(hdrsFile)) {
+            Loop Read, hdrsFile {
+                line := Trim(A_LoopReadLine)
+                if (line = '' || SubStr(line, 1, 1) = ';')
+                    continue
+                p := InStr(line, ':')
+                if (p < 2)
+                    continue
+                try req.SetRequestHeader(Trim(SubStr(line, 1, p - 1)), Trim(SubStr(line, p + 1)))
+            }
+        }
+
+        if (bodyFile != '' && FileExist(bodyFile)) {
+            reqBody := FileRead(bodyFile, 'UTF-8')
+            req.Send(reqBody)
+        } else {
+            req.Send()
+        }
+
+        status := req.Status
+
+        if (mode = 'download') {
+            ; 只认 2xx：404/500 的响应体是错误页，存成文件只会污染目录
+            if (status < 200 || status > 299)
+                throw Error('下载失败：服务器返回 HTTP ' status '（未保存任何文件）')
+            dl := WhSaveToFile(req, saveDir, saveName, onExists, backup, url)
+        } else {
+            body := req.ResponseText
+        }
+    } catch as e {
+        errMsg := CleanComError(e.Message)
+
+        ; 常见 WinHttp / WinINET 错误码翻译成人话，比 0x80072EE2 好懂。
+        ; 这些错误都在"还没拿到 HTTP 响应"的阶段抛出，和 4xx/5xx（限流、鉴权失败）是两回事。
+        codeMap := Map(
+            '0x80072EE2', '连接超时：服务器没有在 ' timeout ' 秒内响应',
+            '0x80072EE7', '域名解析失败：DNS 查不到这个主机',
+            '0x80072EFD', '无法连接到服务器：端口不可达或被防火墙拦截',
+            '0x80072EFE', '连接被对方中断：TCP 已连上但 TLS 握手被重置。多为网络干扰、代理或目标站点封禁，不是请求参数问题',
+            '0x80072EF3', '服务器返回了无法识别的响应',
+            '0x80072F78', '服务器返回的响应无效',
+            '0x80072F8F', 'TLS/SSL 握手失败：系统可能未启用 TLS 1.2',
+            '0x80090308', 'TLS 握手失败：证书或加密套件不被接受',
+            '0x800B0109', '证书链不受信任：目标站点证书有问题或系统根证书缺失',
+            '0x800C0005', '无法解析域名或连接被拒绝',
+            '0x800C0008', '下载失败：连接被中途断开'
+        )
+        for code, text in codeMap {
+            if InStr(errMsg, code) {
+                errMsg := text '（' code '）'
+                break
+            }
+        }
+    }
+
+    elapsed := A_TickCount - t0
+
+    if (mode != 'download') {
+        try FileAppend(body, outBody, 'UTF-8-RAW')
+        catch
+            errMsg := errMsg = '' ? '响应写入失败（可能无权限）' : errMsg
+    }
+
+    ; 错误信息可能带换行，IniWrite 的值必须是单行
+    errMsg := StrReplace(StrReplace(errMsg, "`r", ' '), "`n", ' ')
+
+    try FileDelete(meta)
+    IniWrite(status, meta, 'resp', 'Status')
+    IniWrite(errMsg, meta, 'resp', 'Error')
+    IniWrite(elapsed, meta, 'resp', 'Ms')
+    IniWrite(mode = 'download' ? dl.size : StrLen(body), meta, 'resp', 'Len')
+
+    if (mode = 'download') {
+        IniWrite(dl.file, meta, 'dl', 'File')
+        IniWrite(dl.name, meta, 'dl', 'Name')
+        IniWrite(dl.size, meta, 'dl', 'Size')
+        IniWrite(dl.skipped, meta, 'dl', 'Skipped')
+        IniWrite(dl.backup, meta, 'dl', 'Backup')
+    }
+
+    return 0
+}
+
+/* 把响应体写成文件。返回 {file, name, size, skipped, backup}
+   —— 文件很小（配置文件、图标、脚本），所以一次性进内存，不做分片/断点。 */
+WhSaveToFile(req, dir, given, onExists, doBackup, url) {
+    name := WhSaltName(given != '' ? given : WhPickName(req, url))
+    if (dir = '')
+        dir := EnvGet('USERPROFILE') '\Downloads'
+    try DirCreate(dir)                      ; 顺带创建多级目录
+    if !DirExist(dir)
+        throw Error('保存目录不可用：' dir)
+
+    final := RTrim(dir, '\/') '\' name
+    res := { file: final, name: name, size: 0, skipped: 0, backup: '' }
+
+    if FileExist(final) {
+        if (onExists != 'overwrite') {       ; 默认跳过：最保守的语义
+            res.skipped := 1
+            res.size := FileGetSize(final)
+            return res
+        }
+        if (doBackup) {
+            bakPath := final '.bak'
+            try FileDelete(bakPath)
+            try {
+                FileCopy(final, bakPath, 1)
+                res.backup := bakPath
+            }
+        }
+    }
+
+    ; 先写 .part 再改名：中途失败不会留下一个"看起来完整"的半截文件
+    tmp := final '.part'
+    try FileDelete(tmp)
+
+    st := ComObject('ADODB.Stream')          ; ADODB 是最省事的二进制写盘方式
+    st.Type := 1                             ; adTypeBinary（1 = 二进制，默认是文本）
+    st.Open()
+    try {
+        ; ResponseBody 是 SafeArray(VT_UI1)，ADODB 能直接吃。
+        ; 千万别用 ResponseText：那会按字符集解码，图片/压缩包当场废掉
+        st.Write(req.ResponseBody)
+        st.SaveToFile(tmp, 2)                ; 2 = adSaveCreateOverWrite
+        st.Close()
+    } catch as e {
+        try st.Close()
+        try FileDelete(tmp)
+        throw Error('写入文件失败：' CleanComError(e.Message))
+    }
+
+    try FileMove(tmp, final, 1)
+    catch {
+        try FileDelete(tmp)
+        throw Error('保存失败：目标被占用或没有权限（' final '）')
+    }
+
+    res.size := FileGetSize(final)
+    return res
+}
+
+/* 文件名优先级：Content-Disposition > URL 最后一段（curl -O 的行为） */
+WhPickName(req, url) {
+    cd := ''
+    try cd := req.GetResponseHeader('Content-Disposition')
+    cd := Trim(cd == '' ? '' : cd)
+
+    if (cd != '') {
+        ; RFC 5987 的 filename*=UTF-8''%E4%B8%AD.txt 优先，浏览器/服务端都这么排
+        if RegExMatch(cd, "i)filename\*\s*=\s*([^;]+)", &m) {
+            v := Trim(m[1], ' "')
+            if RegExMatch(v, "^[^']*'[^']*'(.*)$", &pfx)
+                v := pfx[1]
+            v := WhUrlDecode(v)
+            if (v != '')
+                return v
+        }
+        if RegExMatch(cd, 'i)filename\s*=\s*("([^"]*)"|([^;]+))', &m) {
+            v := m[2] != '' ? m[2] : Trim(m[3], ' ')
+            v := WhUrlDecode(v)
+            if (v != '')
+                return v
+        }
+    }
+
+    u := url
+    if (p := InStr(u, '#'))
+        u := SubStr(u, 1, p - 1)
+    if (p := InStr(u, '?'))
+        u := SubStr(u, 1, p - 1)
+    seg := ''
+    for part in StrSplit(u, '/')
+        seg := part
+    seg := WhUrlDecode(seg)
+    return (seg != '') ? seg : 'download.bin'
+}
+
+/* 文件名里不能出现的字符一律换掉 —— 远端可以返回任意字符串，
+   带 : / \ 的名字会被当成路径写到别的地方去 */
+WhSaltName(n) {
+    n := RegExReplace(n, '[\\/:*?"<>|\x00-\x1f]', '_')
+    n := Trim(n, ' .')
+    if (n = '' || n = '.' || n = '..')
+        n := 'download.bin'
+    return n
+}
+
+/* %XX 解码（按 UTF-8 解释）。不做 + → 空格：路径里 + 就是加号本身 */
+WhUrlDecode(s) {
+    len := StrLen(s)
+    if !len
+        return ''
+    buf := Buffer(len * 4 + 8, 0)
+    n := 0, i := 1
+    while (i <= len) {
+        c := SubStr(s, i, 1)
+        if (c = '%' && i + 2 <= len && RegExMatch(SubStr(s, i + 1, 2), '^[0-9a-fA-F]{2}$')) {
+            NumPut('UChar', Integer('0x' SubStr(s, i + 1, 2)), buf, n)
+            n += 1, i += 3
+            continue
+        }
+        b := StrPut(c, 'UTF-8')
+        tmp := Buffer(b, 0)
+        StrPut(c, tmp, 'UTF-8')
+        DllCall('RtlMoveMemory', 'ptr', buf.Ptr + n, 'ptr', tmp.Ptr, 'uptr', b - 1)
+        n += b - 1
+        i += 1
+    }
+    return n ? StrGet(buf, n, 'UTF-8') : ''
+}
+
+WhIntOr(s, def) {
+    s := Trim(s)
+    return IsNumber(s) ? Integer(s) : def
 }

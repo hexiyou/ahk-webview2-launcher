@@ -1,5 +1,6 @@
 /* ============================================================
-   请求头动态值实测：{{#ts}} {{#uuid}} {{#nonce:N}} {{#sha256:…}} {{#hmac:名:…}}
+   请求头动态值实测：{{#ts}} {{#uuid}} {{#nonce:N}} {{#env:NAME}}
+                      {{#md5|sha1|sha256|sha384|sha512}} {{#base64[url]}} {{#hmac[-算法]}}
 
    这些函数只存在于 AHK 侧，前端跑不到，所以不能像 app.js 那样直接 require。
    做法与 out-check.js 一致：从 launcher.ahk 里把函数体抽出来拼成一个探针跑，
@@ -34,7 +35,8 @@ function build() {
   const keys = /global SIG_KEYS := Map\([\s\S]*?\n\)/.exec(src);
   if (!keys) throw new Error('找不到 SIG_KEYS 定义');
 
-  const fns = ['HdrExpand', 'HdrEval', 'HdrInline', 'UuidV4', 'RandAlnum', 'HashHex']
+  const fns = ['HdrExpand', 'HdrEval', 'HdrInline', 'HdrEnv', 'HashAlgo', 'HdrLine'
+    , 'UuidV4', 'RandAlnum', 'HashHex', 'B64Encode']
     .map(n => extractFn(src, n)).join('\n\n');
 
   const driver = `
@@ -78,6 +80,29 @@ Log('badhmac=' TryEval(() => HdrExpand('{{#hmac:noColonAtAll}}')))
 Log('whole=' HdrExpand('Authorization: Bearer {{#hmac:demo:{ts}}}'))
 Log('case=' HdrExpand('{{#TS}}'))
 Log('nospaced=' HdrExpand('{{#ts}}{{#ts}}'))
+
+EnvSet('QL_HDR_ENV', 'hello-env')
+EnvSet('QL_HDR_NL', 'a' Chr(13) Chr(10) 'b')
+Log('env=' HdrExpand('{{#env:QL_HDR_ENV}}'))
+Log('env_missing=' TryEval(() => HdrExpand('{{#env:QL_HDR_NOPE}}')))
+Log('env_noname=' TryEval(() => HdrExpand('{{#env:}}')))
+Log('line_ok=' HdrLine('X-Ok: {{#env:QL_HDR_ENV}}'))
+Log('line_crlf=' TryEval(() => HdrLine('X-Bad: {{#env:QL_HDR_NL}}')))
+Log('md5=' HdrExpand('{{#md5:abc}}'))
+Log('sha1=' HdrExpand('{{#sha1:abc}}'))
+Log('sha384=' HdrExpand('{{#sha384:abc}}'))
+Log('sha512=' HdrExpand('{{#sha512:abc}}'))
+Log('hmac_md5=' HdrExpand('{{#hmac-md5:demo:abc}}'))
+Log('hmac_sha1=' HdrExpand('{{#hmac-sha1:demo:abc}}'))
+Log('hmac_sha512=' HdrExpand('{{#hmac-sha512:demo:abc}}'))
+Log('b64=' HdrExpand('{{#base64:abc}}'))
+Log('b64_cn=' HdrExpand('{{#base64:中文}}'))
+Log('b64_empty=' HdrExpand('{{#base64:}}'))
+Log('b64url=' HdrExpand('{{#base64url:??>}}'))
+Log('b64url_pad=' HdrExpand('{{#base64url:ab}}'))
+Log('b64_ts=' HdrExpand('{{#base64:{ts}}}'))
+Log('b64_ts_v=' HdrExpand('{{#ts}}'))
+Log('sha3=' HdrExpand('{{#sha3:abc}}'))
 ExitApp(0)
 `;
 
@@ -153,6 +178,36 @@ function main() {
   check('不认识的密钥名报错', /^ERR:.*未知的签名密钥名/.test(kv.badkey || ''), kv.badkey);
   check('hmac 缺参数报错', /^ERR:.*hmac 少了参数/.test(kv.badhmac || ''), kv.badhmac);
   check('大写 {{#TS}} 不认识（不误伤）', kv.case === '{{#TS}}', kv.case);
+  check('不认识的算法原样保留', kv.sha3 === '{{#sha3:abc}}', kv.sha3);
+
+  console.log('\n== 环境变量 ==');
+  check('{{#env:NAME}} 取到环境变量', kv.env === 'hello-env', kv.env);
+  check('变量没定义时报错（不给空串）', /^ERR:.*没有定义/.test(kv.env_missing || ''), kv.env_missing);
+  check('env 没写变量名报错', /^ERR:.*少了变量名/.test(kv.env_noname || ''), kv.env_noname);
+  check('正常值原样进请求头', kv.line_ok === 'X-Ok: hello-env', kv.line_ok);
+  check('值里带 CRLF 时拒发（换行注入）', /^ERR:.*换行/.test(kv.line_crlf || ''), kv.line_crlf);
+
+  console.log('\n== 其它摘要算法 ==');
+  for (const [k, algo] of [['md5', 'md5'], ['sha1', 'sha1'], ['sha384', 'sha384'], ['sha512', 'sha512']]) {
+    const want = crypto.createHash(algo).update('abc').digest('hex');
+    check('{{#' + k + ':abc}} 与 crypto 一致', kv[k] === want, kv[k] + ' vs ' + want);
+  }
+  for (const [k, algo] of [['hmac_md5', 'md5'], ['hmac_sha1', 'sha1'], ['hmac_sha512', 'sha512']]) {
+    const want = crypto.createHmac(algo, SECRET).update('abc').digest('hex');
+    check('{{#' + k.replace('_', '-') + ':demo:abc}} 与 crypto 一致', kv[k] === want,
+      kv[k] + ' vs ' + want);
+  }
+
+  console.log('\n== Base64 ==');
+  check('{{#base64:abc}} = YWJj', kv.b64 === 'YWJj', kv.b64);
+  check('中文按 UTF-8 编码', kv.b64_cn === Buffer.from('中文', 'utf8').toString('base64'), kv.b64_cn);
+  check('空串给空串（不报错）', kv.b64_empty === '', JSON.stringify(kv.b64_empty));
+  check('base64url 把 + 换成 -', kv.b64url === 'Pz8-', kv.b64url);
+  check('base64url 去掉补位 =', kv.b64url_pad === 'YWI', kv.b64url_pad);
+  const b64ts = Number((kv.b64_ts_v || '').trim());
+  check('{{#base64:{ts}}} 里层先展开', [-2, -1, 0, 1, 2].map(d =>
+    Buffer.from(String(b64ts + d), 'utf8').toString('base64')).includes(kv.b64_ts),
+    kv.b64_ts + ' vs ts=' + b64ts);
 
   console.log('\n' + (fails ? '请求头动态值：失败 ' + fails + ' 项' : '请求头动态值：全部通过'));
   process.exit(fails ? 1 : 0);

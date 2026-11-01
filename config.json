@@ -394,7 +394,7 @@
     {
       "id": "http-signed",
       "name": "示例：带签名的 webhook",
-      "subtitle": "请求头里的 {{#ts}} / {{#nonce}} / {{#hmac:…}} 由 AHK 在发送前展开",
+      "subtitle": "请求头里的 {{#ts}} / {{#env:…}} / {{#base64:…}} / {{#hmac:…}} 由 AHK 在发送前展开",
       "keywords": [
         "签名",
         "sign",
@@ -410,7 +410,9 @@
         "X-Timestamp: {{#ts}}",
         "X-Nonce: {{#nonce:16}}",
         "X-Signature: {{#hmac:demo:{ts}}}",
-        "X-Trace: {{#uuid}}"
+        "X-Trace: {{#uuid}}",
+        "X-Client: {{#env:COMPUTERNAME}}",
+        "X-Auth: Basic {{#base64:demo-user:demo-pass}}"
       ],
       "timeout": 15,
       "pinned": false,

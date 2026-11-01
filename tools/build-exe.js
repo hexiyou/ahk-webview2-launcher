@@ -97,14 +97,17 @@ function main() {
   /* ---- 组装运行目录 ----
      ui 必须外置（改界面不用重编译）；lib 只要 WebView2Loader.dll
      （WebView2.ahk / ComVar.ahk / Promise.ahk 已经编进 exe 了）。
-     runtime 解释器是为了 webhook / download / ahk 类型 —— 见 AhkInterp()。 */
+     runtime 解释器现在只有 "ahk" 类型条目还用它 —— webhook / download 走
+     主脚本自己的 --webhook 分支，没有 runtime 也能跑（见 RunWebhook()）。 */
   copyDir(path.join(ROOT, 'ui'), path.join(OUT, 'ui'));
   fs.mkdirSync(path.join(OUT, 'lib'), { recursive: true });
   fs.copyFileSync(path.join(ROOT, 'lib', 'WebView2Loader.dll'),
     path.join(OUT, 'lib', 'WebView2Loader.dll'));
   fs.mkdirSync(path.join(OUT, 'runtime'), { recursive: true });
   fs.copyFileSync(BASE, path.join(OUT, 'runtime', 'AutoHotkey64.exe'));
-  fs.copyFileSync(path.join(ROOT, 'webhook.ahk'), path.join(OUT, 'webhook.ahk'));
+  /* 老版本 dist 里可能有这两个残留，清掉免得让人以为还在用 */
+  for (const f of ['webhook.ahk'])
+    try { fs.unlinkSync(path.join(OUT, f)); } catch (e) {}
   /* 两个入口脚本：它们会自己判断「同目录有没有 QuickLaunch.exe」 */
   for (const f of ['ql.cmd', 'run.bat'])
     fs.copyFileSync(path.join(ROOT, f), path.join(OUT, f));
