@@ -30,7 +30,10 @@ function extractFn(src, name) {
 }
 
 function build() {
-  const src = fs.readFileSync(path.join(ROOT, 'launcher.ahk'), 'utf8');
+  /* 统一成 LF 再抽取：仓库里 core.autocrlf=true，检出到工作区就是 CRLF，
+     而下面找"行首顶格的 }"用的是 '\n}\n' —— 遇上 \r\n 会一个都找不到，
+     报「HdrExpand 没有闭合」，看着像源码坏了，其实只是行尾。 */
+  const src = fs.readFileSync(path.join(ROOT, 'launcher.ahk'), 'utf8').replace(/\r\n/g, '\n');
 
   const keys = /global SIG_KEYS := Map\([\s\S]*?\n\)/.exec(src);
   if (!keys) throw new Error('找不到 SIG_KEYS 定义');
