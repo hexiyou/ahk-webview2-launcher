@@ -158,9 +158,13 @@ wv2-launcher/
 │  ├─ cli-check.js       命令行专项实测：真进程跑退出码/stdout/单实例/窗口可见性/停用条目/模板（60 项）
 │  ├─ out-check.js       控制台输出实测：AllocConsole 造真控制台，写进去再读回来比对
 │  ├─ out-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
-│  └─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，验证触发/日志/不弹窗（22 项）
+│  ├─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，验证触发/日志/不弹窗（22 项）
+│  ├─ hdr-check.js       请求头动态值：抽出 AHK 函数单跑，用 crypto 对照 HMAC/SHA-256（22 项）
+│  ├─ hdr-e2e.js         请求头动态值端到端：本地回显服务看真实收到的头（加 --exe 测编译版）
+│  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
+├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
-└─ run.bat               启动（= 唤醒已有实例）
+└─ run.bat               启动：有 QuickLaunch.exe 就起它，否则起 launcher.ahk
 ```
 
 > 用例不是另写一份实现：它从 `ui/app.js` 里**抽取真实函数体**再跑，
@@ -183,6 +187,9 @@ wv2-launcher/
 > node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用条目/模板（60 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log）
+> node tools/hdr-check.js      # 请求头动态值：{{#ts}}/{{#nonce}}/{{#sha256}}/{{#hmac}} 与 crypto 对照（22 项）
+> node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
+> node tools/build-exe.js      # 编译成 dist\QuickLaunch.exe（需要 Ahk2Exe，见「九」）
 > ```
 
 ---
@@ -516,6 +523,62 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 - 也可以**命名填**：`查 IP 归属地 lang=en`（含 `=` 即视为命名），用来跳过前面的变量
 - 必填项没填 → 不发请求，预览行变红并说明缺哪个
 - `ip` 留空时 `target` 变成 `http://ip-api.com/json/` —— 这正是 ip-api「查本机」的语义
+
+#### 请求头里的动态值（`{{#ts}}` / `{{#hmac:…}}`）
+
+上面的 `{{name}}` 是「你自己填进去的值」。还有一类值**每次请求都不一样**，而且**不该写在 config.json 里**
+（比如签名密钥）—— 这类由 AHK 在发送前展开。写法是 `{{#函数名:参数}}`，那个 `#` 是关键。
+
+| 写法 | 结果 |
+|---|---|
+| `{{#ts}}` | Unix 秒（10 位） |
+| `{{#tsms}}` | Unix 毫秒（13 位） |
+| `{{#uuid}}` | UUID v4 |
+| `{{#nonce:16}}` | 16 位随机小写字母数字（默认 16，上限 128） |
+| `{{#sha256:文本}}` | SHA-256，十六进制小写 |
+| `{{#hmac:密钥名:待签内容}}` | HMAC-SHA256，十六进制小写；密钥取自 `launcher.ahk` 的 `SIG_KEYS` |
+
+待签内容里可以用**单花括号**引用别的动态值，里层先展开、外层拿结果去算：
+
+```json
+"headers": [
+  "X-Timestamp: {{#ts}}",
+  "X-Nonce: {{#nonce:16}}",
+  "X-Signature: {{#hmac:demo:{ts}}}",
+  "X-Trace: {{#uuid}}"
+]
+```
+
+密钥只写在 `launcher.ahk` 顶部：
+
+```ahk
+global SIG_KEYS := Map(
+    'demo', 'ql-demo-2026-secret'
+)
+```
+
+于是 config.json 里只有**名字**，明文密钥不落配置文件；编译成 exe 之后连 `SIG_KEYS` 都看不到
+（见「[九、编译成 exe](#九编译成-exe可选)」）。
+
+**为什么要有 `#`**（这条是踩出来的）：一开始写成 `{{ts}}`，它和前端的参数变量长得一模一样 ——
+条目一旦声明了 `params`，前端就会报「`{{ts}}` 没有在 params 里声明」直接拒绝执行；
+就算不报错也会被替换成空串。`#` 不在变量名的字符类 `[\w.-]` 里，前端从头到尾不认它，
+原样交给 AHK 就行，不需要任何特殊处理。
+
+同理，嵌套也不能写成 `{{#hmac:demo:{{#ts}}}}` —— 内层收尾紧跟外层收尾会凑出 `}}}}`，
+那是前端「输出字面 `}}`」的逃生口（见「模板变量」一节），会被吃成 `}}`，签名占位符少两个括号、
+整条失效。单花括号两头都不碰，所以用它。
+
+五条行为约定：
+
+- **认不出来的一律原样保留**：`{{#foo:bar}}`、`{{#TS}}`（大小写敏感）都会一字不改地发出去，
+  老配置里真写了这种字面量不会被误伤；
+- **密钥名写错就拒发**：`{{#hmac:nope:abc}}` → 面板直接报「未知的签名密钥名」，不会带着错签名发出去；
+  同理 `{{#hmac:名字}}`（少了待签内容）也报错；
+- **只展开请求头**：`target` / `body` 里的 `{{#ts}}` 不动，那里仍然只认 `params` 变量；
+- 待签内容里**不能有字面 `{}`**，单花括号只认 `{ts}` `{tsms}` `{uuid}` `{nonce:N}` 这四种，
+  其余原样保留。要签 JSON 就把 JSON 拼进 `body` 模板；
+- 单花括号**不能再套 `hmac`**（防止自己签自己），但可以套两个不同的：`{ts}{nonce:8}`。
 
 带请求体又没指定 `Content-Type` 时，默认加 `application/json; charset=utf-8`。
 
@@ -1099,6 +1162,30 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     另外，被 `Cancel` 掉的那次导航**也会走到 `NavigationCompleted`**（`IsSuccess=false`），
     必须用 `dropNav` 标记跳过 —— 否则每次拖文件都会弹一个模态错误框，消息循环当场冻住。
 
+52. **⭐ 编译后 `A_AhkPath` 指向 exe 自己，不再是解释器**：三处 `Run('"' A_AhkPath '" …webhook.ahk…')`
+    在编译版里都变成"再起一个自己"，参数全进了 `A_Args`，目标脚本一次都不会执行。
+    症状是 webhook / download 统一报「请求进程异常退出」，看着像 webhook.ahk 语法坏了。
+    实测验证方式：编一个只有 `FileAppend` 的 `target.ahk`，再用编译版
+    `exe.exe /ErrorStdOut target.ahk spec.ini` 去拉它 —— `target-ran.txt` 根本不会出现，
+    而 `A_Args` 里躺着 `['/ErrorStdOut', 'target.ahk', 'spec.ini']`。
+    修法见 `AhkInterp()`：编译版走随包解释器，脚本版原样返回 `A_AhkPath`。
+
+53. **⭐ bcrypt 的属性名是 `HashDigestLength`，不是 `HashLength`**：写错不会报错，
+    `BCryptGetProperty` 返回 `STATUS_NOT_SUPPORTED`，而输出缓冲区**保持上一次的旧值** ——
+    于是 `hashLen` 读成了 326（对象长度），接着 `BCryptFinishHash` 报 `0xC000000D 参数无效`。
+    整条链看起来像"加密算错了"，实际只是名字写错。
+    **教训**：连 `DllCall` 的返回值一起判断，别只看缓冲区里的数。
+
+54. **`FileDelete` / `FileMove` 在文件不存在时会抛异常**：测试探针里习惯性写
+    `FileDelete(LOG)` 清场，文件恰好不在就抛 `Error`，而探针没有 `OnError` →
+    AHK 弹出**模态**错误框 → 进程挂住、`spawnSync` 一路超时，报出来的是"探针没产出日志"，
+    跟真正的原因差着十万八千里。清理语句一律 `try FileDelete(...)`。
+
+55. **批处理 `if (...)` 块里的 `%ERRORLEVEL%` 是块开始前的旧值**：`ql.cmd` 里如果写成
+    `if exist QuickLaunch.exe ( … & exit /b %ERRORLEVEL% )`，退出码永远是 0 ——
+    cmd 在解析整个块时就把变量展开了。要么 `goto` 跳出去再 `exit /b`，要么开
+    `enabledelayedexpansion` 用 `!ERRORLEVEL!`。现在用的是 `goto`。
+
 ---
 
 ## 六、命令行（`ql`）
@@ -1351,9 +1438,81 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 - 没有「立即执行一次」「暂停到明天」这类手动操作，也不统计成功率；要停某条任务就改
   `enabled: false` 再重新加载配置。
 
-## 九、可以继续加的东西
+## 九、编译成 exe（可选）
 
-- `{{ENV}}` 占位符：把密钥放进环境变量，而不是写在 config.json 里
+脚本版和编译版**可以同时存在**：命令行参数、界面行为、`config.json` 完全一致，选哪个只影响分发方式。
+
+| | 脚本版（`launcher.ahk`） | 编译版（`QuickLaunch.exe`） |
+|---|---|---|
+| 改 AHK 代码 | 存盘重启即可 | 要重新编译 |
+| 改 `ui\` 里的 HTML/JS/CSS | 重载配置或重启 | **一样**，不用重编译 |
+| 需要 `runtime\AutoHotkey64.exe` | 要（它就是解释器） | 只有 webhook / download / ahk 类型要 |
+| 源码 / 密钥是否可见 | 是 | 否（能解包，但不再是明文文件） |
+
+### 编译
+
+```bat
+node tools/build-exe.js
+```
+
+调 Ahk2Exe 把 `launcher.ahk` 编成 `dist\QuickLaunch.exe`（约 1.4 MB），再把运行时要的外部文件
+一起放进 `dist\`，得到一个能直接双击的目录。Ahk2Exe 需要自己装：
+
+- 从 <https://github.com/AutoHotkey/Ahk2Exe/releases> 下载解压，拿 `Ahk2Exe.exe`
+- 放到 `tools\Ahk2Exe.exe`，或设环境变量 `AHK2EXE` 指向它
+
+（`build-exe.js` 用的是项目自带的 `runtime\AutoHotkey64.exe` 当 base，版本自然对齐。）
+
+### dist 里有什么
+
+| 文件 | 必需 | 说明 |
+|---|---|---|
+| `QuickLaunch.exe` | ✅ | 编译产物 |
+| `config.json` / `launcher.ini` | ✅ | 重编译**不会覆盖**已存在的，别怕丢配置 |
+| `ui\` | ✅ | 界面；改界面不用重编译 |
+| `lib\WebView2Loader.dll` | ✅ | WebView2 加载器 |
+| `runtime\AutoHotkey64.exe` + `webhook.ahk` | 视情况 | webhook / download / ahk 类型要靠它跑 |
+| `ql.cmd` / `run.bat` | 可选 | 自己会判断同目录有没有 exe |
+
+`lib\WebView2\WebView2.ahk`、`ComVar.ahk`、`Promise.ahk` 已经被 `#Include` 编进 exe，**不用带**；
+`pinyin.txt`（985 KB）运行时不读，也不用带。
+
+### webhook 为什么非得带着解释器
+
+编译后 `A_AhkPath` 指向 **exe 自己**，不再是解释器。而代码有三处拿它去跑别的 `.ahk`：
+
+```ahk
+Run('"' A_AhkPath '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"')
+```
+
+编译版执行这行等于 `QuickLaunch.exe /ErrorStdOut webhook.ahk spec.ini` —— 它不认
+「跑某个脚本」这种参数（全进了自己的 `A_Args`），目标脚本一次都不会执行。实测症状：
+webhook / download 全部报「请求进程异常退出」。
+
+修法是 `AhkInterp()`：编译版优先返回 `SCRIPT_DIR\runtime\AutoHotkey64.exe`，脚本版原样返回
+`A_AhkPath`。想彻底不带解释器，可以把 `webhook.ahk` 合并进主脚本做成 `--webhook <spec>` 分支 ——
+能省 1.25 MB，但要动联网那条主路径，目前没做。
+
+### 单实例跟着目录走
+
+`INST_KEY = HashText(SCRIPT_DIR)`，所以 exe 和 .ahk 放**同一目录**会共用一把锁（只能跑一个）；
+放**不同目录**则完全独立，各自的命令行也只连自己的实例。
+
+### 三个必须知道的限制
+
+1. **GUI 子系统**：和 `AutoHotkey64.exe` 一样。所以 `ql list` 在真 cmd 窗口里，提示符会抢在输出
+   前面（输出不丢，只是位置难看），退出码也传不回来。这**不是编译引入的** —— 脚本版一模一样。
+   要改只能编成 console 子系统，代价是双击弹黑窗。
+2. **不是真机器码**：Ahk2Exe 做的是「解释器 + 压缩脚本」的打包，`Ahk2Exe.exe /restore` 能把源码
+   提出来。对「别让人随手翻配置里的密钥」够用，对「防逆向」不够。
+3. **杀软误报**：AHK 编译的 exe 有一定概率被误报，加白名单即可。
+
+图标和版本信息可以用 Ahk2Exe 的 `/icon`、`/set-version` 补，`build-exe.js` 现在没传。
+
+## 十、可以继续加的东西
+
+- 动态值再来几个：`{{#env:NAME}}`（环境变量）、`{{#md5:…}}`、`{{#base64:…}}`；
+  以及把 `webhook.ahk` 并进主脚本做成 `--webhook <spec>` 分支，这样编译版可以不依赖 runtime
 - `download`：进度条与中途取消、断点续传（`Range` + `.part` 续写）、`Content-Length`/哈希校验
 - `download`：多文件批量下载（现在一个条目只下一个文件）
 - webhook：请求历史、把常用请求存成条目

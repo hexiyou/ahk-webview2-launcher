@@ -380,6 +380,11 @@
      PowerShell 脚本块），JSON 里直接写四个花括号，不用跟反斜杠搏斗。 */
   const TPL_RE = /\{\{\{\{|\}\}\}\}|\{\{\s*([\w.-]+)\s*\}\}/g;
 
+  /* 请求头里的动态值写成 {{#ts}} / {{#hmac:demo:{{#ts}}}}，由 AHK 在发送前展开
+     （launcher.ahk 的 HdrExpand）。这里的 TPL_RE 只认 [\w.-]，# 不在里面，
+     所以这类占位符前端从头到尾都不认 —— 既不会被替换成空串，也不会被
+     templateIssues 当成"引用了没声明的变量"。 */
+
   function fillTemplate(v, args, opts) {
     if (typeof v === 'string')
       return v.replace(TPL_RE, (m, k, off, whole) => {

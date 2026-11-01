@@ -35,6 +35,13 @@ global CLI_DIR    := A_Temp '\quicklaunch-cli'    ; 客户端的回执文件放�
 global SCHED_LOG  := SCRIPT_DIR '\sched.log'      ; 定时任务的执行记录（一行一条，主界面没有入口，靠它查）
 global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
 
+; 请求头动态值的签名密钥：**只存在于这里**。
+; config.json 里写 {{#hmac:demo:...}} 引用名字，明文密钥不落配置文件；
+; 编译成 exe 后连这张表也看不见（只剩 exe 里的压缩脚本）。
+global SIG_KEYS := Map(
+    'demo', 'ql-demo-2026-secret'
+)
+
 ; 单实例 / 进程间通信的标识：跟着脚本目录走，同一份程序的多个副本互不干扰
 global INST_KEY   := HashText(StrLower(SCRIPT_DIR))
 global MUTEX_NAME := 'Local\QuickLaunch-' INST_KEY
@@ -872,7 +879,7 @@ Launch(kind, target, args, workdir, argv := [], argvRaw := '') {
             }
             Run(A_ComSpec ' /s /k "' line '"', workdir)
         case 'ahk':
-            Run('"' A_AhkPath '" "' target '"' (args != '' ? ' ' args : '') extra, workdir)
+            Run('"' AhkInterp() '" "' target '"' (args != '' ? ' ' args : '') extra, workdir)
         case 'webhook':
             throw Error('webhook 类型由前端直接发请求，不应走到 Launch')
         default:                                  ; app
@@ -943,10 +950,19 @@ DoWebhook(raw) {
     for f in ['meta.ini', 'body.txt', 'spec.ini', 'h.txt', 'b.txt']
         try FileDelete(dir '\' f)
 
-    ; 请求头由前端给成 "Name: Value" 的字符串数组 —— 避免在这里解析嵌套 JSON
+    ; 请求头由前端给成 "Name: Value" 的字符串数组 —— 避免在这里解析嵌套 JSON。
+    ; 每行过一次 HdrExpand：{{#ts}} / {{#hmac:...}} 这类动态值只在这里展开，
+    ; 展开失败（比如密钥名写错）直接拒发 —— 带着错签名发出去比不发更糟。
     hs := ''
-    for h in JsonStrArray(raw, 'headers')
-        hs .= h '`n'
+    try {
+        for h in JsonStrArray(raw, 'headers')
+            hs .= HdrExpand(h) '`n'
+    } catch as e {
+        try DirDelete(dir, true)
+        JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
+            ',"truncated":0,"error":' JsonQuote('请求头展开失败：' e.Message) ',"body":""}')
+        return
+    }
     try FileAppend(hs, dir '\h.txt', 'UTF-8-RAW')
 
     body := JsonStr(raw, 'body')
@@ -962,7 +978,7 @@ DoWebhook(raw) {
 
     pid := 0
     try {
-        Run('"' A_AhkPath '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
+        Run('"' AhkInterp() '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
             , SCRIPT_DIR, 'Hide', &pid)
     } catch as e {
         JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
@@ -1160,9 +1176,15 @@ StartDownload(cfg) {
 
     ; download 只发 GET、不带请求体；请求头照传（内网下载常要带 token）
     hs := ''
-    if cfg.HasOwnProp('headers')
-        for h in cfg.headers
-            hs .= h '`n'
+    try {
+        if cfg.HasOwnProp('headers')
+            for h in cfg.headers
+                hs .= HdrExpand(h) '`n'
+    } catch as e {
+        try DirDelete(dir, true)
+        SendDownloadError(id, cfg.purpose, '请求头展开失败：' e.Message)
+        return
+    }
     try FileAppend(hs, dir '\h.txt', 'UTF-8-RAW')
     try FileAppend('', dir '\b.txt', 'UTF-8-RAW')
 
@@ -1181,7 +1203,7 @@ StartDownload(cfg) {
 
     pid := 0
     try {
-        Run('"' A_AhkPath '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
+        Run('"' AhkInterp() '" /ErrorStdOut "' SCRIPT_DIR '\webhook.ahk" "' spec '"'
             , SCRIPT_DIR, 'Hide', &pid)
     } catch as e {
         SendDownloadError(id, cfg.purpose, '无法启动下载进程：' e.Message)
@@ -1919,6 +1941,201 @@ WriteReply(path, json) {
         f.Close()
         FileMove(tmp, path, 1)
     }
+}
+
+; ============================================================================
+;  请求头里的动态值：{{#函数名:参数}}
+;
+;  为什么放在 AHK 而不是前端：签名密钥与算法要能「编译进 exe」。
+;  config.json 只留 {{#hmac:demo:{ts}}} 这样的占位符，明文和算法都不落配置文件。
+;
+;  为什么要那个 #：前端的模板变量 TPL_RE 是 /\{\{\s*([\w.-]+)\s*\}\}/。
+;  一开始写成 {{ts}}，结果它和前端的"参数变量"长得一模一样 ——
+;  条目一旦声明了 params，前端就会把 {{ts}} 当成"引用了没声明的变量"，
+;  直接拒绝执行；就算不报错也会被替换成空串。加个 # 之后，
+;  # 不在 [\w.-] 里，前端从头到尾都不认它，原样送到这里（不需要任何遮罩代码）。
+;
+;  支持：
+;    {{#ts}}                    Unix 秒
+;    {{#tsms}}                  Unix 毫秒
+;    {{#uuid}}                  UUID v4
+;    {{#nonce:16}}              N 位随机小写字母数字（默认 16，上限 128）
+;    {{#sha256:文本}}           十六进制 SHA-256
+;    {{#hmac:密钥名:待签内容}}   十六进制 HMAC-SHA256，密钥取自 SIG_KEYS
+;
+;  待签内容里可以用**单花括号**引用另一个动态值：{{#hmac:demo:{ts}}}
+;  —— 为什么不是 {{#hmac:demo:{{#ts}}}}：内层收尾紧跟外层收尾会凑出 }}}}，
+;  那是前端「输出字面 }}」的逃生口（见 ui/app.js 的 TPL_RE），会被吃成 }}，
+;  于是签名占位符少两个括号、整条失效。单花括号两头都不碰，最省事。
+;  单花括号只认 ts / tsms / uuid / nonce，不支持再套 hmac。
+; ============================================================================
+HdrExpand(line) {
+    if !InStr(line, '{{#')
+        return line
+    Loop 4 {                              ; 里层先展开，外层用结果再算一次
+        out := '', pos := 1, hit := false
+        m := ''
+        /* 内层允许一对单花括号：{{#hmac:demo:{ts}}} —— 但不能有第二层 */
+        while RegExMatch(line, '\{\{#((?:[^{}]|\{[^{}]*\})*)\}\}', &m, pos) {
+            r := HdrEval(m[1])
+            out .= SubStr(line, pos, m.Pos - pos) . (r.ok ? r.val : m[0])
+            if r.ok
+                hit := true
+            pos := m.Pos + m.Len
+        }
+        out .= SubStr(line, pos)
+        if (!hit || !InStr(out, '{{#'))
+            return out
+        line := out
+    }
+    return line
+}
+
+HdrEval(expr) {
+    global SIG_KEYS
+    name := expr, rest := ''
+    p := InStr(expr, ':')
+    if p {
+        name := SubStr(expr, 1, p - 1)
+        rest := SubStr(expr, p + 1)
+    }
+    name := Trim(name, ' ' . "`t")
+
+    switch name {
+        case 'ts':
+            return {ok: true, val: String(DateDiff(A_NowUTC, '19700101000000', 'Seconds'))}
+        case 'tsms':
+            return {ok: true, val: String(DateDiff(A_NowUTC, '19700101000000', 'Seconds') * 1000 + A_MSec)}
+        case 'uuid':
+            return {ok: true, val: UuidV4()}
+        case 'nonce':
+            n := (Trim(rest, ' ' . "`t") = '') ? 16 : Integer(Trim(rest, ' ' . "`t"))
+            if (n < 1 || n > 128)
+                n := 16
+            return {ok: true, val: RandAlnum(n)}
+        case 'sha256':
+            return {ok: true, val: HashHex(rest)}
+        case 'hmac':
+            ; hmac:密钥名:待签内容  —— 只按第一个冒号切，内容里的冒号照旧
+            q := InStr(rest, ':')
+            if !q
+                throw Error('hmac 少了参数，写法是 {{hmac:密钥名:待签内容}}')
+            kname := Trim(SubStr(rest, 1, q - 1), ' ' . "`t")
+            if !SIG_KEYS.Has(kname)
+                throw Error('未知的签名密钥名「' kname '」——在 launcher.ahk 的 SIG_KEYS 里定义')
+            return {ok: true, val: HashHex(HdrInline(SubStr(rest, q + 1)), 'SHA256', SIG_KEYS[kname])}
+    }
+    return {ok: false, val: ''}          ; 不认识：原样留着
+}
+
+/* 待签内容里的单花括号占位：{ts} {tsms} {uuid} {nonce:8}
+   只认无副作用的这几个，不认 hmac（避免自己套自己）；不认识的整段原样留着。 */
+HdrInline(s) {
+    if !InStr(s, '{')
+        return s
+    out := '', pos := 1
+    m := ''
+    while RegExMatch(s, '\{([a-z][\w]*)(?::([^{}]*))?\}', &m, pos) {
+        name := m[1]
+        if (name = 'ts' || name = 'tsms' || name = 'uuid' || name = 'nonce') {
+            r := HdrEval(m[2] = '' ? name : name ':' m[2])
+            out .= SubStr(s, pos, m.Pos - pos) . (r.ok ? r.val : m[0])
+        } else {
+            out .= SubStr(s, pos, m.Pos - pos) . m[0]
+        }
+        pos := m.Pos + m.Len
+    }
+    return out . SubStr(s, pos)
+}
+
+UuidV4() {
+    static HEX := '0123456789abcdef'
+    s := ''
+    Loop 32
+        s .= SubStr(HEX, Random(1, 16), 1)
+    ; 版本位固定 4，变体位固定 8/9/a/b
+    s := SubStr(s, 1, 12) . '4' . SubStr(s, 14, 3) . SubStr('89ab', Random(1, 4), 1) . SubStr(s, 18)
+    return SubStr(s, 1, 8) '-' SubStr(s, 9, 4) '-' SubStr(s, 13, 4) '-' SubStr(s, 17, 4) '-' SubStr(s, 21, 12)
+}
+
+RandAlnum(n) {
+    static CS := 'abcdefghijklmnopqrstuvwxyz0123456789'
+    s := ''
+    Loop n
+        s .= SubStr(CS, Random(1, 36), 1)
+    return s
+}
+
+/* SHA-256 / HMAC-SHA256，走 Windows 自带的 bcrypt（不引第三方库）。
+   key 为空 = 普通摘要；非空 = HMAC（要带 BCRYPT_ALG_HANDLE_HMAC_FLAG）。 */
+HashHex(text, algo := 'SHA256', key := '') {
+    hAlg := 0, hHash := 0
+    flags := (key = '') ? 0 : 0x00000008
+    if DllCall('bcrypt\BCryptOpenAlgorithmProvider'
+        , 'ptr*', &hAlg, 'wstr', algo, 'ptr', 0, 'uint', flags, 'int')
+        throw Error('系统不支持摘要算法：' algo)
+    try {
+        szBuf := Buffer(4, 0), got := 0
+        DllCall('bcrypt\BCryptGetProperty', 'ptr', hAlg, 'wstr', 'ObjectLength'
+            , 'ptr', szBuf, 'uint', 4, 'uint*', &got, 'uint', 0, 'int')
+        objLen := NumGet(szBuf, 0, 'uint')
+        /* 属性名是 HashDigestLength。写成 HashLength 会返回 STATUS_NOT_SUPPORTED，
+           而 Buffer 保持上一次的旧值 —— 这里踩过：hashLen 变成 326（对象长度），
+           接着 BCryptFinishHash 报 0xC000000D「参数无效」，看着像加密失败，
+           实际只是名字写错。 */
+        DllCall('bcrypt\BCryptGetProperty', 'ptr', hAlg, 'wstr', 'HashDigestLength'
+            , 'ptr', szBuf, 'uint', 4, 'uint*', &got, 'uint', 0, 'int')
+        hashLen := NumGet(szBuf, 0, 'uint')
+        if (!objLen || !hashLen)
+            throw Error('取不到摘要长度：' algo)
+
+        dLen := StrPut(text, 'utf-8')
+        dBuf := Buffer(dLen, 0)
+        StrPut(text, dBuf, 'utf-8')
+
+        kBuf := 0, kLen := 0
+        if (key != '') {
+            kLen := StrPut(key, 'utf-8') - 1
+            kBuf := Buffer(kLen, 0)
+            StrPut(key, kBuf, 'utf-8')
+        }
+
+        objBuf := Buffer(objLen, 0)
+        if DllCall('bcrypt\BCryptCreateHash', 'ptr', hAlg, 'ptr*', &hHash
+            , 'ptr', objBuf, 'uint', objLen
+            , 'ptr', kBuf, 'uint', kLen, 'uint', 0, 'int')
+            throw Error('BCryptCreateHash 失败')
+        if DllCall('bcrypt\BCryptHashData', 'ptr', hHash, 'ptr', dBuf, 'uint', dLen - 1, 'uint', 0, 'int')
+            throw Error('BCryptHashData 失败')
+        outBuf := Buffer(hashLen, 0)
+        if DllCall('bcrypt\BCryptFinishHash', 'ptr', hHash, 'ptr', outBuf, 'uint', hashLen, 'uint', 0, 'int')
+            throw Error('BCryptFinishHash 失败')
+
+        hex := ''
+        Loop hashLen
+            hex .= Format('{:02x}', NumGet(outBuf, A_Index - 1, 'uchar'))
+        return hex
+    } finally {
+        if hHash
+            DllCall('bcrypt\BCryptDestroyHash', 'ptr', hHash, 'int')
+        if hAlg
+            DllCall('bcrypt\BCryptCloseAlgorithmProvider', 'ptr', hAlg, 'uint', 0, 'int')
+    }
+}
+
+AhkInterp() {
+    /* 「跑另一个 .ahk」时用的解释器路径。
+       脚本版就是 A_AhkPath；编译版的 A_AhkPath 指向 exe 自己，拿它当解释器
+       只会再起一个自己 —— 参数全进 A_Args，目标脚本一次都不会执行（实测过：
+       目标脚本的 FileAppend 从没落盘）。所以编译版优先用随包的 runtime 解释器，
+       找不到再退回 A_AhkPath：这样漏带 runtime 时是 webhook 报错，而不是静默跑飞。 */
+    global SCRIPT_DIR
+    if A_IsCompiled {
+        p := SCRIPT_DIR '\runtime\AutoHotkey64.exe'
+        if FileExist(p)
+            return p
+    }
+    return A_AhkPath
 }
 
 HashText(s) {

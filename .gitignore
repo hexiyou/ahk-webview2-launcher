@@ -32,6 +32,9 @@ pinyin.txt
 # ── AutoHotkey 官方帮助文档（2MB，非运行必需，需要时从官网取） ──
 runtime/AutoHotkey.chm
 
+# ── 编译产物（tools/build-exe.js 生成，含 1.4MB 的 exe，不入库） ──
+dist/
+
 # ── 系统与编辑器噪音 ──
 Thumbs.db
 desktop.ini

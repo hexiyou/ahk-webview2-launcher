@@ -154,5 +154,26 @@ console.log('— 含空格的取值自动补引号（只对 app / ahk 的 args�
   eq('cmd 不补（echo 会把引号打出来）', T.applyParams(cmd, '"a b"').item.target, 'echo a b');
 }
 
+console.log('— 动态值 {{#函数:参数}} 完全不进前端的模板逻辑');
+{
+  /* 这是这套语法为什么带 # 的原因：不加的话 {{ts}} 和参数变量长得一模一样，
+     条目一声明 params，前端就会报「{{ts}} 没有在 params 里声明」直接拒绝执行。 */
+  const it = {
+    type: 'webhook', target: 'http://x/',
+    headers: ['X-Sign: {{#hmac:demo:{ts}}', 'X-User: {{user}}'],
+    params: [{ name: 'user' }]
+  };
+  const w = T.applyParams(it, 'alice');
+  eq('动态值整段原样保留', w.item.headers[0], 'X-Sign: {{#hmac:demo:{ts}}');
+  eq('同一数组里的参数变量照旧替换', w.item.headers[1], 'X-User: alice');
+  eq('不被当成「没声明的变量」', Array.from(T.tplVars(it.headers)), ['user']);
+  eq('体检不报错', T.templateIssues(it).err.length, 0);
+
+  eq('无参的动态值也不进模板', T.tplVars(['X-T: {{#ts}}']).size, 0);
+  eq('不会被替换成空串', T.fillTemplate('X-T: {{#ts}}', { ts: 'wrong' }), 'X-T: {{#ts}}');
+  eq('普通变量没受影响', T.fillTemplate('a {{v}} b', { v: 'X' }), 'a X b');
+  eq('转义仍然有效', T.fillTemplate('{{{{v}}}}', { v: 'X' }), '{{v}}');
+}
+
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

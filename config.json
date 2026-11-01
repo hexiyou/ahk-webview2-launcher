@@ -392,6 +392,31 @@
       "accent": "#0ea5e9"
     },
     {
+      "id": "http-signed",
+      "name": "示例：带签名的 webhook",
+      "subtitle": "请求头里的 {{#ts}} / {{#nonce}} / {{#hmac:…}} 由 AHK 在发送前展开",
+      "keywords": [
+        "签名",
+        "sign",
+        "hmac",
+        "示例"
+      ],
+      "icon": "",
+      "type": "webhook",
+      "group": "net",
+      "target": "https://httpbin.org/anything",
+      "method": "GET",
+      "headers": [
+        "X-Timestamp: {{#ts}}",
+        "X-Nonce: {{#nonce:16}}",
+        "X-Signature: {{#hmac:demo:{ts}}}",
+        "X-Trace: {{#uuid}}"
+      ],
+      "timeout": 15,
+      "pinned": false,
+      "accent": "#8b5cf6"
+    },
+    {
       "id": "dl-demo",
       "name": "下载示例文件",
       "subtitle": "小文件下载 · 存到「下载」目录，同名文件跳过",
