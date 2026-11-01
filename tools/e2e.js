@@ -189,6 +189,25 @@ const PAGE_JS = String.raw`
         ' 状态=' + JSON.stringify(document.getElementById('rStatus').textContent) +
         ' 正文=' + JSON.stringify((document.getElementById('rPre').textContent || '').slice(0, 30)));
 
+    /* 拖文件进来：WebView2 的默认动作就是顶层导航到 file:///…，AHK 必须把它拦下、
+       把真实路径送回页面（见 launcher.ahk 的 OnNavStarting）。这里用 location.href
+       触发同一条导航管线 —— 若拦截失效，页面会被换成文件内容，下面这行日志就没了。 */
+    window.__applyConfig({
+      items: [{ id: 'tdrop', name: '测试拖入文件', type: 'app', keywords: ['tdrop'],
+        target: 'C:\\Windows\\System32\\notepad.exe', args: '{{file}}',
+        params: [{ name: 'file', type: 'path' }] }]
+    });
+    await wait(250);
+    setQ('测试拖入'); await wait(150);
+    const hrefBefore = location.href;
+    location.href = %%DROP_URL%%;
+    await wait(1400);
+    log('T20 拖入路径落进参数   -> 还在原页=' + (location.href === hrefBefore) +
+        ' 参数态=' + JSON.stringify(document.getElementById('subjName').textContent) +
+        ' 输入=' + JSON.stringify(q.value) +
+        ' 一致=' + (q.value === %%DROP_TEXT%%) +
+        ' 预览=' + JSON.stringify((document.getElementById('paramPreview').textContent || '').slice(0, 64)));
+
     await wait(900);                      /* 等 usage.json 落盘（写盘有 400ms 防抖） */
     log('DONE');
   } catch (e) {
@@ -244,6 +263,24 @@ function prepareUncIcon() {
   }
 }
 
+/* T20 要拖一个"真文件"进来：路径里刻意带空格和中文，用来验证
+   PathCreateFromUrlW 的百分号解码（%20 / UTF-8 多字节）没走歪 */
+const DROP_FILE = path.join(os.tmpdir(), 'ql 拖入 test.txt');
+/* encodeURI 保留盘符冒号和斜杠，把空格和中文转成 %XX —— 和资源管理器拖出来的一致 */
+const DROP_URL = 'file:///' + encodeURI(DROP_FILE.replace(/\\/g, '/'));
+/* 期望落进输入框的内容：含空格要自动补引号 */
+const DROP_TEXT = '"' + DROP_FILE + '"';
+
+function prepareDropFile() {
+  try {
+    fs.writeFileSync(DROP_FILE, 'e2e drop probe\n', 'utf8');
+    return true;
+  } catch (e) {
+    console.log('[提示] 准备拖入测试文件失败：' + e.message);
+    return false;
+  }
+}
+
 function build() {
   let src = fs.readFileSync(path.join(ROOT, 'launcher.ahk'), 'utf8');
 
@@ -264,12 +301,17 @@ function build() {
   src = src.replace(anchor, anchor + '\n\nSetTimer(E2E_Start, -1200)');
 
   fs.writeFileSync(GEN, src + AHK_TAIL, 'utf8');
-  fs.writeFileSync(JS_FILE, PAGE_JS, 'utf8');
+  fs.writeFileSync(JS_FILE,
+    /* 用函数式替换：路径里万一出现 $ 也不会被 String.replace 当成 $& 之类的记号 */
+    PAGE_JS.replace('%%DROP_URL%%', () => JSON.stringify(DROP_URL))
+           .replace('%%DROP_TEXT%%', () => JSON.stringify(DROP_TEXT)),
+    'utf8');
 }
 
 function main() {
   build();
   prepareUncIcon();
+  prepareDropFile();
   try { fs.unlinkSync(LOG); } catch (e) {}
 
   const r = spawnSync(AHK, ['/ErrorStdOut', '/force', GEN], {
@@ -290,7 +332,8 @@ function main() {
     /T17 拉取失败回包\s*-> 弹层已关=true/.test(log) &&
     /T18 空格认高亮行\s*-> .*一致=true 面板=true/.test(log) &&
     /T18b Tab 保住选中\s*-> .*一致=true/.test(log) &&
-    /T19 download 结果面板\s*-> 面板=true/.test(log);
+    /T19 download 结果面板\s*-> 面板=true/.test(log) &&
+    /T20 拖入路径落进参数\s*-> 还在原页=true.*一致=true/.test(log);
   console.log('\n' + (ok ? '端到端冒烟：通过' : '端到端冒烟：有异常，逐行看上面的输出'));
   process.exit(ok ? 0 : 1);
 }

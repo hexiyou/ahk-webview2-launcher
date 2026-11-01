@@ -47,6 +47,9 @@ global wv := 0
 global uiReady := false
 global lastNavOK := -1        ; 最近一次导航结果（-1 = 还没导航过）
 global lastNavErr := -1
+global dropNav := false       ; 上一次导航是被我们拦下的（拖文件进来），别当成加载失败
+global dropSeen := ''         ; 上一次转给页面的拖入 URI（同一次拖放别转两遍）
+global dropSeenAt := 0
 global ncDrag := false        ; WebView2 原生非客户区拖拽是否可用
 global httpJobs := Map()      ; 进行中的 webhook 请求：id -> {dir, pid, deadline}
 global ipcGui := 0            ; 收件箱窗口（接收命令行请求）
@@ -226,11 +229,14 @@ BuildUi(s) {
         wvc.IsVisible := 1
 
     wv.add_WebMessageReceived(OnWebMessage)
+    wv.add_NavigationStarting(OnNavStarting)
+    wv.add_NewWindowRequested(OnNewWindow)
     wv.add_NavigationCompleted(OnNavDone)
     wv.add_ProcessFailed(OnProcFailed)
 
     InjectBootstrap()
-    wv.Navigate('file:///' StrReplace(UI_PATH, '\', '/'))
+    ; 和 OnNavStarting 里放行用的那串保持完全一致（见那里的注释）
+    wv.Navigate(ToFileUrl(UI_PATH))
 
     ; 窗口显示后合成层可能还没跟上，补两次尺寸/可见性，收掉残留白屏
     SetTimer(Refill, -120)
@@ -251,8 +257,90 @@ Refill() {
     }
 }
 
+; ============================================================================
+;  拦住"拖进来的东西"
+;
+;  WebView2 的默认动作：把拖进窗口的文件当成一次**顶层导航**（file:///C:/…），
+;  也就是整个界面被换成那个文件的内容 —— 看上去像"程序用它打开了文件"。
+;  页面自己救不了：DataTransfer 里的 File 只有名字、没有路径（Chromium 的安全设计），
+;  所以只能在宿主侧拦：Cancel 掉这次导航，把 URI 交给页面自己去解路径。
+;
+;  为什么不在 AHK 里解：PathCreateFromUrlW 把 %E6%8B%96 解成 U+00E6 U+008B U+0096
+;  （一个字节一个字符），中文/多字节路径必然乱码 —— 实测踩过。页面有 `new URL()`
+;  + `decodeURIComponent`，解 URL 本来就该交给它。
+;
+;  这里刻意**保留** AllowExternalDrop = true（默认值）：置成 false 之后 Chromium
+;  会拒绝一切 OLE 拖放，连这个导航都不会发生，路径也就无从得到。
+; ============================================================================
+OnNavStarting(sender, args) {
+    global UI_PATH, dropNav
+    dropNav := false                       ; 每次新导航先复位，别让上一次的拦截影响判断
+    uri := ''
+    try uri := args.Uri
+    if (uri = '')
+        return
+
+    ; 自己的页面（首次加载 / 重载 / #锚点）放行。
+    ; 两道判据：整串相等（平时都走这条），以及末尾 12 个字符相等（"i/index.html"）——
+    ; 脚本目录里带中文时，Chromium 会把 URI 前面的部分百分号编码，整串比不上，
+    ; 但 "ui/index.html" 这一段是 ASCII，一定原样。绝不能拿"解码后的路径"来比：
+    ; 一旦解码错，连自己的首页都会被拦掉，界面直接起不来。
+    uiUrl := ToFileUrl(UI_PATH)
+    uiTail := SubStr(StrReplace(UI_PATH, '\', '/'), -12)
+    if (SubStr(uri, 1, StrLen(uiUrl)) = uiUrl || SubStr(uri, -12) = uiTail)
+        return
+
+    args.Cancel := 1
+    dropNav := true
+
+    if RegExMatch(uri, 'i)^file://') {
+        ; 文件 / 文件夹：页面解出真实路径，填进参数
+        if DropOnce(uri)
+            JsSend('{"type":"dropped","uri":' JsonQuote(uri) '}')
+    } else {
+        ; 不是文件：拖进来的多半是浏览器里的链接。照样拦下来（界面不能被顶掉），
+        ; 只是没法当路径用，提示一句。
+        Notify('只支持拖文件 / 文件夹进来；链接请直接粘贴')
+    }
+}
+
+; 拖进来的文件有时不是"就地导航"，而是让 Chromium 另开一个窗口
+; （WebView2Feedback #278 里就是这么表现的）。两条路都堵上 ——
+; 本程序不需要任何弹窗，新窗口一律 Handled。
+OnNewWindow(sender, args) {
+    uri := ''
+    try uri := args.Uri
+    try args.Handled := 1
+    if (uri = '')
+        return
+    if RegExMatch(uri, 'i)^file://') {
+        if DropOnce(uri)
+            JsSend('{"type":"dropped","uri":' JsonQuote(uri) '}')
+    } else {
+        Notify('只支持拖文件 / 文件夹进来；链接请直接粘贴')
+    }
+}
+
+; 同一次拖放可能同时触发「导航」和「新窗口」两种事件：1 秒内同一个 URI 只转一次，
+; 否则路径会被填两遍
+DropOnce(uri) {
+    global dropSeen, dropSeenAt
+    now := A_TickCount
+    if (uri = dropSeen && now - dropSeenAt < 1000)
+        return false
+    dropSeen := uri
+    dropSeenAt := now
+    return true
+}
+
 OnNavDone(sender, args) {
-    global lastNavOK, lastNavErr
+    global lastNavOK, lastNavErr, dropNav
+    if (dropNav) {
+        ; 被 OnNavStarting 拦下的那次导航也会走到这里（IsSuccess=false），
+        ; 这不是加载失败：别弹模态框（弹了界面就冻住），也别污染诊断信息。
+        dropNav := false
+        return
+    }
     lastNavOK := args.IsSuccess
     lastNavErr := args.WebErrorStatus
     if !args.IsSuccess

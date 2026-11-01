@@ -1808,6 +1808,67 @@
     els.q.focus();
   }
 
+  /* file:///C:/a%20b/拖入.txt → C:\a b\拖入.txt；file://server/share/x → \\server\share\x
+     解 URL 放在页面做：`new URL` + decodeURIComponent 本来就干这个，
+     宿主侧的 PathCreateFromUrlW 会把多字节字符按"一个字节一个字符"解，中文必乱。 */
+  function fileUrlToPath(uri) {
+    let u;
+    try { u = new URL(String(uri || '')); } catch (e) { return ''; }
+    if (String(u.protocol || '').toLowerCase() !== 'file:') return '';
+    let p = u.pathname || '';
+    try { p = decodeURIComponent(p); } catch (e) { /* 不是合法转义就按原文用 */ }
+    const host = String(u.hostname || '');
+    if (host && host.toLowerCase() !== 'localhost') {
+      /* UNC：\\服务器\共享\… */
+      return ('\\\\' + host + p).replace(/\//g, '\\');
+    }
+    /* 本地：pathname 一定以 / 开头，去掉它再换反斜杠（保留 \\?\ 这类前缀不管） */
+    return p.replace(/^\//, '').replace(/\//g, '\\');
+  }
+
+  /* ---------------------------------------------------------- 拖文件进来
+
+     WebView2 默认把"拖进窗口的文件"当成一次**顶层导航**（file:///C:/…），
+     等于整个界面被换成文件内容 —— 看上去就像"程序拿它打开了文件"。
+     页面自己救不了：DataTransfer 里的 File 只有名字、没有路径（Chromium 的安全设计），
+     所以由 AHK 在 NavigationStarting 里把那次导航拦下，把 URI 送到这里
+     （见 launcher.ahk 的 OnNavStarting）。
+
+     落到哪里：等价于"把这段路径粘贴进参数"——
+       · 已在参数态 → 补到参数末尾（含空格自动加引号，和手打一样）
+       · 没在参数态 → 先为高亮的那一条进参数态（拖文件是个明确动作，不再要求先按过 ↑↓）
+       · 高亮项不吃参数 → 就当普通文本插到光标处
+     ---------------------------------------------------------- */
+  function onDropped(uri) {
+    const p = fileUrlToPath(uri);
+    if (!p) return;
+    const text = /\s/.test(p) ? '"' + p + '"' : p;
+    try { els.q.focus(); } catch (e) {}
+
+    if (!state.param) {
+      const it = state.results[state.sel];
+      if (it && takesArgs(it)) enterParamFor(it);
+    }
+    if (state.param) {
+      const cur = els.q.value;
+      setTail(cur + (cur && !/\s$/.test(cur) ? ' ' : '') + text);
+    } else {
+      insertAtCaret(text);
+    }
+    toast('已填入路径：' + (p.length > 60 ? p.slice(0, 58) + '…' : p), 2600);
+  }
+
+  /* 把一段文本"粘贴"进搜索框：走同一条 input 流程，光标停在插入内容之后 */
+  function insertAtCaret(text) {
+    const v = els.q.value;
+    let s = v.length, e = v.length;
+    try { s = els.q.selectionStart; e = els.q.selectionEnd; } catch (e2) {}
+    els.q.value = v.slice(0, s) + text + v.slice(e);
+    const pos = s + text.length;
+    try { els.q.setSelectionRange(pos, pos); } catch (e2) {}
+    els.q.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
   /* Enter：参数态就带上参数，否则按老行为 */
   function doLaunch() {
     const item = state.results[state.sel];
@@ -2725,6 +2786,10 @@
           break;
         case 'fs-result':
           onFsResult(msg);
+          break;
+        case 'dropped':
+          /* 拖进来的文件：AHK 拦下 file:/// 导航后把原始 URI 送过来 */
+          onDropped(msg.uri || '');
           break;
         case 'run-ack':
           /* AHK 那边真正起了进程（或报了错），命令行执行的收尾回执 */

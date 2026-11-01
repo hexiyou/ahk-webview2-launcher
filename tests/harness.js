@@ -35,6 +35,8 @@ const DEFAULT_NAMES = [
   'splitQuoted', 'takesArgs', 'uniqueMatch', 'splitArgs', 'parseQuery', 'sourceFor', 'findGroup',
   /* 空格语义 / 切范围保选择 */
   'spaceTarget', 'selIndexById',
+  /* 拖文件进来：file:// URI → 本地路径 */
+  'fileUrlToPath',
   /* 参数取值 */
   'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery',
   'tplVars', 'templateIssues', 'joinTokens', 'applyParams',
