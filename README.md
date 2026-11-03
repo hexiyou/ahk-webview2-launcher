@@ -149,6 +149,7 @@ wv2-launcher/
 │  ├─ json.test.js       JSON 树的行模型（层级/逗号归属/路径/空容器/截断，60 条）
 │  ├─ keys.test.js       空格键语义 / 切范围保选择（14 条）
 │  ├─ drop.test.js       file:// URI → 本地路径（中文/空格/UNC/坏转义，14 条）
+│  ├─ jsonfile.test.js  jsonfile 类型：target 原样保留/类型标签/参数校验（20 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
 │  ├─ gen-pinyin.ps1     从 pinyin-data 重新生成 ui/pinyin.js
@@ -165,6 +166,7 @@ wv2-launcher/
 │  ├─ hdr-e2e.js         请求头动态值端到端：本地回显服务看真实收到的头（加 --exe 测编译版）
 │  ├─ wh-cli-check.js    --webhook 的 --json/--body：真跑子进程，验输出与退出码（37 项，加 --exe 测编译版）
 │  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进，并验证 hidden 条目不上界面（45 项）
+│  ├─ jsonfile-check.js  jsonfile 真机全链路：真读盘、真渲染、点刷新时改文件看内容跟不跟（30 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -187,6 +189,7 @@ wv2-launcher/
 > node tests/json.test.js      # 60 条（JSON 树的行模型）
 > node tests/keys.test.js      # 14 条（空格认高亮行 / 切范围保选择，见踩坑 50）
 > node tests/drop.test.js      # 14 条（file:// URI → 本地路径，见踩坑 51）
+> node tests/jsonfile.test.js  # 20 条（jsonfile 的 target 原样保留 / 参数校验 / Tab 补全判定）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
@@ -197,6 +200,7 @@ wv2-launcher/
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
 > node tools/jsonui-check.js   # 真 WebView2 里点折叠/搜索/量缩进（加 --shot 停住方便截图）
+> node tools/jsonfile-check.js # jsonfile 全链路：真读盘/树渲染/错误文案/刷新真的重读（30 项）
 > node tools/build-exe.js      # 编译成 dist\QuickLaunch.exe（需要 Ahk2Exe，见「九」）
 > ```
 
@@ -249,6 +253,8 @@ wv2-launcher/
 - `webhook` —— 发 HTTP 请求，把响应显示在面板里（见下方「webhook 类型」）
 - `download` —— 下载小文件并保存到本地（见下方「download 类型」），是 `webhook` 的变种：
   联网逻辑完全一样，只是响应体按**二进制**写进文件而不是显示在面板里
+- `jsonfile` —— 读**本地**一个 JSON 文件并显示成树（见下方「jsonfile 类型」）。
+  **不联网、不发请求**，借的是 `webhook` 那套 JSON 树 / `Ctrl+F` / `jsonPath`，只是数据来自磁盘
 
 顶层除了 `items`，还可以有 `groups`（分组，见下）和 `schedules`（定时任务，
 见「[七、定时调度](#七定时调度)」）。两个都是可选的，不写就是没有。
@@ -777,6 +783,61 @@ ql --webhook C:\path\spec.ini --body | jq .data.items[0]
 }
 ```
 
+### jsonfile 类型（看本地 JSON 文件）
+
+本机硬盘上有一份 JSON，想用这个工具那套「可折叠的树 + 字段搜索 + `jsonPath` 取值」
+去看它 —— 这就是 `jsonfile`。**它不发任何网络请求**，AHK 直接把文件读出来交给页面。
+
+```jsonc
+{
+  "id": "cfg",
+  "name": "查看 config.json",
+  "type": "jsonfile",
+  "target": "file://c:\\app\\data.json",     // 三种写法都认，见下
+  "jsonPath": "items[0]",                     // 可选：只看某个字段
+  "group": "dev"
+}
+```
+
+带参数（配合 `type: "path"`，Tab 会按目录补全）：
+
+```jsonc
+{
+  "id": "vj",
+  "name": "看 JSON",
+  "type": "jsonfile",
+  "target": "file://{{path}}",
+  "params": [{ "name": "path", "label": "文件", "type": "path", "placeholder": "C:\\x\\data.json" }]
+}
+```
+
+`target` 的写法：
+
+| 写法 | 结果 |
+|---|---|
+| `file://c:\example\data.json` | 反斜杠、两个斜杠 —— 手写最顺手的一种 |
+| `file:///C:/example/data.json` | URL 规范的三斜杠 |
+| `C:\example\data.json` | 裸绝对路径 |
+| `data\x.json` | 相对路径，按**脚本目录**解析 |
+| `file://server/share/x.json` | UNC，按 `\\server\share\x.json` 处理 |
+| `%TEMP%\x.json` | 环境变量会展开 |
+
+路径里的 `%20` 这类百分号编码会自动解开（从浏览器地址栏复制过来的路径一定是编码过的）。
+
+| 行为 | 说明 |
+|---|---|
+| 面板显示 | 方法徽标是 `FILE`，地址行是**解析后的绝对路径**，状态行是「已读取 · 体积 · 耗时」——不显示 HTTP 状态码，因为这个功能根本没有请求 |
+| 复用 webhook 的显示 | JSON 树、折叠、`Ctrl+F` 查找、字段复制、`jsonPath` 提取、只看结果 / 完整内容切换，全部和 webhook 一致 |
+| 非 JSON 文件 | **按原文显示**并标注「非 JSON」，不报错（和 webhook 对非 JSON 响应的态度一致） |
+| 手动刷新 | 面板上有「刷新」按钮，重新读一遍文件。**不做自动刷新** —— 那会让它和 webhook 的行为分叉 |
+| 大小上限 | 8 MB。超了**直接报错不读**：截断过的 JSON 一定解析失败，退化成纯文本反而让人以为文件坏了 |
+| 编码 | 自动认 BOM（UTF-8 / UTF-16 都行）；无 BOM 的 GBK 文件会按 936 再读一次 |
+| 定时任务 / `ql` | 和 webhook 一样能挂调度、能用 `ql run <id>` 跑（结果打到 stdout 的是一行摘要） |
+
+> 为什么不用浏览器直接 `fetch('file://…')`：页面本身是 `file://` 装载的，
+> Chromium 默认禁止 `file://` 页面去取另一个 `file://` 文件（不一致的 opaque origin），
+> 要放开得给整个 WebView2 加 `--allow-file-access-from-files`，为一个读 JSON 的功能不值当。
+
 ### 拉取在线配置（两个入口）
 
 把远端一份 `config.json` 下载下来覆盖本地，然后立刻重载 —— 用来在多台机器间同步配置。
@@ -833,6 +894,7 @@ ql --webhook C:\path\spec.ini --body | jq .data.items[0]
 | `cmd` | **原样**交给 cmd，绝不按路径改写 | `ipconfig /all` → `ipconfig /all` |
 | `url` | 原样 | `ms-calculator:`、`https://…` |
 | `webhook` / `download` | 原样（是网址，不是路径） | `https://api…` → 原样 |
+| `jsonfile` | 原样交给 AHK 解析（`file://` 剥壳 / `%20` 解码 / 环境变量 / 相对路径都在 AHK 侧做） | `file://c:\x\y.json` → 原样传下去 |
 | `folder` / `ahk` | 一律当路径，相对路径按脚本目录解析 | `docs` → `<脚本目录>\docs` |
 | `app` | 绝对路径/协议原样；`.`、`..` 或带分隔符的相对路径按脚本目录解析；**裸命令名**交给 PATH | `.\tool.exe` → `<脚本目录>\tool.exe`；`notepad.exe` → 交给 PATH |
 
@@ -1356,6 +1418,49 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     `cliRank` 是命令行（不传）。新增"界面入口"时忘了传 true，这条就会漏到界面上；
     删掉 `state.vis` 的回退分支，测试夹具又会全部炸 —— `tests/hidden.test.js` 两边都钉住了。
 
+63. **`file://` 的解析顺序是有讲究的，顺序错了 `%TEMP%` 就会被拼成相对路径。**
+    正确顺序：剥 `file://` → 解 `%XX` → `/` 换 `\` → **展开环境变量** → 再判断绝对/相对。
+    一开始把展开放在最后，`%TEMP%\q.json` 还没展开时既没有盘符也没有前导斜杠，于是被
+    当成相对路径拼成了 `C://程序目录//C://Users//…//Temp//q.json` —— 报"文件不存在"，
+    但面板上那条路径长得完全不像用户写的，很难一眼看出是拼接顺序的问题。
+    另外 `file:///C:/x`（三斜杠）要吃掉那个多余的前导斜杠，`file://server/share/x`
+    按 UNC 处理（URL 里 `//` 后面是主机名，Windows 正好用 `\\server\share` 表达）。
+    `%20` 要按**字节**解再按 UTF-8 重组，逐字符解会把中文文件名拆成乱码。
+
+64. **`FileRead` 自己会认 BOM，别手工看头几个字节。** 实测（`FileOpen(..., 'RAW')`
+    这个 build 不支持，拿不到原始字节）：`FileRead(path, 'UTF-8')` 对 **UTF-16 LE 带 BOM
+    的文件也能直接读对**，因为库先看 BOM 再决定怎么解码。要处理的只剩"无 BOM 的 GBK"：
+    按 UTF-8 读会出来一串 `U+FFFD`（替换字符），拿它当判据再按 `CP936` 读一次，
+    结果里没有 `U+FFFD` 才换 —— 这样真正含 `U+FFFD` 的 UTF-8 文件不会被误判。
+    国内工具导出的 JSON 不少是 GBK，这一步不做就是满屏乱码。
+
+65. **超限的 JSON 不能截断，只能拒读。** webhook 那套是"超过 400KB 截断 + 提示"，
+    因为 HTTP 响应截一段还能看。JSON 不行：截断必然缺括号，`JSON.parse` 一定失败，
+    于是退化成纯文本 —— 用户看到的是"这文件好像坏了"，而真实原因是"太大了"。
+    所以 `jsonfile` 超过 8MB 直接报错，报错里写清体积和上限。
+
+66. **页面里 `fetch('file://…')` 是走不通的。** 界面是 `wv.Navigate(ToFileUrl(UI_PATH))`
+    装载的，页面自己的 origin 就是 `file://`，Chromium 默认禁止 `file://` 页面去取另一个
+    `file://` 资源（各自的 opaque origin 对不上）。要放开得给 WebView2 的 environment 加
+    `--allow-file-access-from-files`，那是全局放宽、影响所有页面。所以文件必须由 AHK 读了
+    再经消息桥送过来 —— 顺带还能用上 AHK 那套路径解析和环境变量展开。
+
+67. **本地文件这条链路能复用整个 JSON 面板，靠的是"回执长得一样"。**
+    `jsonfile-result` 的字段刻意和 `http-result` 对齐（`ok / ms / body / error / truncated`），
+    于是 `renderResult` 里的 JSON 树、`Ctrl+F`、`jsonPath` 提取、字段复制一行都没改，
+    只多了 `isFile` 那几个文案分支（`FILE` 徽标、绝对路径、`已读取 · 体积 · 耗时`）——
+    和 `download` 用 `isDl` 分叉是同一个套路，队形保持一致。
+    另外它**不需要** webhook 那套子进程：那套存在的唯一理由是 WinHttp 是同步 COM、
+    放主线程会冻住窗口；读一个文件是毫秒级的，同步读、同步回执就行。
+
+68. **"手动刷新"要做，"自动刷新"不做。** 自动刷新得挂一个每秒比对 mtime 的定时器，
+    还会让这个类型和 webhook 的行为分叉（webhook 没有这种东西）；而它的真实用途是
+    "改完配置顺手看一眼"，点一下按钮完全够。代价要说清：面板里显示的是**读的那一刻**
+    的磁盘内容，所以元信息那一行特意写了「读的是磁盘内容，改完点「刷新」」。
+    验证"刷新真的重新读盘"不能只看按钮有没有反应 —— `tools/jsonfile-check.js` 的做法是
+    页面点刷新前先往日志里写一个标记，node 侧看到就把磁盘上的文件换掉，然后断言面板里
+    出现了新内容。只重画旧数据的话这条会立刻红。
+
 ---
 
 ## 六、命令行（`ql`）
@@ -1603,6 +1708,10 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 - `download` 把光标留给「保存路径」这一层：路径存在性、写权限的问题只会得到一句错误提示，
   不会自动换目录；`%VAR%` 只展开一层环境变量，不解析 `~`。
 - 每个请求起一个子进程，没有连接复用；高频连续点会有点开销（单次约 30~80ms 启动成本）。
+- `jsonfile` 一次把整个文件读进内存，上限 8MB，超了直接报错（不截断，见踩坑 65）；
+  也**没有**流式解析，所以"几百 MB 的 JSON 只想取一个字段"这种场景它做不了。
+- `jsonfile` 不做自动刷新：面板里是**读的那一刻**的磁盘内容，改完要手动点「刷新」。
+- `jsonfile` 只读、不写、不监控；路径来自你自己的 `config.json`，它不会去猜别的位置。
 - 运行时参数只做"空白切分 + 引号"，不解析 `%VAR%`、管道、通配符。
   `app` / `ahk` 的每个参数按需加引号（含空白或引号才加），所以 `cmd.exe` 这类 shell 语义请用 `cmd` 类型条目（原样拼接）。
 - 模板 `{{x}}` 只是**整词替换**，没有表达式：不支持默认值表达式、条件、切片、函数，

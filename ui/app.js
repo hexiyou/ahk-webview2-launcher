@@ -106,7 +106,7 @@
   function resolveTarget(type, p) {
     const s = (p == null ? '' : String(p)).trim();
     if (!s) return '';
-    if (type === 'cmd' || type === 'url' || type === 'webhook' || type === 'download') return s;
+    if (type === 'cmd' || type === 'url' || type === 'webhook' || type === 'download' || type === 'jsonfile') return s;
     if (isProtocol(s) || isAbsPath(s)) return s;
     // folder / ahk 的 target 天然是路径，裸名也按脚本目录解析
     if (type === 'folder' || type === 'ahk') return absPath(s);
@@ -140,11 +140,13 @@
     return `linear-gradient(135deg, ${a}, ${a}cc)`;
   }
 
-  const KIND_LABEL = { app: '应用', cmd: '命令', url: '链接', folder: '目录', ahk: '脚本', webhook: '请求', download: '下载' };
+  const KIND_LABEL = { app: '应用', cmd: '命令', url: '链接', folder: '目录', ahk: '脚本', webhook: '请求', download: '下载', jsonfile: '文件' };
 
   function kindLabel(item) {
     /* webhook 直接显示请求方法，比"请求"两个字信息量大 */
     if (item.type === 'webhook') return (item.method || 'GET').toUpperCase();
+    /* 本地文件用 FILE，和 HTTP 方法摆在一起时一眼分得清哪个不联网 */
+    if (item.type === 'jsonfile') return 'FILE';
     return KIND_LABEL[item.type] || '应用';
   }
 
@@ -197,7 +199,7 @@
         || null;
   }
 
-  const CMD_TYPES = { cmd: 1, ahk: 1, webhook: 1, download: 1 };
+  const CMD_TYPES = { cmd: 1, ahk: 1, webhook: 1, download: 1, jsonfile: 1 };
 
   /* 界面可见的条目：启用、且没写 hidden。
 
@@ -261,7 +263,8 @@
   function takesArgs(item) {
     if (!item) return false;
     if (item.type === 'app' || item.type === 'cmd' || item.type === 'ahk') return true;
-    if (item.type === 'webhook' || item.type === 'download') return (item.params || []).length > 0;
+    if (item.type === 'webhook' || item.type === 'download' || item.type === 'jsonfile')
+      return (item.params || []).length > 0;
     return false;                       /* folder / url 不参与，避免误判 */
   }
 
@@ -496,7 +499,9 @@
   function applyParams(item, raw) {
     const decl = item.params || [];
     const text = raw == null ? '' : String(raw);
-    const isNet = item.type === 'webhook' || item.type === 'download';
+    /* jsonfile 也算：路径就是这个功能的主体，必填项缺了必须拦下来，
+       不能像 cmd 那样"缺了照样跑" */
+    const isNet = item.type === 'webhook' || item.type === 'download' || item.type === 'jsonfile';
 
     /* 没声明 params：整条不参与替换，参数照旧原样追加。
        这是「老配置零影响」的兜底 —— 也是 {{ }} 在这些条目上的语义：字面量。 */
@@ -953,8 +958,9 @@
       if (/\.(png|svg|jpe?g|gif|webp|ico|bmp)$/i.test(ic)) return fileUrl(absPath(ic));
       if (/\.exe$/i.test(ic)) return iconFromExe(absPath(ic));
     }
-    /* webhook 没有可执行文件，默认用网络图标 */
-    if (item.type === 'webhook') return null;
+    /* webhook / jsonfile 没有可执行文件：一个用网络图标，一个用默认字母图标
+       （别拿 file:// 路径去 iconFromExe，那是白跑一趟） */
+    if (item.type === 'webhook' || item.type === 'jsonfile') return null;
     return iconFromExe(item.target);
   }
 
@@ -1005,6 +1011,16 @@
         '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
         '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>';
       el.style.color = item.accent || '#3b82f6';
+      return el;
+    }
+    /* 本地 JSON：一对花括号，比首字母更能说明"这是份数据" */
+    if (item.type === 'jsonfile' && !item.icon) {
+      el.classList.add('ic-emoji');
+      el.innerHTML = '<svg width="' + Math.round(size * 0.56) + '" height="' + Math.round(size * 0.56) +
+        '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M9 4.6c-1.5 0-2.2.8-2.2 2.2v2.5c0 1.2-.6 1.8-1.8 2.1 1.2.3 1.8.9 1.8 2.1v2.5c0 1.4.7 2.2 2.2 2.2"/>' +
+        '<path d="M15 4.6c1.5 0 2.2.8 2.2 2.2v2.5c0 1.2.6 1.8 1.8 2.1-1.2.3-1.8.9-1.8 2.1v2.5c0 1.4-.7 2.2-2.2 2.2"/></svg>';
+      el.style.color = item.accent || '#4b5563';
       return el;
     }
     el.style.background = tint(item);
@@ -1575,6 +1591,9 @@
       preview = 'GET ' + buildUrl(applied) +
         '  →  ' + (applied.savePath || '系统「下载」目录') + '\\' +
         (applied.fileName || '（沿用远端文件名）');
+    } else if (item.type === 'jsonfile') {
+      head = '将读取';
+      preview = applied.target || '（还没写路径）';
     } else if (item.type === 'webhook') {
       head = '将请求';
       preview = (item.method || 'GET') + ' ' + buildUrl(applied);
@@ -1757,7 +1776,8 @@
       const kind = document.createElement('span');
       kind.className = 'row-kind'
         + (item.type === 'webhook' ? ' row-kind-http' : '')
-        + (item.type === 'download' ? ' row-kind-dl' : '');
+        + (item.type === 'download' ? ' row-kind-dl' : '')
+        + (item.type === 'jsonfile' ? ' row-kind-file' : '');
       kind.textContent = kindLabel(item);
       row.appendChild(kind);
 
@@ -1825,8 +1845,9 @@
       return false;
     }
 
-    if (item.type === 'webhook' || item.type === 'download') {
+    if (item.type === 'webhook' || item.type === 'download' || item.type === 'jsonfile') {
       if (item.type === 'download') runDownload(w.item, cli, quiet);
+      else if (item.type === 'jsonfile') runLocalJson(w.item, cli, quiet);
       else runWebhook(w.item, raw, cli, quiet);
       if (!quiet) bumpUsage(item);
       return true;
@@ -1940,7 +1961,8 @@
     /* 参数态启动成功就把输入清干净：否则下次唤出还停在参数态，
        新输入会被拼到旧主体后面（实测踩过）。
        非参数态的启动保持原行为（窗口隐藏，查询留着）。 */
-    if (ok && state.param && item.type !== 'webhook' && item.type !== 'download') setQuery('');
+    if (ok && state.param && item.type !== 'webhook' && item.type !== 'download'
+      && item.type !== 'jsonfile') setQuery('');
   }
 
   /* ---------------------------------------------------------- Webhook */
@@ -2177,6 +2199,81 @@
     if (res.ms) lines.push('用时：' + res.ms + ' ms');
     if (res.backup) lines.push('原文件已备份：' + res.backup);
     return lines.join('\n');
+  }
+
+  /* ---------------------------------------------------------- 本地 JSON
+
+     数据不走网络：AHK 直接读文件、直接回执，所以这里没有超时、没有轮询，
+     pending 只是为了让"结果面板已关掉"这种情况还能给命令行一个回执。
+     回执字段和 http-result 同形，下面 renderResult 那一整套（JSON 树、Ctrl+F、
+     jsonPath 提取、字段复制）原样复用，唯一的分叉是 isFile 那几个文案。 */
+
+  function runLocalJson(item, cli, quiet) {
+    const id = 'j' + (++state.reqSeq).toString(36) + '-' + Date.now().toString(36);
+    state.pending.set(id, { item: item, kind: 'jsonfile', cli: !!cli, quiet: !!quiet });
+
+    if (!quiet) {
+      state.result = {
+        id: id, item: item, loading: true, ok: true, file: true,
+        status: 0, ms: 0, size: 0, path: item.target || '',
+        body: '', error: '', truncated: 0, view: 'body'
+      };
+      renderResult();
+    }
+
+    if (!HAS_BRIDGE) {
+      /* 浏览器预览：给一份假文件内容，方便调样式 */
+      if (quiet) { state.pending.delete(id); return; }
+      setTimeout(() => {
+        state.pending.delete(id);
+        state.result = Object.assign({}, state.result, {
+          loading: false, ms: 3, size: 512,
+          path: 'C:\\示例\\data.json', body: DEMO_RESPONSE
+        });
+        renderResult();
+      }, 200);
+      return;
+    }
+
+    post({ type: 'readjson', id: id, path: item.target || '' });
+  }
+
+  function onJsonFileResult(msg) {
+    const pend = state.pending.get(msg.id);
+    state.pending.delete(msg.id);
+    const wasCli = !!(pend && pend.cli);
+
+    const line = msg.ok
+      ? ('已读取 ' + (msg.size ? fmtBytes(msg.size) : '') + (msg.ms ? ' · ' + msg.ms + 'ms' : ''))
+      : ('读取失败：' + (msg.error || '未知错误'));
+
+    if (pend && pend.quiet) { cliDone(msg.ok ? 0 : 4, line); return; }
+    if (!state.result || state.result.id !== msg.id) {
+      if (wasCli) cliDone(4, '结果面板已被关闭，取不到这次读取的结果');
+      return;
+    }
+
+    state.result = Object.assign({}, state.result, {
+      loading: false,
+      ok: !!msg.ok,
+      ms: msg.ms | 0,
+      size: msg.size | 0,
+      path: msg.path || state.result.path,
+      body: msg.body || '',
+      error: msg.error || '',
+      truncated: msg.truncated | 0
+    });
+    renderResult();
+
+    if (wasCli) cliDone(msg.ok ? 0 : 4, line);
+  }
+
+  /* 手动刷新：重新读一遍同一个文件。不做自动刷新 —— 那是"盯着看"的场景，
+     不是"翻一下"的场景，而且会让这个类型和 webhook 的行为分叉。 */
+  function refreshResult() {
+    const res = state.result;
+    if (!res || !res.file || res.loading) return;
+    runLocalJson(res.item, false, false);
   }
 
   /* ---------------------------------------------------------- 结果分析 */
@@ -2575,6 +2672,18 @@
 
   /* 连接层失败（一个字节的响应都没拿到）时的提示。
      关键是要和 4xx/5xx 区分开：限流会返回状态码和正文，不会走到这里。 */
+  /* 本地文件读失败：不要套用 netErrorText，那段通篇讲 DNS / TLS / 代理，
+     对着"文件不存在"念一遍只会让人更糊涂。 */
+  function fileErrorText(res) {
+    const err = String(res.error || '读取失败').trim();
+    return [
+      '没能读到这个文件。', '',
+      '  ' + err, '',
+      '面板上方是 AHK 实际去找的位置（相对路径按程序目录算）。',
+      '带 file:// 前缀也可以，file:///C:/x/y.json 和 file://c:\\x\\y.json 都认。'
+    ].join('\n');
+  }
+
   function netErrorText(res) {
     const err = String(res.error || '请求失败').trim();
     const lines = ['请求没有完成，没有拿到任何 HTTP 响应。', '', '  ' + err, ''];
@@ -2626,26 +2735,42 @@
 
     const item = res.item || {};
     const isDl = !!res.download;
-    els.rMethod.textContent = isDl ? 'GET' : (item.method || 'GET').toUpperCase();
-    els.rMethod.className = 'rmethod m-' + (isDl ? 'get' : (item.method || 'GET').toLowerCase());
-    /* 显示最终请求地址（含 query 串），否则用户会以为 query 没生效 */
-    const fullUrl = res.url || buildUrl(item) || '';
+    const isFile = !!res.file;
+    if (isFile) {
+      els.rMethod.textContent = 'FILE';
+      els.rMethod.className = 'rmethod m-file';
+    } else {
+      els.rMethod.textContent = isDl ? 'GET' : (item.method || 'GET').toUpperCase();
+      els.rMethod.className = 'rmethod m-' + (isDl ? 'get' : (item.method || 'GET').toLowerCase());
+    }
+    /* 显示最终请求地址（含 query 串），否则用户会以为 query 没生效；
+       本地文件则显示 AHK 实际解析出来的绝对路径 —— 相对路径到底指到哪了，
+       只有这一行能看出来 */
+    const fullUrl = isFile
+      ? (res.path || item.target || '')
+      : (res.url || buildUrl(item) || '');
     els.rUrl.textContent = fullUrl;
     els.rUrl.title = fullUrl;
 
     /* 状态行 */
     if (res.loading) {
       els.rStatus.className = 'rstat st-wait';
-      els.rStatus.textContent = isDl ? '下载中…' : '请求中…';
+      els.rStatus.textContent = isFile ? '读取中…' : (isDl ? '下载中…' : '请求中…');
     } else if (!res.ok) {
       els.rStatus.className = 'rstat st-err';
-      els.rStatus.textContent = shortErrLabel(res.error);
+      els.rStatus.textContent = isFile ? '读取失败' : shortErrLabel(res.error);
       els.rStatus.title = res.error || '';
     } else if (isDl) {
       /* 下载没有"状态码文案"的需求，跳过/成功更直观 */
       const txt = res.skipped ? '已跳过（文件已存在）' : (res.status ? String(res.status) : '完成');
       els.rStatus.className = 'rstat ' + (res.skipped ? 'st-warn' : statusClass(res));
       els.rStatus.textContent = txt + (res.ms ? ' · ' + res.ms + 'ms' : '');
+    } else if (isFile) {
+      /* 本地文件没有状态码，报体积和耗时更实在 */
+      els.rStatus.className = 'rstat st-ok';
+      els.rStatus.textContent = '已读取'
+        + (res.size ? ' · ' + fmtBytes(res.size) : '')
+        + (res.ms ? ' · ' + res.ms + 'ms' : '');
     } else {
       const txt = (STATUS_TEXT[res.status] ? res.status + ' ' + STATUS_TEXT[res.status] : res.status ? String(res.status) : '无状态码');
       els.rStatus.className = 'rstat ' + statusClass(res);
@@ -2687,12 +2812,14 @@
     els.rJson.hidden = !tree;
     els.rFind.hidden = !tree;
     if (!tree) els.rFindBar.hidden = true;
+    /* 刷新只对"读本地文件"有意义；网络请求要重来就再选一次条目 */
+    els.rRefresh.hidden = !isFile || res.loading;
 
     if (res.loading) {
-      els.rPre.innerHTML = '<span class="jt-p">' + (isDl ? '正在下载…' : '等待响应…') + '</span>';
+      els.rPre.innerHTML = '<span class="jt-p">' + (isFile ? '正在读取…' : (isDl ? '正在下载…' : '等待响应…')) + '</span>';
       clearFind();
     } else if (!res.ok && !res.body && !isDl) {
-      els.rPre.textContent = netErrorText(res);
+      els.rPre.textContent = isFile ? fileErrorText(res) : netErrorText(res);
       clearFind();
     } else if (tree) {
       renderJsonTree(els.rJson, tree);
@@ -2701,7 +2828,8 @@
       els.rPre.innerHTML = highlightJson(text);
       clearFind();
     } else {
-      els.rPre.textContent = text || '（空响应）';
+      /* 读的是本地文件时说"空文件"更准确 —— 这里根本没有响应 */
+      els.rPre.textContent = text || (isFile ? '（空文件）' : '（空响应）');
       clearFind();
     }
 
@@ -2720,6 +2848,8 @@
       if (treeNote) bits.push(treeNote);
       if (!an.isJson && !res.loading && res.body) bits.push('非 JSON，按原文显示');
       if (tree && tree.length > JSON_AUTO_LINES) bits.push('点数 = 折叠，行尾 = 复制字段');
+      /* 本地文件多给一句"这是磁盘上的，可能已经被改过"，省得以为是实时视图 */
+      if (isFile && !res.loading && res.ok) bits.push('读的是磁盘内容，改完点「刷新」');
     }
     els.rMeta.textContent = bits.join(' · ');
     els.rMeta.hidden = !bits.length;
@@ -2851,6 +2981,7 @@
     els.rPre = $('rPre');
     els.rMeta = $('rMeta');
     els.rToggle = $('rToggle');
+    els.rRefresh = $('rRefresh');
     els.rJson = $('rJson');
     els.rFind = $('rFind');
     els.rFindBar = $('rFindBar');
@@ -2930,6 +3061,7 @@
     $('subjClear').addEventListener('click', () => exitParam());
     $('rClose').addEventListener('click', closeResult);
     $('rCopy').addEventListener('click', copyResult);
+    els.rRefresh.addEventListener('click', refreshResult);
     els.rToggle.addEventListener('click', () => {
       if (!state.result) return;
       state.result.view = state.result.view === 'body' ? 'full' : 'body';
@@ -3053,7 +3185,7 @@
        run    —— 直接执行，参数按参数态那套原文分配
 
      每条请求都必须以 cliDone 收尾（AHK 在等这条回执，--wait 的调用方也在等）。
-     慢请求（webhook / download）由结果回调收尾，期间 cliBusy 一直为真，
+     慢请求（webhook / download / jsonfile）由结果回调收尾，期间 cliBusy 一直为真，
      后面的请求排在队里 —— 命令行本来就该一条一条来。
      ---------------------------------------------------------- */
 
@@ -3140,7 +3272,8 @@
 
     const ok = launch(item, String(req.args || ''), { cli: true, quiet: !!req.quiet });
     if (!ok) return;                 /* launch 内部已经 cliDone */
-    if (item.type === 'webhook' || item.type === 'download') return;  /* 结果回调收尾 */
+    if (item.type === 'webhook' || item.type === 'download' || item.type === 'jsonfile')
+      return;                        /* 结果回调收尾 */
     /* app / cmd / ahk / folder / url：等 AHK 的 run-ack 收尾 */
   }
 
@@ -3226,6 +3359,9 @@
           break;
         case 'download-result':
           onDownloadResult(msg);
+          break;
+        case 'jsonfile-result':
+          onJsonFileResult(msg);
           break;
         case 'fs-result':
           onFsResult(msg);

@@ -572,6 +572,15 @@ kbd {
   opacity: 1;
 }
 
+/* 本地文件：不联网，所以用中性灰 —— 绿色/蓝色在这套界面里都是"网上发生的事" */
+.row-kind-file {
+  color: #4b5563;
+  background: #f3f4f6;
+  border-color: #e5e7eb;
+  font-weight: 600;
+  opacity: 1;
+}
+
 /* ============================================================
    Webhook 响应面板
    ============================================================ */
@@ -617,6 +626,8 @@ kbd {
 .rmethod.m-delete { background: #ef4444; }
 .rmethod.m-head,
 .rmethod.m-options { background: #8b5cf6; }
+/* 本地文件：中性灰，和上面几个 HTTP 方法一眼分得开 */
+.rmethod.m-file { background: #4b5563; }
 
 .rurl {
   flex: 0 1 auto;

@@ -35,6 +35,7 @@ global PULL_DIR   := A_Temp '\quicklaunch-pull'   ; 「拉取在线配置」先�
 global CLI_DIR    := A_Temp '\quicklaunch-cli'    ; 客户端的回执文件放这里（跨进程用，别用脚本目录）
 global SCHED_LOG  := SCRIPT_DIR '\sched.log'      ; 定时任务的执行记录（一行一条，主界面没有入口，靠它查）
 global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
+global FILE_MAX_BODY := 8 * 1024 * 1024   ; jsonfile 读本地文件的上限（字节）。超了一律拒读，见 DoReadJson
 
 ; 请求头动态值的签名密钥：**只存在于这里**。
 ; config.json 里写 {{#hmac:demo:...}} 引用名字，明文密钥不落配置文件；
@@ -568,6 +569,139 @@ ListShares(server) {
     return out
 }
 
+; ------------------------- 内部通道：读本地 JSON 文件 ------------------------
+/*  jsonfile 类型的数据不走网络：AHK 直接把文件读出来回执。
+    比起 webhook 那套「写 spec → 起子进程 → 轮询 meta → 超时兜底」，这里全都不需要 ——
+    那套存在的唯一理由是 WinHttp 是同步 COM、放主线程会冻住窗口，读文件没有这个问题。
+
+    回执故意做得和 http-result 同形（ok / ms / body / error / truncated），
+    前端那一整套 JSON 树、Ctrl+F 查找、jsonPath 提取就能直接复用，一行都不用改。 */
+DoReadJson(raw) {
+    global FILE_MAX_BODY
+    id := JsonStr(raw, 'id')
+    if (id = '')
+        id := 'f' A_TickCount
+
+    t0 := A_TickCount
+    p := FileTargetPath(JsonStr(raw, 'path'))
+    if (p = '')
+        return JsReadFail(id, '没有配置文件路径', '', 0)
+
+    if DirExist(p)
+        return JsReadFail(id, '这是一个目录，不是文件', p, 0)
+    if !FileExist(p)
+        return JsReadFail(id, '文件不存在：' p, p, 0)
+
+    size := 0
+    try size := FileGetSize(p)
+    /* 超限直接拒读，不截断：截断过的 JSON 一定解析失败，会退化成纯文本，
+       用户看到的就是「这文件好像坏了」，比明说「太大了」误导得多。 */
+    if (size > FILE_MAX_BODY)
+        return JsReadFail(id, '文件太大（' FmtBytes(size) '），上限 ' FmtBytes(FILE_MAX_BODY) '，没有读取'
+            , p, size)
+
+    err := ''
+    body := ReadTextFile(p, &err)
+    if (err != '')
+        return JsReadFail(id, err, p, size)
+
+    JsSend('{"type":"jsonfile-result","id":' JsonQuote(id) ',"ok":1'
+        . ',"ms":' (A_TickCount - t0) ',"size":' size ',"truncated":0,"error":""'
+        . ',"path":' JsonQuote(p) ',"body":' JsonQuote(body) '}')
+}
+
+JsReadFail(id, msg, p, size) {
+    JsSend('{"type":"jsonfile-result","id":' JsonQuote(id) ',"ok":0'
+        . ',"ms":0,"size":' size ',"truncated":0,"error":' JsonQuote(msg)
+        . ',"path":' JsonQuote(p) ',"body":""}')
+}
+
+/* 把配置里的 target 变成真实路径。三种写法都吃：
+       file://c:\x\y.json      手写最常见（反斜杠、两个斜杠）
+       file:///C:/x/y.json     URL 规范写法（三个斜杠）
+       C:\x\y.json            裸路径；相对路径（data\x.json）按脚本目录算
+
+   为什么 file://server/share/x.json 按 UNC 处理：URL 里 // 后面是主机名，
+   Windows 正好用 \\server\share 表达同一件事。想写相对路径就直接写裸路径。 */
+FileTargetPath(p) {
+    global SCRIPT_DIR
+    p := Trim(p)
+    if (p = '')
+        return ''
+
+    hasScheme := RegExMatch(p, 'i)^file://(.*)$', &m)
+    if hasScheme
+        p := m[1]
+
+    p := UriDecode(p)                     ; 从浏览器复制的路径，空格是 %20
+    p := StrReplace(p, '/', '\')
+    /* 环境变量必须在判断「绝对还是相对」之前展开：%TEMP%\x.json 展开后才是
+       带盘符的绝对路径，否则会被当成相对路径拼到脚本目录后面。 */
+    p := ExpandEnvVars(p)
+    if RegExMatch(p, '^\\[a-zA-Z]:')                     ; ///C:/x → \C:\x
+        p := SubStr(p, 2)
+    else if (hasScheme && !RegExMatch(p, '^[a-zA-Z]:'))   ; //server/share → \\server\share
+        p := '\\' p
+    else if (!hasScheme && !RegExMatch(p, '^[a-zA-Z]:') && SubStr(p, 1, 2) != '\\')
+        p := SCRIPT_DIR '\' p                            ; 相对路径按程序目录算
+
+    return p
+}
+
+/* %XX → 字节。先攒字节再按 UTF-8 解，不然中文文件名（%E4%B8%AD…）会被拆成
+   一串乱码；`50%off.json` 这种裸 % 不满足两位十六进制，原样留着。 */
+UriDecode(s) {
+    if !InStr(s, '%')
+        return s
+    buf := Buffer(StrPut(s, 'UTF-8') + 8), n := 0
+    i := 1, len := StrLen(s)
+    while (i <= len) {
+        c := SubStr(s, i, 1)
+        if (c = '%' && i + 2 <= len && RegExMatch(SubStr(s, i + 1, 2), '^[0-9a-fA-F]{2}$')) {
+            NumPut('UChar', Integer('0x' SubStr(s, i + 1, 2)), buf, n)
+            n += 1, i += 3
+            continue
+        }
+        cb := Buffer(StrPut(c, 'UTF-8'))
+        cl := StrPut(c, cb, 'UTF-8') - 1
+        Loop cl
+            NumPut('UChar', NumGet(cb, A_Index - 1, 'UChar'), buf, n), n += 1
+        i += 1
+    }
+    return StrGet(buf, n, 'UTF-8')
+}
+
+/* 读文本，顺手把编码猜对。
+   FileRead 自带 BOM 识别（UTF-8 带 BOM、UTF-16 都能直接读对，实测过），
+   所以只需要处理「无 BOM 的老 GBK 文件」—— 国内工具导出的 JSON 很常见。
+   拿 U+FFFD 当判据：按 UTF-8 读 GBK 必然满屏替换字符，再按 936 读一次对比即可。 */
+ReadTextFile(path, &err) {
+    err := ''
+    try s := FileRead(path, 'UTF-8')
+    catch as e {
+        err := '读取失败：' CleanComError(e.Message)
+        return ''
+    }
+    if !InStr(s, Chr(0xFFFD))
+        return s
+
+    alt := ''
+    try alt := FileRead(path, 'CP936')
+    catch
+        return s
+    /* 936 读得更干净才换 —— 真正含 U+FFFD 的 UTF-8 文件不会被误判 */
+    return (alt != '' && !InStr(alt, Chr(0xFFFD))) ? alt : s
+}
+
+FmtBytes(n) {
+    n := n + 0
+    if (n < 1024)
+        return n ' B'
+    if (n < 1048576)
+        return Format('{:.1f}', n / 1024) ' KB'
+    return Format('{:.2f}', n / 1048576) ' MB'
+}
+
 ShowLauncher() {
     global g, wv, wvc, uiReady, settings
     if !IsObject(g)
@@ -800,6 +934,8 @@ OnWebMessage(sender, args) {
             SaveUsage(raw)
         case 'fs':
             DoFs(raw)
+        case 'readjson':
+            DoReadJson(raw)
         case 'log':
             FileAppend(JsonStr(raw, 'text') '`n', SCRIPT_DIR '\launcher.log', 'UTF-8')
     }
@@ -908,6 +1044,8 @@ Launch(kind, target, args, workdir, argv := [], argvRaw := '') {
             Run('"' AhkInterp() '" "' target '"' (args != '' ? ' ' args : '') extra, workdir)
         case 'webhook':
             throw Error('webhook 类型由前端直接发请求，不应走到 Launch')
+        case 'jsonfile':
+            throw Error('jsonfile 类型由前端直接读文件（readjson），不应走到 Launch')
         default:                                  ; app
             if RegExMatch(target, '^(shell:|ms-|https?:|mailto:)') {
                 Run(target)
