@@ -101,6 +101,8 @@
             <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
           </svg>
         </button>
+        <button class="rbtn rbtn-min" id="rExpand" title="展开全部节点" hidden>展开全部</button>
+        <button class="rbtn rbtn-min" id="rCollapse" title="折叠全部节点" hidden>折叠全部</button>
         <button class="rbtn" id="rRefresh" title="重新读取这个文件" hidden>刷新</button>
         <button class="rbtn" id="rToggle" hidden>完整响应</button>
         <button class="rbtn" id="rCopy">复制</button>
@@ -152,6 +154,10 @@
   <div class="toast" id="toast"></div>
 </div>
 
+<!-- 第三方解析器，原样放在 vendor/ 下（说明见 README「YAML / TOML 预览」）：
+     js-yaml 的 UMD 直接可用；smol-toml 是零 require 的 CJS 单文件，外面包了层垫片。 -->
+<script src="vendor/js-yaml.min.js"></script>
+<script src="vendor/smol-toml.js"></script>
 <script src="pinyin.js"></script>
 <script src="app.js"></script>
 </body>

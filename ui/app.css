@@ -675,6 +675,10 @@ kbd {
 .rbtn[hidden] { display: none; }
 .rbtn-close { width: 26px; padding: 0; color: #9aa0aa; }
 .rbtn-close:hover { background: #ffe9e9; color: #d92d20; border-color: #ffd5d5; }
+/* 「展开全部 / 折叠全部」是树视图的操作：文案要完整（图标说不清"全部"），
+   所以压字号和留白，别让四个中文字把地址挤没了 */
+.rbtn-min { padding: 0 6px; font-size: 10px; color: var(--muted); }
+.rbtn-min:hover { color: #111; }
 
 .rmeta {
   flex: 0 0 auto;

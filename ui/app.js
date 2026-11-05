@@ -2288,7 +2288,7 @@
     if (!quiet) {
       state.result = {
         id: id, item: item, loading: true, ok: true, file: true,
-        status: 0, ms: 0, size: 0, path: item.target || '',
+        status: 0, ms: 0, size: 0, path: item.target || '', format: '',
         body: '', error: '', truncated: 0, view: 'body'
       };
       renderResult();
@@ -2332,6 +2332,7 @@
       ms: msg.ms | 0,
       size: msg.size | 0,
       path: msg.path || state.result.path,
+      format: msg.format || state.result.format || '',
       body: msg.body || '',
       error: msg.error || '',
       truncated: msg.truncated | 0
@@ -2378,19 +2379,135 @@
     return { ok: true, value: cur };
   }
 
-  function analyzeResult(res) {
-    const out = { isJson: false, json: null, hasPath: false, extracted: undefined, pathError: '' };
-    if (!res || !res.body) return out;
-    try {
-      out.json = JSON.parse(res.body);
-      out.isJson = true;
-    } catch (e) {
+  /* ---------------------------------------------------------- 结构化数据解析
+
+     本地配置文件有三种语法，解析器各不相同，但**解析完都是普通对象/数组** ——
+     所以下面那套 JSON 树、Ctrl+F、jsonPath 提取可以一行不改地复用。
+     用哪个解析器按扩展名决定（由 AHK 判、跟着回执的 format 走），不从内容猜：
+     YAML 几乎能把任何文本解析成"一个标量"，猜错的代价是纯文本文件被当成
+     "只有一个字符串的 YAML"，比不解析更让人困惑。 */
+
+  const FORMAT_LABEL = { json: 'JSON', yaml: 'YAML', toml: 'TOML' };
+
+  /* 解析器交出来的是"活对象"，和 JSON.parse 的结果不完全一样，直接丢给 jsonRows 会出事：
+       - TOML 的日期是 Date，jsonRows 把它当对象、Object.keys 为空 → 画成 {}
+       - YAML 的锚点能造出真正的循环引用（a: &x {self: *x}），jsonRows 是纯递归，会爆栈
+     统一在这里转成纯 JSON 值的形状。用"递归栈"而不是全局 seen 集合：
+     同一个锚点被引用两次是合法的（两份副本各自展开），只有自己嵌自己才算环。 */
+  function plainData(root, maxDepth) {
+    const limit = maxDepth || 200;
+    const stack = new Set();
+    /* 用 toString 认类型而不是 instanceof：解析器和页面若不在同一个 realm
+       （测试沙箱、将来的 iframe/worker），instanceof 会全线返回 false，
+       Date 就被当成普通对象画成 {} —— 这类失败静默且难查。 */
+    const tagOf = v => Object.prototype.toString.call(v);
+
+    function walk(v, depth) {
+      if (v === null || typeof v !== 'object') return v;
+      if (depth > limit) return '…（嵌套超过 ' + limit + ' 层，已省略）';
+      if (stack.has(v)) return '（循环引用）';
+
+      let t = tagOf(v);
+      if (t === '[object Date]')
+        return isNaN(v.getTime()) ? String(v) : v.toISOString();
+      if (t === '[object Map]') { v = Array.from(v.entries()); t = tagOf(v); }   /* YAML 的 !!omap */
+      else if (t === '[object Set]') { v = Array.from(v); t = tagOf(v); }        /* YAML 的 !!set */
+      /* 认不出的宿主对象（Uint8Array 之类）别画成 {} 骗人 */
+      if (t !== '[object Object]' && t !== '[object Array]') return String(v);
+
+      let out;
+      stack.add(v);
+      if (t === '[object Array]') {
+        out = v.map(x => walk(x, depth + 1));
+      } else {
+        out = {};
+        for (const k of Object.keys(v)) out[k] = walk(v[k], depth + 1);
+      }
+      stack.delete(v);
       return out;
     }
+
+    return walk(root, 0);
+  }
+
+  /* 返回 { value, docs, multi, empty } —— docs > 1 表示 YAML 的多文档（--- 分隔）。 */
+  function parseStructured(body, fmt) {
+    if (fmt === 'yaml') {
+      if (!window.jsyaml) throw new Error('YAML 解析器没加载（ui/vendor/js-yaml.min.js）');
+      /* 用 loadAll 而不是 load：空文件 load() 会抛「input is empty」，可空配置是正常的
+         （空 YAML 很常见，注释掉全部内容就长这样）；多文档也只有 loadAll 拿得到。 */
+      const docs = window.jsyaml.loadAll(body) || [];
+      if (!docs.length || (docs.length === 1 && docs[0] === undefined))
+        return { value: null, docs: 0, empty: true };
+      if (docs.length === 1) return { value: plainData(docs[0]), docs: 1 };
+      return { value: plainData(docs), docs: docs.length, multi: true };
+    }
+    if (fmt === 'toml') {
+      if (!window.smolToml) throw new Error('TOML 解析器没加载（ui/vendor/smol-toml.js）');
+      return { value: plainData(window.smolToml.parse(body)), docs: 1 };
+    }
+    /* JSON 不走 plainData：JSON.parse 出来的本来就没有 Date / 循环引用，
+       而这一趟深拷贝对几 MB 的响应是白花的开销。 */
+    return { value: JSON.parse(body), docs: 1 };
+  }
+
+  /* 解析失败要说人话。YAML / TOML 的报错都带行列，比 JSON 那个
+     "Unexpected token } in JSON at position 42" 有用得多，得把位置抠出来。 */
+  function describeParseError(e, fmt, body) {
+    const full = String((e && (e.reason || e.message)) || e || '解析失败');
+    const msg = full.split('\n')[0].replace(/^Invalid TOML document:\s*/, '');
+    let line = 0, col = 0;
+
+    if (fmt === 'yaml' && e && e.mark) {
+      line = (e.mark.line | 0) + 1;          /* js-yaml 的 mark 是 0 基 */
+      col = (e.mark.column | 0) + 1;
+    } else if (fmt === 'toml' && e && e.line) {
+      line = e.line | 0;                     /* smol-toml 已经是 1 基 */
+      col = (e.column | 0) || 0;
+    } else {
+      /* JSON.parse 只有 position（字符下标），换算成行列；换不出来就只说"语法有误" */
+      const m = /position (\d+)/.exec(full);
+      if (m) {
+        const head = String(body || '').slice(0, m[1] | 0).split('\n');
+        line = head.length;
+        col = head[head.length - 1].length + 1;
+      }
+    }
+    return line ? (msg + '（第 ' + line + ' 行' + (col ? '第 ' + col + ' 列' : '') + '）') : msg;
+  }
+
+  function analyzeResult(res) {
+    const out = {
+      format: '', isData: false, data: null, hasPath: false, extracted: undefined
+      , pathError: '', parseError: '', docs: 0, multi: false, empty: false
+    };
+    /* 本地文件的格式跟着 AHK 回执走；网络响应没有这个字段，一律按 JSON */
+    const fmt = (res && res.file && res.format) ? res.format : 'json';
+    out.format = fmt;
+    /* 读到了但正文是空的（空文件 / 空响应）—— 不算解析失败，别弹错 */
+    if (!res || !res.body) { out.empty = true; return out; }
+
+    let got;
+    try {
+      got = parseStructured(res.body, fmt);
+    } catch (e) {
+      /* 不认识的扩展名（.txt / .log / 无扩展名）试一把 JSON 失败，不算"解析失败"：
+         用户本来就没说它是 JSON，报语法错只会让人以为文件坏了。
+         只有扩展名明确写着 json/yaml/toml 的，坏了才值得指出坏在哪一行。 */
+      if (fmt !== 'text') out.parseError = describeParseError(e, fmt, res.body);
+      return out;
+    }
+
+    out.isData = true;
+    out.docs = got.docs || 1;
+    out.multi = !!got.multi;
+    out.empty = !!got.empty;
+    out.data = got.value;
+
     const path = res.item && res.item.jsonPath;
     if (path) {
       out.hasPath = true;
-      const r = getByPath(out.json, path);
+      const r = getByPath(out.data, path);
       if (r.ok) out.extracted = r.value;
       else out.pathError = r.error;
     }
@@ -2630,6 +2747,17 @@
     return rows;
   }
 
+  /* 全展开 / 全折叠。折叠时**保留最外层不动**：连根一起收起来就只剩一行
+     「{ 57 个字段 }」，那不是折叠、是把内容藏了 —— 用户想看的是顶层有哪些字段。 */
+  function jsonSetAll(open) {
+    if (!els.rJson) return;
+    const nodes = els.rJson.querySelectorAll('.jnode');
+    for (const n of nodes) {
+      const isTop = !!(n.parentElement && n.parentElement.classList.contains('jroot'));
+      n.classList.toggle('collapsed', !open && !isTop);
+    }
+  }
+
   /* ---------------------------------------------------------- 面板内搜索 */
 
   const jview = { hits: [], idx: -1, q: '' };
@@ -2854,7 +2982,7 @@
     const an = analyzeResult(res);
     let text = res.body || '';
     let isJsonView = false;
-    let treeVal;                      /* 有值 = 这份 JSON 能画成可折叠的树 */
+    let treeVal;                      /* 有值 = 这份数据能画成可折叠的树 */
     let treeNote = '';
 
     if (isDl) {
@@ -2867,10 +2995,11 @@
         isJsonView = typeof an.extracted !== 'string';
         if (isJsonView) treeVal = an.extracted;
       }
-    } else if (an.isJson) {
-      text = JSON.stringify(an.json, null, 2);
+    } else if (an.isData && !an.empty) {
+      /* 三种格式到这里已经都是普通对象/数组了，后面一视同仁 */
+      text = JSON.stringify(an.data, null, 2);
       isJsonView = true;
-      treeVal = an.json;
+      treeVal = an.data;
     }
 
     /* 行数太多就不建树：几万个 div 只会让面板卡住，不如老老实实显示文本 */
@@ -2914,12 +3043,19 @@
       if (res.backup) bits.push('原文件已备份');
       if (res.skipped) bits.push('onExists: skip');
     } else {
+      /* 先说清"按哪种语法看的"，后面那些提示才有上下文 */
+      if (isFile && !res.loading && res.ok && FORMAT_LABEL[an.format])
+        bits.push(FORMAT_LABEL[an.format]);
+      if (an.multi) bits.push(an.docs + ' 个文档');
+      /* 解析失败不占正文：原文照常显示，坏在哪儿写在这儿 */
+      if (an.parseError) bits.push('解析失败：' + an.parseError);
+      else if (!an.isData && !an.empty && !res.loading && res.body)
+        bits.push('不是 ' + (FORMAT_LABEL[an.format] || 'JSON') + '，按原文显示');
       if (an.hasPath && res.view === 'body' && !an.pathError)
         bits.push('jsonPath: ' + (item.jsonPath || ''));
       if (an.hasPath && an.pathError) bits.push('取路径失败');
       if (res.truncated) bits.push('响应过大已截断');
       if (treeNote) bits.push(treeNote);
-      if (!an.isJson && !res.loading && res.body) bits.push('非 JSON，按原文显示');
       if (tree && tree.length > JSON_AUTO_LINES) bits.push('点数 = 折叠，行尾 = 复制字段');
       /* 本地文件多给一句"这是磁盘上的，可能已经被改过"，省得以为是实时视图 */
       if (isFile && !res.loading && res.ok) bits.push('读的是磁盘内容，改完点「刷新」');
@@ -2930,6 +3066,8 @@
     /* 按钮 */
     els.rToggle.hidden = isDl || !an.hasPath;
     els.rToggle.textContent = res.view === 'body' ? '完整响应' : '只看结果';
+    els.rExpand.hidden = !tree;
+    els.rCollapse.hidden = !tree;
 
     state.viewText = text;
   }
@@ -3055,6 +3193,8 @@
     els.rMeta = $('rMeta');
     els.rToggle = $('rToggle');
     els.rRefresh = $('rRefresh');
+    els.rExpand = $('rExpand');
+    els.rCollapse = $('rCollapse');
     els.rJson = $('rJson');
     els.rFind = $('rFind');
     els.rFindBar = $('rFindBar');
@@ -3135,6 +3275,8 @@
     $('rClose').addEventListener('click', closeResult);
     $('rCopy').addEventListener('click', copyResult);
     els.rRefresh.addEventListener('click', refreshResult);
+    els.rExpand.addEventListener('click', () => jsonSetAll(true));
+    els.rCollapse.addEventListener('click', () => jsonSetAll(false));
     els.rToggle.addEventListener('click', () => {
       if (!state.result) return;
       state.result.view = state.result.view === 'body' ? 'full' : 'body';
@@ -3482,7 +3624,8 @@
   window.__qlTest = {
     parseQuery, getByPath, highlightJson, buildUrl, toQueryString,
     jsonRows, keySeg, jsonValText,
-    renderJsonTree, jsonFind, clearFind,
+    renderJsonTree, jsonFind, clearFind, jsonSetAll,
+    plainData, parseStructured, describeParseError, analyzeResult,
     scoreOf: scoreOf, scoreOne: scoreOne, fieldQuality: fieldQuality,
     subseqQuality: subseqQuality, lastTokenRange: lastTokenRange,
     splitForComplete: splitForComplete, histComplete: histComplete,

@@ -25,6 +25,12 @@ const JS_FILE = path.join(os.tmpdir(), 'ql-jsonfile-probe.js');
 const LOG = path.join(SANDBOX, '_jsonfile.log');
 const FIXTURE = path.join(BASE, 'data.json');
 const PLAIN = path.join(BASE, 'note.txt');
+const YAML1 = path.join(BASE, 'svc.yml');
+const YAML2 = path.join(BASE, 'multi.yaml');
+const TOML1 = path.join(BASE, 'cfg.toml');
+const YAMLBAD = path.join(BASE, 'broken.yml');
+const BIGYAML = path.join(BASE, 'big.yml');
+const BIGTXT = path.join(BASE, 'big.txt');
 
 function copyDir(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
@@ -61,6 +67,70 @@ function prepare() {
   writeFixture('首读');
   fs.writeFileSync(PLAIN, '这是一份纯文本，不是 JSON。\n第二行。\n', 'utf8');
 
+  /* YAML：中文键、嵌套、数组、日期、以及一个足够深的层级用来验展开/折叠 */
+  fs.writeFileSync(YAML1, [
+    '服务名: 网关',
+    'replicas: 3',
+    '启用: true',
+    '启动于: 2024-06-01',
+    '端口:',
+    '  - 8080',
+    '  - 8443',
+    '数据库:',
+    '  host: db.local',
+    '  pool: 8',
+    '  认证:',
+    '    user: admin',
+    '    from: env',
+    '标签:',
+    '  - 生产',
+    '  - 上海',
+    ''
+  ].join('\n'), 'utf8');
+
+  /* 多文档：元信息要标"3 个文档"，树根得是数组 */
+  fs.writeFileSync(YAML2, [
+    '---',
+    'kind: Service',
+    'name: alpha',
+    '---',
+    'kind: Deployment',
+    'name: beta',
+    'replicas: 2',
+    '---',
+    'kind: ConfigMap',
+    'name: gamma',
+    ''
+  ].join('\n'), 'utf8');
+
+  /* TOML：表 + 数组表 + 日期（日期是最容易画成 {} 的那种值） */
+  fs.writeFileSync(TOML1, [
+    'title = "演示"',
+    'port = 8080',
+    '',
+    '[owner]',
+    'name = "张三"',
+    'joined = 2024-01-02T03:04:05Z',
+    '',
+    '[[items]]',
+    'id = 1',
+    'title = "第一项"',
+    '',
+    '[[items]]',
+    'id = 2',
+    'title = "第二项"',
+    ''
+  ].join('\n'), 'utf8');
+
+  /* 语法坏掉的 YAML：要退回纯文本，而不是白屏或者报"文件读不了" */
+  fs.writeFileSync(YAMLBAD, 'a: [1,\n  b: 2\n', 'utf8');
+
+  /* 3.6MB：同一个体积，.yml 该被 2MB 上限拦下，.txt 该照 8MB 放行 ——
+     这两条一起才说明"上限是按格式分的"，而不是把全局上限改小了 */
+  const big = 'k: value\n'.repeat(400000);
+  fs.writeFileSync(BIGYAML, big, 'utf8');
+  fs.writeFileSync(BIGTXT, big, 'utf8');
+
   const cfg = {
     items: [
       {
@@ -80,6 +150,34 @@ function prepare() {
       {
         id: 'jfplain', name: '看一个纯文本', type: 'jsonfile', group: 'net',
         target: 'file://' + PLAIN
+      },
+      {
+        id: 'yfone', name: '看 YAML', type: 'jsonfile', group: 'net',
+        target: 'file://' + YAML1
+      },
+      {
+        id: 'yfmulti', name: '看多文档 YAML', type: 'jsonfile', group: 'net',
+        target: 'file://' + YAML2
+      },
+      {
+        id: 'tfone', name: '看 TOML', type: 'jsonfile', group: 'net',
+        target: 'file://' + TOML1
+      },
+      {
+        id: 'yfbad', name: '看坏掉的 YAML', type: 'jsonfile', group: 'net',
+        target: 'file://' + YAMLBAD
+      },
+      {
+        id: 'yfpath', name: 'YAML 只取一个字段', type: 'jsonfile', group: 'net',
+        target: 'file://' + YAML1, jsonPath: '数据库.认证.user'
+      },
+      {
+        id: 'yfbig', name: '看一个巨大的 YAML', type: 'jsonfile', group: 'net',
+        target: 'file://' + BIGYAML
+      },
+      {
+        id: 'txbig', name: '看一个同样大的文本', type: 'jsonfile', group: 'net',
+        target: 'file://' + BIGTXT
       }
     ]
   };
@@ -166,8 +264,108 @@ const PAGE_JS = `(async () => {
     ok('纯文本按原文显示', $('rPre').textContent.indexOf('这是一份纯文本') >= 0,
       $('rPre').textContent.slice(0, 40));
     ok('纯文本没有硬画成树', $('rJson').hidden === true);
-    ok('元信息标注了"非 JSON"', $('rMeta').textContent.indexOf('非 JSON') >= 0,
+    ok('元信息标注了"不是 JSON"', $('rMeta').textContent.indexOf('不是 JSON') >= 0,
       $('rMeta').textContent);
+    /* .txt 本来就不是 JSON，试解析失败不能报成"解析失败"，那是在制造问题 */
+    ok('纯文本不被说成"解析失败"', $('rMeta').textContent.indexOf('解析失败') < 0,
+      $('rMeta').textContent);
+
+    /* ---------------- YAML：按扩展名选解析器，照样进同一棵树 ---------------- */
+    window.__cli({ rid: 'b1', mode: 'run', q: 'yfone' });
+    await wait(1500);
+    ok('YAML 读出来了', $('rStatus').textContent.indexOf('已读取') >= 0, $('rStatus').textContent);
+    ok('YAML 走树视图', !$('rJson').hidden && $('rPre').hidden,
+      'rJson.hidden=' + $('rJson').hidden);
+    ok('YAML 中文键显示出来', $('rJson').textContent.indexOf('服务名') >= 0,
+      $('rJson').textContent.slice(0, 60));
+    ok('YAML 数组元素显示出来', $('rJson').textContent.indexOf('8080') >= 0);
+    ok('元信息标注了 YAML', $('rMeta').textContent.indexOf('YAML') >= 0, $('rMeta').textContent);
+    ok('YAML 没被说成"不是 YAML"', $('rMeta').textContent.indexOf('不是 YAML') < 0, $('rMeta').textContent);
+    /* 日期是 YAML/TOML 最容易画错的值：规范化没做对就会变成 {} */
+    ok('YAML 日期显示成原文', $('rJson').textContent.indexOf('2024-06-01') >= 0,
+      $('rJson').textContent.slice(0, 80));
+
+    /* 展开/折叠：按钮要出现，点了要真的改变可见行数 */
+    ok('展开全部按钮可见', $('rExpand').hidden === false);
+    ok('折叠全部按钮可见', $('rCollapse').hidden === false);
+
+    const visRows = () => Array.prototype.filter.call(
+      $('rJson').querySelectorAll('.jline'), el => el.offsetParent !== null).length;
+
+    const rowsOpen = visRows();
+    $('rCollapse').click();
+    await wait(120);
+    const rowsClosed = visRows();
+    ok('折叠全部后可见行变少', rowsClosed < rowsOpen, rowsOpen + ' -> ' + rowsClosed);
+    ok('折叠全部仍保留顶层字段', rowsClosed >= 3, rowsClosed);
+    const topNode = $('rJson').querySelector('.jroot > .jnode');
+    ok('折叠全部不折最外层（否则整屏只剩一行）',
+      !!topNode && !topNode.classList.contains('collapsed'));
+
+    $('rExpand').click();
+    await wait(120);
+    const rowsReopen = visRows();
+    ok('展开全部后行都回来了', rowsReopen >= rowsOpen, rowsOpen + ' -> ' + rowsReopen);
+    ok('展开全部后深处节点也露出来', $('rJson').textContent.indexOf('env') >= 0);
+
+    /* ---------------- 多文档 YAML ---------------- */
+    window.__cli({ rid: 'b2', mode: 'run', q: 'yfmulti' });
+    await wait(1500);
+    ok('多文档走树视图', !$('rJson').hidden);
+    ok('元信息标了文档数', $('rMeta').textContent.indexOf('3 个文档') >= 0, $('rMeta').textContent);
+    ok('三个文档都在树里',
+      ['alpha', 'beta', 'gamma'].every(s => $('rJson').textContent.indexOf(s) >= 0),
+      $('rJson').textContent.slice(0, 80));
+
+    /* ---------------- TOML ---------------- */
+    window.__cli({ rid: 'b3', mode: 'run', q: 'tfone' });
+    await wait(1500);
+    ok('TOML 走树视图', !$('rJson').hidden && $('rPre').hidden);
+    ok('元信息标注了 TOML', $('rMeta').textContent.indexOf('TOML') >= 0, $('rMeta').textContent);
+    ok('TOML 表结构显示出来', $('rJson').textContent.indexOf('张三') >= 0);
+    ok('TOML 数组表显示成 2 项', $('rJson').textContent.indexOf('2 项') >= 0,
+      $('rJson').textContent.slice(0, 80));
+    /* 这一条是重点：Date 不规范化就会渲染成 "{ }"，用户完全看不懂 */
+    ok('TOML 日期显示成 ISO 串', $('rJson').textContent.indexOf('2024-01-02') >= 0,
+      $('rJson').textContent.slice(0, 100));
+    ok('TOML 日期没被画成空对象', $('rJson').textContent.indexOf('joined') >= 0
+      && $('rJson').textContent.indexOf('{}') < 0 && $('rJson').textContent.indexOf('{ }') < 0,
+      $('rJson').textContent.slice(0, 100));
+
+    /* ---------------- 语法坏掉的 YAML：退回原文，但要说明坏在哪 ---------------- */
+    window.__cli({ rid: 'b4', mode: 'run', q: 'yfbad' });
+    await wait(1200);
+    ok('坏 YAML 文件本身读到了', $('rStatus').textContent.indexOf('已读取') >= 0,
+      $('rStatus').textContent);
+    ok('坏 YAML 退回纯文本', $('rJson').hidden === true);
+    ok('坏 YAML 正文还是原文', $('rPre').textContent.indexOf('b: 2') >= 0,
+      $('rPre').textContent.slice(0, 40));
+    ok('坏 YAML 元信息说了解析失败', /解析失败/.test($('rMeta').textContent), $('rMeta').textContent);
+    /* 注意 \\d：这段脚本本身在模板字符串里，写 \d 会被模板字符串吃掉反斜杠 */
+    ok('坏 YAML 报错带行号', /第 \\d+ 行/.test($('rMeta').textContent), $('rMeta').textContent);
+    ok('坏 YAML 不显示展开/折叠', $('rExpand').hidden === true && $('rCollapse').hidden === true);
+
+    /* ---------------- YAML 上的 jsonPath ---------------- */
+    window.__cli({ rid: 'b5', mode: 'run', q: 'yfpath' });
+    await wait(1200);
+    const yv = $('rJson').hidden ? $('rPre').textContent : $('rJson').textContent;
+    ok('YAML 的 jsonPath 提取生效（中文键）', yv.indexOf('admin') >= 0, yv.slice(0, 40));
+    ok('配了 jsonPath 就有"完整响应"按钮', $('rToggle').hidden === false);
+
+    /* ---------------- 上限按格式分：3.6MB 的 .yml 拒读，.txt 照读 ---------------- */
+    window.__cli({ rid: 'b6', mode: 'run', q: 'yfbig' });
+    await wait(1500);
+    ok('超大 YAML 被拒读', $('rStatus').textContent.indexOf('读取失败') >= 0, $('rStatus').textContent);
+    ok('超大 YAML 说清上限是 2MB', $('rPre').textContent.indexOf('2.00 MB') >= 0,
+      $('rPre').textContent.slice(0, 90));
+    ok('超大 YAML 说清"没有读取"', $('rPre').textContent.indexOf('没有读取') >= 0,
+      $('rPre').textContent.slice(0, 90));
+
+    window.__cli({ rid: 'b7', mode: 'run', q: 'txbig' });
+    await wait(2500);
+    ok('同样大的文本文件照常读（上限没有一刀切）',
+      $('rStatus').textContent.indexOf('已读取') >= 0, $('rStatus').textContent);
+    ok('大文本按原文显示', $('rPre').textContent.indexOf('k: value') >= 0);
 
     /* ---------------- 手动刷新：真的重新读盘 ---------------- */
     window.__cli({ rid: 'a4', mode: 'run', q: 'jftree' });

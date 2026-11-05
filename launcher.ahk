@@ -36,6 +36,10 @@ global CLI_DIR    := A_Temp '\quicklaunch-cli'    ; 客户端的回执文件放�
 global SCHED_LOG  := SCRIPT_DIR '\sched.log'      ; 定时任务的执行记录（一行一条，主界面没有入口，靠它查）
 global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
 global FILE_MAX_BODY := 8 * 1024 * 1024   ; jsonfile 读本地文件的上限（字节）。超了一律拒读，见 DoReadJson
+; YAML / TOML 单独一个上限，比 JSON 小得多：这两种解析器是逐字符扫状态机，
+; 实测 8MB 要 1 秒以上（JSON.parse 只要 6ms），同步解析会把界面按住。
+; 再说这个体量的配置文件本身罕见，2MB 足够覆盖到最大的 k8s / compose 合集。
+global FILE_MAX_TEXT := 2 * 1024 * 1024
 ; webhook 模板里内联文件（{{#file:…}} / filebase64 / filehash）的上限。
 ; 比 jsonfile 小得多：内容要拼进字符串、再编码成 UTF-8 写盘，体积翻倍是常事，
 ; 真拿它传大文件会卡住界面，而且 base64 之后还要再涨 1/3。
@@ -583,7 +587,7 @@ ListShares(server) {
     回执故意做得和 http-result 同形（ok / ms / body / error / truncated），
     前端那一整套 JSON 树、Ctrl+F 查找、jsonPath 提取就能直接复用，一行都不用改。 */
 DoReadJson(raw) {
-    global FILE_MAX_BODY
+    global FILE_MAX_BODY, FILE_MAX_TEXT
     id := JsonStr(raw, 'id')
     if (id = '')
         id := 'f' A_TickCount
@@ -600,20 +604,44 @@ DoReadJson(raw) {
 
     size := 0
     try size := FileGetSize(p)
-    /* 超限直接拒读，不截断：截断过的 JSON 一定解析失败，会退化成纯文本，
+    /* 超限直接拒读，不截断：截断过的配置一定解析失败，会退化成纯文本，
        用户看到的就是「这文件好像坏了」，比明说「太大了」误导得多。 */
-    if (size > FILE_MAX_BODY)
-        return JsReadFail(id, '文件太大（' FmtBytes(size) '），上限 ' FmtBytes(FILE_MAX_BODY) '，没有读取'
-            , p, size)
+    fmt := DataFormatOf(p)
+    /* 只有 YAML / TOML 走小上限：它们现场解析，慢；JSON 和纯文本 8MB 照旧 */
+    maxBody := (fmt = 'yaml' || fmt = 'toml') ? FILE_MAX_TEXT : FILE_MAX_BODY
+    if (size > maxBody)
+        return JsReadFail(id, '文件太大（' FmtBytes(size) '），预览上限是 '
+            . FmtBytes(maxBody) '，没有读取', p, size)
 
     err := ''
     body := ReadTextFile(p, &err)
     if (err != '')
         return JsReadFail(id, err, p, size)
 
+    /* format 由这边判、跟着回执走，前端不再自己看一遍扩展名 —— 两处各判一次，
+       迟早会在"大写扩展名""file:// 带百分号编码"这类边角上分叉。 */
     JsSend('{"type":"jsonfile-result","id":' JsonQuote(id) ',"ok":1'
         . ',"ms":' (A_TickCount - t0) ',"size":' size ',"truncated":0,"error":""'
-        . ',"path":' JsonQuote(p) ',"body":' JsonQuote(body) '}')
+        . ',"format":' JsonQuote(fmt) ',"path":' JsonQuote(p) ',"body":' JsonQuote(body) '}')
+}
+
+/* 本地文件按哪种语法解读，只看扩展名，不从内容猜：
+   YAML 几乎能把任何文本解析成"一个标量"，猜错的代价是纯文本文件被当成
+   "只有一个字符串的 YAML"，比不解析更让人困惑。
+
+   不认识的扩展名（.txt / .log / 没有扩展名）返回 text：前端仍会试一把 JSON
+   （保持原来"随便丢个文件进来，能解析就画树"的习惯），但**失败不报"解析失败"**
+   —— 用户本来就没说它是 JSON，报语法错只会让人以为文件坏了。 */
+DataFormatOf(p) {
+    SplitPath(p, , , &ext)
+    ext := StrLower(ext)
+    if (ext = 'json')
+        return 'json'
+    if (ext = 'yaml' || ext = 'yml')
+        return 'yaml'
+    if (ext = 'toml')
+        return 'toml'
+    return 'text'
 }
 
 JsReadFail(id, msg, p, size) {

@@ -130,6 +130,9 @@ wv2-launcher/
 │  ├─ index.html         界面结构
 │  ├─ app.css            样式（亮色、圆角、卡片、列表、Toast）
 │  ├─ pinyin.js          拼音表（自动生成，42KB，GB2312 6763 字）
+│  ├─ vendor/
+│  │  ├─ js-yaml.min.js  YAML 解析器（5.5.0，MIT，官方 UMD 产物）
+│  │  └─ smol-toml.js    TOML 解析器（1.9.1，BSD-3，CJS 单文件 + IIFE 垫片）
 │  └─ app.js             搜索打分/拼音/键盘导航/参数态/补全/与 AHK 通信
 ├─ lib/
 │  ├─ WebView2/WebView2.ahk   thqby 的 WebView2 COM 绑定库（MIT）
@@ -150,6 +153,7 @@ wv2-launcher/
 │  ├─ keys.test.js       空格键语义 / 切范围保选择（14 条）
 │  ├─ drop.test.js       file:// URI → 本地路径（中文/空格/UNC/坏转义，14 条）
 │  ├─ jsonfile.test.js  jsonfile 类型：target 原样保留/类型标签/参数校验（20 条）
+│  ├─ config-format.test.js  YAML/TOML：解析分派/Date 与循环引用/报错行列（39 条）
 │  ├─ multipart.test.js multipart 归一化/模板替换/请求头不补 JSON/压平格式（40 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
@@ -167,7 +171,7 @@ wv2-launcher/
 │  ├─ hdr-e2e.js         请求头动态值端到端：本地回显服务看真实收到的头（加 --exe 测编译版）
 │  ├─ wh-cli-check.js    --webhook 的 --json/--body：真跑子进程，验输出与退出码（37 项，加 --exe 测编译版）
 │  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进，并验证 hidden 条目不上界面（45 项）
-│  ├─ jsonfile-check.js  jsonfile 真机全链路：真读盘、真渲染、点刷新时改文件看内容跟不跟（30 项）
+│  ├─ jsonfile-check.js  jsonfile 真机全链路：真读盘、真渲染、点刷新时改文件看内容跟不跟（67 项）
 │  ├─ mp-e2e.js          multipart 与模板读文件端到端：本地回显服务逐字节比对包体和文件（36 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
@@ -192,6 +196,7 @@ wv2-launcher/
 > node tests/keys.test.js      # 14 条（空格认高亮行 / 切范围保选择，见踩坑 50）
 > node tests/drop.test.js      # 14 条（file:// URI → 本地路径，见踩坑 51）
 > node tests/jsonfile.test.js  # 20 条（jsonfile 的 target 原样保留 / 参数校验 / Tab 补全判定）
+> node tests/config-format.test.js # 39 条（YAML/TOML 解析分派、Date 与循环引用、报错行列）
 > node tests/multipart.test.js # 40 条（multipart 三种写法 / 模板替换 / 请求头 / 交给 AHK 的压平格式）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
@@ -203,7 +208,7 @@ wv2-launcher/
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
 > node tools/jsonui-check.js   # 真 WebView2 里点折叠/搜索/量缩进（加 --shot 停住方便截图）
-> node tools/jsonfile-check.js # jsonfile 全链路：真读盘/树渲染/错误文案/刷新真的重读（30 项）
+> node tools/jsonfile-check.js # jsonfile 全链路：真读盘/树渲染/YAML+TOML/展开折叠/错误文案/刷新真的重读（67 项）
 > node tools/mp-e2e.js         # multipart + {{#file}} 端到端：真发请求，服务端逐字节比对（36 项）
 > node tools/build-exe.js      # 编译成 dist\QuickLaunch.exe（需要 Ahk2Exe，见「九」）
 > ```
@@ -257,8 +262,9 @@ wv2-launcher/
 - `webhook` —— 发 HTTP 请求，把响应显示在面板里（见下方「webhook 类型」）
 - `download` —— 下载小文件并保存到本地（见下方「download 类型」），是 `webhook` 的变种：
   联网逻辑完全一样，只是响应体按**二进制**写进文件而不是显示在面板里
-- `jsonfile` —— 读**本地**一个 JSON 文件并显示成树（见下方「jsonfile 类型」）。
-  **不联网、不发请求**，借的是 `webhook` 那套 JSON 树 / `Ctrl+F` / `jsonPath`，只是数据来自磁盘
+- `jsonfile` —— 读**本地**一个配置文件（JSON / YAML / TOML，按扩展名选解析器）并显示成树
+  （见下方「jsonfile 类型」）。**不联网、不发请求**，借的是 `webhook` 那套 JSON 树 /
+  `Ctrl+F` / `jsonPath`，只是数据来自磁盘
 
 顶层除了 `items`，还可以有 `groups`（分组，见下）和 `schedules`（定时任务，
 见「[七、定时调度](#七定时调度)」）。两个都是可选的，不写就是没有。
@@ -699,6 +705,7 @@ global SIG_KEYS := Map(
 | 想做的事 | 怎么做 |
 |---|---|
 | 折叠一整块 | 点行首的 `▾`；折叠后显示成 `{… 12 个字段}`，收起的子树不再占地方 |
+| 全部展开 / 全部折叠 | 右上角「展开全部」「折叠全部」。折叠时**保留最外层**：连根一起收起来就只剩一行 `{ 57 个字段}`，那不是折叠，是把内容藏了 |
 | 搜索 | 右上角放大镜或 `Ctrl+F`。`Enter` 下一个、`Shift+Enter` 上一个，命中会自动展开祖先节点 |
 | 复制单个字段 | 鼠标移到那一行，点行尾的 `⧉`。字符串复制原文，对象/数组复制整段缩进好的 JSON |
 | 复制当前视图 | 右上角「复制」 |
@@ -855,10 +862,23 @@ ql --webhook C:\path\spec.ini --body | jq .data.items[0]
 }
 ```
 
-### jsonfile 类型（看本地 JSON 文件）
+### jsonfile 类型（看本地配置文件：JSON / YAML / TOML）
 
-本机硬盘上有一份 JSON，想用这个工具那套「可折叠的树 + 字段搜索 + `jsonPath` 取值」
+本机硬盘上有一份配置文件，想用这个工具那套「可折叠的树 + 字段搜索 + `jsonPath` 取值」
 去看它 —— 这就是 `jsonfile`。**它不发任何网络请求**，AHK 直接把文件读出来交给页面。
+
+按**扩展名**选解析器，不从内容猜：YAML 几乎能把任何文本都解析成"一个标量"，
+猜错的代价是纯文本文件被当成"只有一个字符串的 YAML"，比不解析更让人困惑。
+
+| 扩展名 | 解析器 | 备注 |
+|---|---|---|
+| `.json` | 浏览器内置 `JSON.parse` | 原来的行为 |
+| `.yaml` / `.yml` | js-yaml 5.5.0 | 多文档（`---`）自动包成数组 |
+| `.toml` | smol-toml 1.9.1 | 日期转成 ISO 字符串 |
+| 其它（`.txt` / `.log` / 无扩展名） | 也试一把 `JSON.parse` | 失败按原文显示，**不报"解析失败"** |
+
+三种格式解析完都是**普通对象/数组**，所以后面的树、折叠、搜索、`jsonPath`
+是同一套代码，不是三份实现。
 
 ```jsonc
 {
@@ -900,11 +920,36 @@ ql --webhook C:\path\spec.ini --body | jq .data.items[0]
 |---|---|
 | 面板显示 | 方法徽标是 `FILE`，地址行是**解析后的绝对路径**，状态行是「已读取 · 体积 · 耗时」——不显示 HTTP 状态码，因为这个功能根本没有请求 |
 | 复用 webhook 的显示 | JSON 树、折叠、`Ctrl+F` 查找、字段复制、`jsonPath` 提取、只看结果 / 完整内容切换，全部和 webhook 一致 |
-| 非 JSON 文件 | **按原文显示**并标注「非 JSON」，不报错（和 webhook 对非 JSON 响应的态度一致） |
+| 展开全部 / 折叠全部 | 有树的时候面板上有这两个按钮。折叠时**保留最外层**——连根一起收起来就只剩一行「{ 57 个字段}」，那不是折叠，是把内容藏了 |
+| 元信息里的格式 | 正文上方会标一行 `JSON` / `YAML` / `TOML`，多文档 YAML 再加一句「N 个文档」 |
+| 解析失败 | **正文照常按原文显示**，元信息里写清坏在哪：「解析失败：deficient indentation（第 3 行第 1 列）」。YAML / TOML 的报错都带行列，比 JSON 那个 `Unexpected token at position 42` 有用 |
+| 不是配置文件 | `.txt` / `.log` 这类不认识的扩展名会试一把 JSON，失败就按原文显示并标注「不是 JSON，按原文显示」——用户本来就没说它是 JSON，报语法错只会让人以为文件坏了 |
 | 手动刷新 | 面板上有「刷新」按钮，重新读一遍文件。**不做自动刷新** —— 那会让它和 webhook 的行为分叉 |
-| 大小上限 | 8 MB。超了**直接报错不读**：截断过的 JSON 一定解析失败，退化成纯文本反而让人以为文件坏了 |
+| 大小上限 | `.json` 和纯文本 8 MB；`.yaml` / `.toml` **2 MB**。差别在解析耗时：实测 8 MB 的 YAML 要 1.1 秒（`JSON.parse` 6 ms），同步解析会把界面按住。超了一律报错不读，截断过的配置一定解析失败，退化成纯文本反而让人以为文件坏了 |
 | 编码 | 自动认 BOM（UTF-8 / UTF-16 都行）；无 BOM 的 GBK 文件会按 936 再读一次 |
 | 定时任务 / `ql` | 和 webhook 一样能挂调度、能用 `ql run <id>` 跑（结果打到 stdout 的是一行摘要） |
+
+#### YAML / TOML 的几处差异（用之前值得知道）
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 多文档 YAML（`---` 分隔）显示成一个数组 | 一份文件里有 N 个文档，没别的办法同时装下 | 元信息标「N 个文档」，树根是数组 |
+| `on: yes` 显示成字符串 `"yes"`，不是 `true` | js-yaml 默认按 **YAML 1.2** 解析，1.2 里只有 `true/false` 是布尔（1.1 的 `yes/no/on/off` 不是） | 按 1.2 理解。GitHub Actions 的 `on:` 键不受影响（键名仍是 `"on"`） |
+| TOML 的日期显示成 `2024-01-02T03:04:05.000Z` | TOML 解析器返回 `Date` 对象，而树渲染只认普通值 | 解析后统一转成 ISO 字符串，所以不会画成 `{ }` |
+| 带锚点的 YAML 可能出现「（循环引用）」 | `a: &x {self: *x}` 在 YAML 里合法，能造出真正的环 | 解析后过一遍规范化，环替换成提示，否则递归渲染会爆栈 |
+| 自定义标签（`!Foo`）报「unknown tag」 | 默认 schema 不认自定义标签，**这也是安全边界**：`!!js/function` 不会被执行 | 按原文看，或用标准 YAML 重写 |
+
+#### 这两个解析器从哪来
+
+放在 `ui/vendor/`，**是原样引入的静态文件，不是 npm 依赖**：没有 `package.json`、
+没有 `node_modules`、没有构建步骤，和 `ui/pinyin.js` 一样由 `<script>` 直接加载。
+
+| 文件 | 版本 | 许可 | 来源与改动 |
+|---|---|---|---|
+| `js-yaml.min.js` | 5.5.0 | MIT | 官方 UMD 产物 `dist/browser/js-yaml.umd.min.js`，只补了许可头、去掉末尾指向 `.map` 的注释 |
+| `smol-toml.js` | 1.9.1 | BSD-3-Clause | 官方 `dist/index.cjs` 原样包进一层 IIFE 垫片（它自带全部依赖、零 `require`），全局名 `smolToml` |
+
+升级时按同样方式重做一次即可，命令写在「实现要点」的第 78 条。
 
 > 为什么不用浏览器直接 `fetch('file://…')`：页面本身是 `file://` 装载的，
 > Chromium 默认禁止 `file://` 页面去取另一个 `file://` 文件（不一致的 opaque origin），
@@ -1509,7 +1554,8 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
 65. **超限的 JSON 不能截断，只能拒读。** webhook 那套是"超过 40 万字符截断 + 提示"（`HTTP_MAX_BODY`），
     因为 HTTP 响应截一段还能看。JSON 不行：截断必然缺括号，`JSON.parse` 一定失败，
     于是退化成纯文本 —— 用户看到的是"这文件好像坏了"，而真实原因是"太大了"。
-    所以 `jsonfile` 超过 8MB 直接报错，报错里写清体积和上限。
+    所以 `jsonfile` 一律报错不读，报错里写清体积和上限。
+    上限按格式分：`.json` / 纯文本 8MB，`.yaml` / `.toml` 2MB（现场解析，慢，见第 77 条）。
 
 66. **页面里 `fetch('file://…')` 是走不通的。** 界面是 `wv.Navigate(ToFileUrl(UI_PATH))`
     装载的，页面自己的 origin 就是 `file://`，Chromium 默认禁止 `file://` 页面去取另一个
@@ -1576,6 +1622,40 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     换行检查拒发，而报错信息是「展开后出现换行」—— 完全指不到那个换行是文件带来的。
     裁的是 `
 ` 而不是空格：文件末尾的空格有时是有意义的。
+
+75. **YAML / TOML 能接进同一套树，靠的是"解析完都是普通对象"。** 但解析器交出来的
+    不是纯 JSON 值，直接丢给 `jsonRows` 会出两类事：
+    TOML 的日期是 `Date`，`jsonRows` 把它当对象、`Object.keys()` 为空 → 画成 `{ }`；
+    YAML 的锚点能造出**真正的循环引用**（`a: &x {self: *x}`），而 `jsonRows` 是纯递归、
+    没设防（`JSON.parse` 永远不产生环，所以以前不需要），会直接爆栈。
+    所以在 `analyzeResult` 里加了一层 `plainData` 规范化，把两者都变成纯值再进渲染。
+    判类型用 `Object.prototype.toString` 而不是 `instanceof`：解析器和页面若不在同一个
+    realm，`instanceof Date` 全线返回 false —— 失败是静默的（写用例时就先撞上了这个）。
+
+76. **循环引用用"递归栈"判，不用全局 seen 集合。** 同一个锚点被引用两次是合法的
+    （`a: &x {...}` + `b: *x`，应该各自展开成两份），只有自己嵌自己才算环。
+    全局 seen 会把前者误判成环、显示成「（循环引用）」，那是另一个方向的错。
+
+77. **上限按格式分，是因为解析耗时差两个数量级。** 本机实测同一份 8MB 文档：
+    `JSON.parse` 6ms，js-yaml 1156ms，smol-toml 874ms。这个解析是同步的，
+    放主线程就是界面僵住一秒多。所以 `.yaml` / `.toml` 单独限 2MB（实测 335ms / 209ms），
+    `.json` 和纯文本保持 8MB。判据只有扩展名，**不看内容**：YAML 几乎能把任何文本
+    解析成"一个标量"，盲试会把纯文本文件当成"只有一个字符串的 YAML"。
+
+78. **两个解析器是静态文件，不是依赖。** `ui/vendor/` 下两个文件由 `<script>` 直接加载，
+    项目里没有 `package.json`、没有 `node_modules`、没有构建步骤（和 `ui/pinyin.js` 一致）。
+    js-yaml 官方就有 UMD 产物，原样可用；smol-toml 的 `dist/index.cjs` 是**零 `require`**
+    的单文件，外面包一层 IIFE 垫片（给个 `module`/`exports`）就能当普通脚本跑。
+    升级时按同样方式重做：
+
+    ```sh
+    npm pack js-yaml@<版本> smol-toml@<版本>     # 解包取 dist 里的文件
+    # js-yaml：取 dist/browser/js-yaml.umd.min.js，补许可头、删末尾 sourceMappingURL 注释
+    # smol-toml：取 dist/index.cjs，包进 IIFE，末尾挂 window.smolToml = module.exports
+    ```
+
+    换完跑一遍 `node tests/config-format.test.js`（39 条）和 `node tools/jsonfile-check.js`
+    （67 项）—— 前者用的就是 `ui/vendor` 下的这两个真文件，版本换了它会先知道。
 
 ---
 
@@ -1838,10 +1918,16 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 - `download` 把光标留给「保存路径」这一层：路径存在性、写权限的问题只会得到一句错误提示，
   不会自动换目录；`%VAR%` 只展开一层环境变量，不解析 `~`。
 - 每个请求起一个子进程，没有连接复用；高频连续点会有点开销（单次约 30~80ms 启动成本）。
-- `jsonfile` 一次把整个文件读进内存，上限 8MB，超了直接报错（不截断，见踩坑 65）；
+- `jsonfile` 一次把整个文件读进内存，`.json` / 纯文本上限 8MB、`.yaml` / `.toml` 上限 2MB，
+  超了直接报错（不截断，见踩坑 65 和 77）；
   也**没有**流式解析，所以"几百 MB 的 JSON 只想取一个字段"这种场景它做不了。
 - `jsonfile` 不做自动刷新：面板里是**读的那一刻**的磁盘内容，改完要手动点「刷新」。
 - `jsonfile` 只读、不写、不监控；路径来自你自己的 `config.json`，它不会去猜别的位置。
+- YAML 按 **YAML 1.2** 解析：`yes` / `no` / `on` / `off` 是字符串，不是布尔
+  （1.1 的习惯写法在这里不会变成 `true`）；自定义标签（`!Foo`）会报 unknown tag，
+  这也是安全边界 —— `!!js/function` 之类不会被执行。
+- YAML 的**复杂键**（用 `?` 声明的非标量键）会被 `String()` 化，和 JSON 一样只保留字符串形式；
+  同一个锚点被引用两次会展开成两份独立副本（不是共享引用），这是"规范化"的代价，显示上更好读。
 - 运行时参数只做"空白切分 + 引号"，不解析 `%VAR%`、管道、通配符。
   `app` / `ahk` 的每个参数按需加引号（含空白或引号才加），所以 `cmd.exe` 这类 shell 语义请用 `cmd` 类型条目（原样拼接）。
 - 模板 `{{x}}` 只是**整词替换**，没有表达式：不支持默认值表达式、条件、切片、函数，
@@ -1912,7 +1998,7 @@ node tools/build-exe.js
 |---|---|---|
 | `QuickLaunch.exe` | ✅ | 编译产物 |
 | `config.json` / `launcher.ini` | ✅ | 重编译**不会覆盖**已存在的，别怕丢配置 |
-| `ui\` | ✅ | 界面；改界面不用重编译 |
+| `ui\` | ✅ | 界面（含 `ui\vendor\` 里的 YAML / TOML 解析器）；改界面不用重编译 |
 | `lib\WebView2Loader.dll` | ✅ | WebView2 加载器 |
 | `runtime\AutoHotkey64.exe` | 只有 `ahk` 类型要 | 跑别人的 `.ahk` 用。webhook / download 不依赖它，删掉也行 |
 | `ql.cmd` / `run.bat` | 可选 | 自己会判断同目录有没有 exe |
