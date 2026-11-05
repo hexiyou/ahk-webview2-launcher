@@ -392,7 +392,7 @@
 
      刻意不含 workdir：它在 normalizeItem 里已经按"相对脚本目录"展开成绝对路径了，
      再往里塞模板只会得到 `D:\app\C:\work` 这种四不像。 */
-  const TPL_FIELDS = ['target', 'args', 'query', 'headers', 'body', 'savePath', 'fileName'];
+  const TPL_FIELDS = ['target', 'args', 'query', 'headers', 'body', 'savePath', 'fileName', 'multipart'];
 
   /* 三种写法：{{{{ 出字面 {{，}}}} 出字面 }}，{{ name }} 才是变量。
      逃生口是给「参数本身就是模板语法」的场景留的（mustache 文件、Jinja2、
@@ -455,7 +455,10 @@
   function templateIssues(item) {
     const decl = item.params || [];
     const vars = tplVars(TPL_FIELDS.map(f => item[f]));
-    if (!decl.length) return { err: [], warn: Array.from(vars) };
+    /* multipart 写坏了也要报 —— 它不会让 templateIssues 自己发现问题，
+       但「静默退化成普通 body」比报错难查得多 */
+    const pre = item.mpErr ? [item.mpErr] : [];
+    if (!decl.length) return { err: pre, warn: Array.from(vars) };
 
     const known = new Set(decl.map(p => p.name));
     const err = [];
@@ -465,7 +468,7 @@
       const near = decl.map(p => p.name).find(n => n.toLowerCase() === k.toLowerCase());
       err.push('{{' + k + '}} 没有在 params 里声明' + (near ? '（是不是想写 ' + near + '？）' : ''));
     });
-    return { err: err, warn: [] };
+    return { err: pre.concat(err), warn: [] };
   }
 
   /* query 里"纯模板且替换为空"的键直接丢掉，避免拼出 ?lang= 这种空参 */
@@ -527,7 +530,10 @@
       body: fillTemplate(item.body, r.args),
       /* download 的保存位置也能模板化：「下载 {{name}}」直接把远端文件名当本地文件名 */
       savePath: fillTemplate(item.savePath, r.args),
-      fileName: fillTemplate(item.fileName, r.args)
+      fileName: fillTemplate(item.fileName, r.args),
+      /* multipart 里的 path / fields 值同样能引用参数 —— 这是「拖一个文件去上传」
+         那条路的关键：{"path": "{{file}}"} 让用户每次自己选文件 */
+      multipart: fillTemplate(item.multipart, r.args)
     });
 
     /* 被模板点名的参数已经落到该落的位置了，不再往末尾重复追加一次；
@@ -676,9 +682,47 @@
 
   /* ---------------------------------------------------------- 数据 */
 
+  /* multipart 归一化。三种写法都认：
+       "multipart": { "fields": {…}, "files": [{ "field": "f", "path": "…" }] }
+       "multipart": [{ "field": "f", "path": "…" }]        ← 只传文件时的简写
+       "multipart": { "field": "f", "path": "…" }          ← 只传一个文件时的简化
+     返回 null 表示"没配这功能"（而不是空对象）—— 后面到处就地判 null 比判空数组清楚。
+
+     字段说明：field = 表单字段名（默认 file）；path = 本地路径（支持 {{参数}} 模板）；
+     filename = 上传后显示的名字（默认取磁盘上的文件名）；type = MIME（默认按扩展名猜）。 */
+  function normalizeMultipart(mp) {
+    if (!mp) return null;
+
+    let arr;
+    if (Array.isArray(mp)) arr = mp;
+    else if (Array.isArray(mp.files)) arr = mp.files;
+    else if (mp.path || mp.file) arr = [mp];         /* 单文件简化写法 */
+    else arr = [];
+
+    const files = arr.filter(f => f && (f.path || f.file)).map(f => ({
+      field: String(f.field || 'file'),
+      path: String(f.path || f.file || ''),
+      filename: String(f.filename || '').trim(),
+      type: String(f.type || '').trim()
+    }));
+
+    const src = (!Array.isArray(mp) && mp.fields && typeof mp.fields === 'object') ? mp.fields : {};
+    const fields = {};
+    Object.keys(src).forEach(k => {
+      if (src[k] == null) return;
+      fields[k] = String(src[k]);
+    });
+
+    if (!files.length && !Object.keys(fields).length) return null;
+    return { files: files, fields: fields };
+  }
+
   function normalizeItem(raw, i) {
     const it = raw || {};
     const type = it.type || 'app';
+    /* multipart 写了但一个能用的文件都没有 —— 这种最容易悄悄失效：
+       配置里明明有这一段，跑起来却按普通 body 发出去，一声不响 */
+    const mp = normalizeMultipart(it.multipart);
     return {
       id: it.id || ('item-' + i),
       name: it.name || '未命名',
@@ -706,6 +750,10 @@
       body: it.body,
       timeout: Number(it.timeout) > 0 ? Math.min(Number(it.timeout), 120) : 15,
       jsonPath: it.jsonPath || it.jsonpath || '',
+      /* multipart 文件上传（等价 curl -F）。有它就整个走 multipart，body 不参与。
+         这里的 path 也会过一遍模板替换，所以 "path": "{{file}}" 能配合 params 用。 */
+      multipart: mp,
+      mpErr: (it.multipart && !mp) ? 'multipart 里没有可用的文件（files 每项至少要有 path）' : '',
       /* download 专用（本质是 webhook 的变种，只是把响应写成文件） */
       savePath: resolveSavePath(it.savePath || it.savepath || ''),
       fileName: String(it.fileName || it.filename || '').trim(),
@@ -1595,8 +1643,13 @@
       head = '将读取';
       preview = applied.target || '（还没写路径）';
     } else if (item.type === 'webhook') {
-      head = '将请求';
+      head = applied.multipart ? '将上传' : '将请求';
       preview = (item.method || 'GET') + ' ' + buildUrl(applied);
+      if (applied.multipart) {
+        const fl = applied.multipart.files;
+        preview += '  →  ' + fl.length + ' 个文件'
+          + (fl.length ? '（' + fl.map(f => f.field + '=' + baseName(f.path)).join('、') + '）' : '');
+      }
     } else if (item.type === 'cmd') {
       preview = applied.target + (w.argvRaw ? ' ' + w.argvRaw : '');
     } else if (item.type === 'ahk') {
@@ -2007,11 +2060,28 @@
     } else if (h && typeof h === 'object') {
       Object.keys(h).forEach(k => lines.push(k + ': ' + h[k]));
     }
-    /* 有请求体又没说 Content-Type，默认按 JSON 发 */
-    const body = buildBody(item);
+    /* 有请求体又没说 Content-Type，默认按 JSON 发。
+       multipart 的 Content-Type 带 boundary，只能由 AHK 拼好之后再加 ——
+       这里先补一个 application/json，到那边就成了两个 Content-Type 头。 */
+    const body = item.multipart ? '' : buildBody(item);
     if (body && !lines.some(l => /^content-type\s*:/i.test(l)))
       lines.push('Content-Type: application/json; charset=utf-8');
     return lines;
+  }
+
+  /* 把 multipart 压平成两个字符串数组交给 AHK。
+     AHK 那边只有 JsonStr / JsonStrArray 这种「取顶层字段」的正则，
+     取不出 multipart.files 这种嵌套结构。分隔符用 \u0001（SOH）：
+     它不可能出现在用户填的字段名或路径里，比 tab、竖线都安全。 */
+  const MP_SEP = '\u0001';
+  function mpFlat(item) {
+    const mp = item.multipart;
+    if (!mp) return { files: [], fields: [] };
+    return {
+      files: (mp.files || []).map(f =>
+        [f.field, f.path, f.filename || '', f.type || ''].join(MP_SEP)),
+      fields: Object.keys(mp.fields || {}).map(k => [k, mp.fields[k]].join(MP_SEP))
+    };
   }
 
   function runWebhook(item, raw, cli, quiet) {
@@ -2041,6 +2111,7 @@
       return;
     }
 
+    const mp = mpFlat(item);
     post({
       type: 'http',
       id: id,
@@ -2048,7 +2119,9 @@
       url: buildUrl(item),
       headers: headerLines(item),
       body: buildBody(item),
-      timeout: item.timeout
+      timeout: item.timeout,
+      mpFiles: mp.files,
+      mpFields: mp.fields
     });
   }
 

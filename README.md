@@ -150,6 +150,7 @@ wv2-launcher/
 │  ├─ keys.test.js       空格键语义 / 切范围保选择（14 条）
 │  ├─ drop.test.js       file:// URI → 本地路径（中文/空格/UNC/坏转义，14 条）
 │  ├─ jsonfile.test.js  jsonfile 类型：target 原样保留/类型标签/参数校验（20 条）
+│  ├─ multipart.test.js multipart 归一化/模板替换/请求头不补 JSON/压平格式（40 条）
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
 │  ├─ gen-pinyin.ps1     从 pinyin-data 重新生成 ui/pinyin.js
@@ -162,11 +163,12 @@ wv2-launcher/
 │  ├─ out-check.js       控制台输出实测：AllocConsole 造真控制台，写进去再读回来比对
 │  ├─ out-probe.ahk      上面那个脚本注入到 launcher.ahk 副本里的检查项
 │  ├─ sched-check.js     定时调度实测：真等一个 at 时刻和一次 every，含 runOnStart 与 hidden 条目（29 项）
-│  ├─ hdr-check.js       请求头动态值：抽出 AHK 函数单跑，用 crypto 对照摘要/HMAC/Base64（36 项）
+│  ├─ hdr-check.js       请求头动态值：抽出 AHK 函数单跑，用 crypto 对照摘要/HMAC/Base64/文件（58 项）
 │  ├─ hdr-e2e.js         请求头动态值端到端：本地回显服务看真实收到的头（加 --exe 测编译版）
 │  ├─ wh-cli-check.js    --webhook 的 --json/--body：真跑子进程，验输出与退出码（37 项，加 --exe 测编译版）
 │  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进，并验证 hidden 条目不上界面（45 项）
 │  ├─ jsonfile-check.js  jsonfile 真机全链路：真读盘、真渲染、点刷新时改文件看内容跟不跟（30 项）
+│  ├─ mp-e2e.js          multipart 与模板读文件端到端：本地回显服务逐字节比对包体和文件（36 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -190,17 +192,19 @@ wv2-launcher/
 > node tests/keys.test.js      # 14 条（空格认高亮行 / 切范围保选择，见踩坑 50）
 > node tests/drop.test.js      # 14 条（file:// URI → 本地路径，见踩坑 51）
 > node tests/jsonfile.test.js  # 20 条（jsonfile 的 target 原样保留 / 参数校验 / Tab 补全判定）
+> node tests/multipart.test.js # 40 条（multipart 三种写法 / 模板替换 / 请求头 / 交给 AHK 的压平格式）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
 > node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用与隐藏条目/模板（66 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log；含 hidden 条目）
-> node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC 与 crypto 对照（36 项）
+> node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC/文件与 crypto 对照（58 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
 > node tools/jsonui-check.js   # 真 WebView2 里点折叠/搜索/量缩进（加 --shot 停住方便截图）
 > node tools/jsonfile-check.js # jsonfile 全链路：真读盘/树渲染/错误文案/刷新真的重读（30 项）
+> node tools/mp-e2e.js         # multipart + {{#file}} 端到端：真发请求，服务端逐字节比对（36 项）
 > node tools/build-exe.js      # 编译成 dist\QuickLaunch.exe（需要 Ahk2Exe，见「九」）
 > ```
 
@@ -541,6 +545,7 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 | `query` | — | 对象 `{"a":"1"}` 或数组 `["a=1"]`，自动 URL 编码后拼到地址上 |
 | `headers` | — | 对象 `{"X-Token":"abc"}` 或数组 `["Name: Value"]` |
 | `body` | — | 字符串原样发；写对象/数组会自动 `JSON.stringify`。`GET`/`HEAD` 时忽略 |
+| `multipart` | — | 上传本地文件（等价 `curl -F`），见下方「[上传本地文件](#上传本地文件multipart)」。有它就整个走 multipart，`body` 不参与 |
 | `timeout` | `15` | 秒，上限 120 |
 | `jsonPath` | — | 从响应 JSON 里取值，如 `data.items[0].name`；取到就只显示这个值，按钮可切回「完整响应」 |
 | `group` | — | 归到哪个分组 |
@@ -581,10 +586,13 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 - 必填项没填 → 不发请求，预览行变红并说明缺哪个
 - `ip` 留空时 `target` 变成 `http://ip-api.com/json/` —— 这正是 ip-api「查本机」的语义
 
-#### 请求头里的动态值（`{{#ts}}` / `{{#env:…}}` / `{{#base64:…}}` / `{{#hmac:…}}`）
+#### 发送前展开的动态值（`{{#ts}}` / `{{#env:…}}` / `{{#file:…}}` / `{{#hmac:…}}`）
 
 上面的 `{{name}}` 是「你自己填进去的值」。还有一类值**每次请求都不一样**，而且**不该写在 config.json 里**
 （比如签名密钥）—— 这类由 AHK 在发送前展开。写法是 `{{#函数名:参数}}`，那个 `#` 是关键。
+
+**适用面**：`headers`、`body`，以及 `file` 参数的路径本身。`target` / `query` 里也能写，但那样拼出来的
+URL 基本不可用，不建议。
 
 | 写法 | 结果 |
 |---|---|
@@ -593,6 +601,10 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 | `{{#uuid}}` | UUID v4 |
 | `{{#nonce:16}}` | 16 位随机小写字母数字（默认 16，上限 128） |
 | `{{#env:NAME}}` | 环境变量 `NAME` 的值（取不到就报错，不会给空串） |
+| `{{#file:路径}}` | 读本地文本文件，**默认裁掉尾部换行**；二进制文件会报错拒发 |
+| `{{#file-raw:路径}}` | 同上，但保留原样的尾部换行 |
+| `{{#filebase64:路径}}` | 按字节读（二进制也安全），编码成 Base64 字符串 |
+| `{{#filehash:sha256:路径}}` | 文件字节的摘要，十六进制；算法支持 `md5` / `sha1` / `sha256` / `sha384` / `sha512` |
 | `{{#md5:文本}}` | MD5，十六进制小写 |
 | `{{#sha1:文本}}` | SHA-1，十六进制小写 |
 | `{{#sha256:文本}}` | SHA-256，十六进制小写 |
@@ -697,6 +709,57 @@ global SIG_KEYS := Map(
 而是给**短标签 + 错误码**，正文里写清这是哪一层失败、怎么排查：
 
 ![请求失败时的面板](docs/screenshot-error.png)
+
+#### 上传本地文件（multipart）
+
+`{{#file:…}}` 把文件**内容**读进 body，本质还是「发一段字符串」。要真正**上传文件**
+（服务端按 `multipart/form-data` 收，带文件名和 MIME），用 `multipart` 字段，等价 `curl -F`：
+
+```json
+{
+  "id": "up-pic",
+  "name": "传一张图",
+  "type": "webhook",
+  "target": "https://api.example.com/upload",
+  "method": "POST",
+  "multipart": {
+    "fields": { "note": "来自 {{who}}", "tag": "nightly" },
+    "files": [
+      { "field": "photo", "path": "{{file}}" }
+    ]
+  },
+  "params": [
+    { "name": "file", "label": "要上传的图", "type": "path" },
+    { "name": "who", "default": "老王" }
+  ]
+}
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `multipart.fields` | — | 普通文本字段，写对象 `{"name": "值"}`。值支持 `{{参数}}` 和 `{{#ts}}` 这类动态值 |
+| `multipart.files[].field` | `file` | 表单字段名（服务端用它找文件） |
+| `multipart.files[].path` | — | 本地路径，必填。支持 `{{参数}}`、`file://`、`%TEMP%`、相对路径 |
+| `multipart.files[].filename` | 磁盘上的文件名 | 上传后服务端看到的文件名 |
+| `multipart.files[].type` | 按扩展名猜 | MIME；猜不到就用 `application/octet-stream` |
+
+两种简写（只传文件时不用写 `files` 数组）：
+
+```json
+"multipart": { "field": "file", "path": "C:\\a.png" }
+"multipart": [{ "field": "a", "path": "1.png" }, { "field": "b", "path": "2.png" }]
+```
+
+几个要留意的行为：
+
+- **有 `multipart` 就整个走它，`body` 不参与**。两个都写不会报错，但 body 会被忽略。
+- `Content-Type`（含 boundary）由程序自己拼。你自己在 `headers` 里写了就不覆盖。
+- 单文件上限 **8MB**。上限写死不是偷懒：整个包在内存里拼，几十 MB 会卡住界面。
+- 文件名里的引号和换行会被替换成 `'` 和空格 —— 不替换的话可以往包里插一段假头部。
+- 按 `2xx` 之外的状态码不做特殊处理：上传失败时响应正文照常显示，方便看服务端说了什么。
+
+> 想传「内容」而不是「文件」时用 `{{#file:…}}`；想传「文件」时用 `multipart`。
+> 分不清就看服务端要什么：收 `application/json` 的要前者，收 `multipart/form-data` 的要后者。
 
 ### 响应不对劲？在终端手跑一遍
 
@@ -1461,6 +1524,50 @@ UNC 路径（`\\server\share\…`）在所有 type 下都算**绝对路径**：�
     页面点刷新前先往日志里写一个标记，node 侧看到就把磁盘上的文件换掉，然后断言面板里
     出现了新内容。只重画旧数据的话这条会立刻红。
 
+69. **`FileOpen` 在文本模式下会跳过 BOM，`RawRead` 也就跟着从第 3 个字节开始读。**
+    这条坑不报错、不报警，只让 base64 和摘要悄悄算错。实测：18 字节的 UTF-16 文件，
+    `f := FileOpen(p, 'r')` 之后 `RawRead` 只拿到 16 字节，首字节是 `0x75`（即 `'u'`），
+    因为文件指针已经被 BOM 探测挪过去了。`RawRead` 本身确实不做字符解码，但它**从当前
+    指针开始读**。修法是打开后先 `f.Seek(0)`。没有这一步的话：
+    `{{#filebase64:a.png}}` 会少掉 PNG 的 `89 50`，`{{#filehash:sha256:a.json}}` 的摘要
+    和 `certutil` 算出来的对不上，而两者都不会报任何错。
+    顺带：`IsBinaryBlob` 也因此必须先拿到 BOM —— UTF-16 文本通篇是 NUL，不看 BOM 就会被
+    当成二进制拒掉，可 `FileRead` 明明是读得动的。
+
+70. **发二进制只能靠 `Send(SAFEARRAY)`，字符串那条路必坏。**
+    `WinHttpRequest.Send()` 收到 BSTR 时会按 UTF-8 编码 —— 文本没问题，二进制经过
+    「字节 → 字符串 → UTF-8」这一圈就永久损坏了。要发原始字节，得给它一个
+    `SafeArray(VT_UI1)`：用 `ADODB.Stream`（`Type := 1`）`LoadFromFile` 再 `Read()`，
+    得到的 `ComObjArray` 直接喂给 `Send()` 即可。实测 256 字节的 `0x00..0xFF` 发出去，
+    服务端收到的 SHA-256 和原文件一字节不差。
+
+71. **multipart 在主进程拼、交给子进程按二进制发。** 看着绕，但两边各做了一件只有它能做的事：
+    主进程手上有展开后的模板值和解析好的绝对路径（`FileTargetPath` 的规则一大套），子进程
+    手上有能发字节的 WinHttp 调用。中间传「文件清单」反而更麻烦 —— `spec.ini` 放不下嵌套
+    结构，字段值里还可能带 tab 和换行。所以主进程直接把整包拼成一个文件写到 `b.bin`，
+    spec 里只多一个 `BodyKind=binary`，子进程读到它就换 `ADODB` 那条路。
+
+72. **文件内容不能再过一遍模板展开。** `HdrExpand` 是循环展开的（为了 `{{#hmac:demo:{ts}}}`
+    这种嵌套），如果 `{{#file:x.md}}` 读出来的内容里带 `{{#`，第二轮就会把文件内容当模板再算
+    一遍 —— 传一个 Handlebars / Vue 模板文件当请求体，内容当场变形。做法是给 file 系列的
+    返回值打 `nore` 标记，展开时把内容里的 `{{#` 换成「私用区哨兵 + `{#`」，出函数前再还原。
+    **哨兵只能替掉第一个大括号**：替两个的话还原时只能还原出一个，`{{#each` 会变成 `{#each`
+    （这个 bug 是断言抓出来的，肉眼看日志只以为少了个字符）。
+
+73. **二进制文件进文本模板必须拒发，不能"尽力而为"。** `FileRead(path, 'UTF-8')` 对 PNG
+    会把非法字节变成 `U+FFFD`，再编码回去就不是原文件了 —— 而请求照样可能返回 200，
+    用户以为传上去了。所以 `HdrFile` 读完字节先扫一遍 NUL（`msvcrt\memchr`，200 万字节
+    也就零点几毫秒，AHK 自己循环要慢一个数量级），命中就报错并提示改用 `{{#filebase64:}}`
+    或 multipart。UTF-16 文本例外，按 BOM 放行。
+
+74. **`{{#file:…}}` 默认裁尾部换行，`{{#file-raw:…}}` 才保留。**
+    `token.txt` 里存一个 Bearer token，`printf` 也好、记事本也好，末尾那一个 `
+` 几乎
+    跑不掉。不裁的话 `Authorization: Bearer {{#file:token.txt}}` 就会被 `HdrLine` 的
+    换行检查拒发，而报错信息是「展开后出现换行」—— 完全指不到那个换行是文件带来的。
+    裁的是 `
+` 而不是空格：文件末尾的空格有时是有意义的。
+
 ---
 
 ## 六、命令行（`ql`）
@@ -1700,6 +1807,13 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 - 频率统计以"启动成功"为准，`app` 类型被杀掉/秒退也算一次；没有做失败回滚。
 - webhook 只处理**文本**响应：二进制（图片/文件）会被当作文本读，得到乱码。要下文件请用 `download` 类型。
 - webhook 响应超过 400KB 会被截断（面板会标「响应过大已截断」）。
+- `{{#file:…}}` 和 `multipart` 都是**整个文件读进内存**，所以只适合小文件：
+  模板内联上限 2MB，multipart 单文件 8MB。超了直接报错，不截断、不分片、没有进度条。
+- multipart 的文件名按 UTF-8 原文写进 `Content-Disposition`，没走 RFC 5987 的
+  `filename*=UTF-8''…`。主流服务端（含国内各家 OSS/图床）都认，但严格按 RFC 实现的老服务端
+  可能把中文名显示成乱码 —— 文件本身不受影响。
+- `{{#file:路径}}` 里的路径**不能带裸花括号** —— 模板正则的参数部分只允许一对单层 `{…}`。
+  Windows 路径里几乎不可能出现，真碰上了就把文件挪个位置。
 - `download` 是**最小实现**：整个响应一次性读进内存，所以只适合小文件（几 MB 以内）。
   没有断点续传、没有分片、没有完整性校验（不比对 `Content-Length` 之外的哈希）、没有进度条，
   也**不能中途取消**（Esc 只关面板，进程会跑到超时）。

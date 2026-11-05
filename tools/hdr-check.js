@@ -39,7 +39,9 @@ function build() {
   if (!keys) throw new Error('找不到 SIG_KEYS 定义');
 
   const fns = ['HdrExpand', 'HdrEval', 'HdrInline', 'HdrEnv', 'HashAlgo', 'HdrLine'
-    , 'UuidV4', 'RandAlnum', 'HashHex', 'B64Encode']
+    , 'UuidV4', 'RandAlnum', 'HashHex', 'B64Encode'
+    , 'HdrFile', 'HdrFileHash', 'ReadBlob', 'IsBinaryBlob', 'B64OfBlob', 'HashHexBytes'
+    , 'FileTargetPath', 'ReadTextFile', 'UriDecode', 'ExpandEnvVars', 'FmtBytes', 'CleanComError']
     .map(n => extractFn(src, n)).join('\n\n');
 
   const driver = `
@@ -47,6 +49,9 @@ function build() {
 #Warn All, Off
 
 ${keys[0]}
+
+global SCRIPT_DIR := "C:\\Tools\\launcher"
+global TPL_FILE_MAX := 2 * 1024 * 1024
 
 ${fns}
 
@@ -62,6 +67,28 @@ TryEval(expr) {
 }
 
 try FileDelete("${LOG.replace(/\\/g, '\\\\')}")
+
+D := A_ScriptDir
+try FileDelete(D '\\t_txt.txt')
+FileAppend('hello 中文', D '\\t_txt.txt', 'UTF-8')
+try FileDelete(D '\\t_nl.txt')
+FileAppend('token-abc' Chr(10), D '\\t_nl.txt', 'UTF-8')
+try FileDelete(D '\\t_tpl.txt')
+FileAppend('{{#ts}} keep', D '\\t_tpl.txt', 'UTF-8')
+try FileDelete(D '\\t_u16.txt')
+FileAppend('utf16 中文', D '\\t_u16.txt', 'UTF-16')
+try FileDelete(D '\\t_empty.txt')
+FileOpen(D '\\t_empty.txt', 'w').Close()
+try FileDelete(D '\\t_bin.png')
+bb := Buffer(8, 0)
+NumPut('UChar', 0x89, bb, 0)
+NumPut('UChar', 0x50, bb, 1)
+NumPut('UChar', 0x00, bb, 2)
+NumPut('UChar', 0xFF, bb, 3)
+bf := FileOpen(D '\\t_bin.png', 'w')
+bf.RawWrite(bb, 8)
+bf.Close()
+
 Log('ts=' HdrExpand('{{#ts}}'))
 Log('tsms=' HdrExpand('{{#tsms}}'))
 Log('uuid=' HdrExpand('{{#uuid}}'))
@@ -106,6 +133,25 @@ Log('b64url_pad=' HdrExpand('{{#base64url:ab}}'))
 Log('b64_ts=' HdrExpand('{{#base64:{ts}}}'))
 Log('b64_ts_v=' HdrExpand('{{#ts}}'))
 Log('sha3=' HdrExpand('{{#sha3:abc}}'))
+Log('f_text=' HdrExpand('{{#file:' D '\\t_txt.txt}}'))
+Log('f_trimnl=' HdrExpand('{{#file:' D '\\t_nl.txt}}'))
+Log('f_raw=' StrReplace(HdrExpand('{{#file-raw:' D '\\t_nl.txt}}'), Chr(10), '<LF>'))
+Log('f_u16=' TryEval(() => HdrExpand('{{#file:' D '\\t_u16.txt}}')))
+Log('f_empty=' HdrExpand('{{#file:' D '\\t_empty.txt}}'))
+Log('f_bin=' TryEval(() => HdrExpand('{{#file:' D '\\t_bin.png}}')))
+Log('f_missing=' TryEval(() => HdrExpand('{{#file:' D '\\nope.txt}}')))
+Log('f_dir=' TryEval(() => HdrExpand('{{#file:' D '}}')))
+Log('f_emptyarg=' TryEval(() => HdrExpand('{{#file:}}')))
+Log('f_b64=' HdrExpand('{{#filebase64:' D '\\t_txt.txt}}'))
+Log('f_b64bin=' HdrExpand('{{#filebase64:' D '\\t_bin.png}}'))
+Log('f_hash=' HdrExpand('{{#filehash:sha256:' D '\\t_txt.txt}}'))
+Log('f_hashmd5=' HdrExpand('{{#filehash:md5:' D '\\t_txt.txt}}'))
+Log('f_hashcase=' HdrExpand('{{#filehash:SHA1:' D '\\t_txt.txt}}'))
+Log('f_hashbad=' TryEval(() => HdrExpand('{{#filehash:sha3:' D '\\t_txt.txt}}')))
+Log('f_hashnop=' TryEval(() => HdrExpand('{{#filehash:sha256}}')))
+Log('f_guard=' HdrExpand('{{#file:' D '\\t_tpl.txt}}'))
+Log('f_in_body=' HdrExpand('{"p": {{#file:' D '\\t_txt.txt}}, "n": 1}'))
+Log('f_in_hdr=' HdrLine('X-Token: {{#file:' D '\\t_nl.txt}}'))
 ExitApp(0)
 `;
 
@@ -211,6 +257,43 @@ function main() {
   check('{{#base64:{ts}}} 里层先展开', [-2, -1, 0, 1, 2].map(d =>
     Buffer.from(String(b64ts + d), 'utf8').toString('base64')).includes(kv.b64_ts),
     kv.b64_ts + ' vs ts=' + b64ts);
+
+  console.log('\n== 文件（{{#file:…}} 系列）==');
+  /* 探针把测试文件写在它自己所在的目录（A_ScriptDir = tmpdir），node 这边读同一批字节做对照 */
+  const TD = os.tmpdir();
+  const txtBuf = fs.readFileSync(path.join(TD, 't_txt.txt'));
+  const binBuf = fs.readFileSync(path.join(TD, 't_bin.png'));
+
+  check('{{#file}} 读出文本（BOM 已剥掉）', kv.f_text === 'hello 中文', kv.f_text);
+  check('{{#file}} 默认裁掉尾部换行', kv.f_trimnl === 'token-abc', JSON.stringify(kv.f_trimnl));
+  check('{{#file-raw}} 保留尾部换行', kv.f_raw === 'token-abc<LF>', JSON.stringify(kv.f_raw));
+  check('UTF-16 文本不被当成二进制', kv.f_u16 === 'utf16 中文', kv.f_u16);
+  check('空文件给空串', kv.f_empty === '', JSON.stringify(kv.f_empty));
+  check('二进制文件被拒（而不是静默损坏）', /^ERR:这是二进制文件/.test(kv.f_bin), kv.f_bin);
+  check('拒的时候提示改用 filebase64', /filebase64/.test(kv.f_bin), kv.f_bin);
+  check('不存在的文件报错', /^ERR:文件不存在/.test(kv.f_missing), kv.f_missing);
+  check('目录报错', /^ERR:这是个目录/.test(kv.f_dir), kv.f_dir);
+  check('空路径报错', /少了文件路径/.test(kv.f_emptyarg), kv.f_emptyarg);
+
+  /* 这两条是 BOM 那个坑的哨兵：FileOpen 在文本模式下会跳过 BOM，
+     不用 Seek(0) 的话 base64 和摘要都会少算 2~3 字节，而且不会报错 */
+  check('{{#filebase64}} 与 Buffer.toString("base64") 逐字节一致',
+    kv.f_b64 === txtBuf.toString('base64'), kv.f_b64 + ' vs ' + txtBuf.toString('base64'));
+  check('{{#filebase64}} 二进制（含 0x89）也一致',
+    kv.f_b64bin === binBuf.toString('base64'), kv.f_b64bin + ' vs ' + binBuf.toString('base64'));
+
+  check('{{#filehash:sha256}} 与 crypto 一致',
+    kv.f_hash === crypto.createHash('sha256').update(txtBuf).digest('hex'), kv.f_hash);
+  check('{{#filehash:md5}} 与 crypto 一致',
+    kv.f_hashmd5 === crypto.createHash('md5').update(txtBuf).digest('hex'), kv.f_hashmd5);
+  check('算法名大小写不敏感（SHA1）',
+    kv.f_hashcase === crypto.createHash('sha1').update(txtBuf).digest('hex'), kv.f_hashcase);
+  check('未知算法报错', /^ERR:filehash 不认这个算法/.test(kv.f_hashbad), kv.f_hashbad);
+  check('filehash 少了路径报错', /^ERR:filehash 少了参数/.test(kv.f_hashnop), kv.f_hashnop);
+
+  check('文件里的 {{# 不再被二次展开', kv.f_guard === '{{#ts}} keep', kv.f_guard);
+  check('能内联进 body 中间', kv.f_in_body === '{"p": hello 中文, "n": 1}', kv.f_in_body);
+  check('能塞进请求头（尾部换行已裁）', kv.f_in_hdr === 'X-Token: token-abc', kv.f_in_hdr);
 
   console.log('\n' + (fails ? '请求头动态值：失败 ' + fails + ' 项' : '请求头动态值：全部通过'));
   process.exit(fails ? 1 : 0);

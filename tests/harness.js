@@ -39,7 +39,7 @@ const DEFAULT_NAMES = [
   'fileUrlToPath',
   /* 参数取值 */
   'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery',
-  'tplVars', 'templateIssues', 'joinTokens', 'applyParams',
+  'tplVars', 'templateIssues', 'joinTokens', 'applyParams', 'normalizeMultipart',
   /* 使用记录 */
   'usageRec', 'usageCount', 'historyOf', 'usageBoost',
   /* 补全 */

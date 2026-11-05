@@ -36,6 +36,12 @@ global CLI_DIR    := A_Temp '\quicklaunch-cli'    ; 客户端的回执文件放�
 global SCHED_LOG  := SCRIPT_DIR '\sched.log'      ; 定时任务的执行记录（一行一条，主界面没有入口，靠它查）
 global HTTP_MAX_BODY := 400000        ; webhook 响应正文上限（字符），超出截断防止消息过大
 global FILE_MAX_BODY := 8 * 1024 * 1024   ; jsonfile 读本地文件的上限（字节）。超了一律拒读，见 DoReadJson
+; webhook 模板里内联文件（{{#file:…}} / filebase64 / filehash）的上限。
+; 比 jsonfile 小得多：内容要拼进字符串、再编码成 UTF-8 写盘，体积翻倍是常事，
+; 真拿它传大文件会卡住界面，而且 base64 之后还要再涨 1/3。
+global TPL_FILE_MAX := 2 * 1024 * 1024
+; multipart 单文件上限。走的是字节流拼包，不进字符串，所以能放宽到 8MB。
+global MP_FILE_MAX := 8 * 1024 * 1024
 
 ; 请求头动态值的签名密钥：**只存在于这里**。
 ; config.json 里写 {{#hmac:demo:...}} 引用名字，明文密钥不落配置文件；
@@ -1084,6 +1090,101 @@ DoReload() {
 }
 
 ; ============================================================================
+;  multipart/form-data 组包（等价 curl -F）
+;  ---------------------------------------------------------------------------
+;  为什么在主进程拼、而不是把文件清单丢给子进程：
+;    · spec.ini 放不下嵌套结构，字段值里还可能带 tab / 换行，另约一套编码格式
+;      比直接拼字节麻烦得多；
+;    · 主进程本来就要展开 {{name}} / {{#…}}，手上已经有最终值；
+;    · 拼成一个文件交给子进程，它那边只多一个「按字节读 body」的分支。
+;
+;  边界串带 16 位随机后缀：固定 boundary 一旦撞上正文内容就会把包切坏。
+;  概率极低，但随机后缀的代价是零，没理由不加。
+; ============================================================================
+
+BuildMultipart(outPath, fields, files, boundary) {
+    /* 先全部校验，再动手写 —— 写到第 3 个才发现文件不存在，前两段就白写了 */
+    ready := []
+    for f in files {
+        p := FileTargetPath(f.path)
+        if (p = '')
+            throw Error('有一条没写文件路径')
+        if DirExist(p)
+            throw Error('这是个目录，不是文件：' p)
+        if !FileExist(p)
+            throw Error('文件不存在：' p)
+        size := 0
+        try size := FileGetSize(p)
+        if (size > MP_FILE_MAX)
+            throw Error('文件太大（' FmtBytes(size) '）：' p
+                . '，multipart 单文件上限是 ' FmtBytes(MP_FILE_MAX))
+        ready.Push({ field: f.field, path: p, name: f.name, ctype: f.ctype, size: size })
+    }
+
+    fh := FileOpen(outPath, 'w')
+    try {
+        for it in fields
+            MpWrite(fh, '--' boundary "`r`n"
+                . 'Content-Disposition: form-data; name="' MpQuote(it.name) '"' "`r`n`r`n"
+                . it.value "`r`n")
+        for it in ready {
+            MpWrite(fh, '--' boundary "`r`n"
+                . 'Content-Disposition: form-data; name="' MpQuote(it.field)
+                . '"; filename="' MpQuote(it.name) '"' "`r`n"
+                . 'Content-Type: ' it.ctype "`r`n`r`n")
+            blob := ReadBlob(it.path, it.size)
+            fh.RawWrite(blob.buf, blob.size)
+            MpWrite(fh, "`r`n")
+        }
+        MpWrite(fh, '--' boundary '--' "`r`n")
+    } finally {
+        fh.Close()
+    }
+    return outPath
+}
+
+/* 把一段文本按 UTF-8 写进已打开的二进制句柄。
+   二进制模式下 File 对象没有"写字符串"的入口，RawWrite 只吃 Buffer。 */
+MpWrite(fh, s) {
+    n := StrPut(s, 'UTF-8') - 1
+    if (n <= 0)
+        return
+    b := Buffer(n, 0)
+    StrPut(s, b, 'UTF-8')
+    fh.RawWrite(b, n)
+}
+
+/* 头里的名字要挡两样：引号（会把 filename="…" 提前闭合）和换行
+   （会凭空多出一段头部）。 */
+MpQuote(s) {
+    s := StrReplace(s, '"', "'")
+    return StrReplace(StrReplace(s, "`r", ' '), "`n", ' ')
+}
+
+/* 按扩展名猜 MIME，猜不到就用 octet-stream。
+   服务端若按 MIME 校验类型，宁可让它收到 octet-stream 报错，
+   也不要瞎猜一个 image/png 送过去、被当成坏图静默丢掉。 */
+MimeOf(name) {
+    static M := Map(
+        'txt', 'text/plain', 'json', 'application/json', 'xml', 'application/xml',
+        'csv', 'text/csv', 'html', 'text/html', 'htm', 'text/html', 'md', 'text/markdown',
+        'jpg', 'image/jpeg', 'jpeg', 'image/jpeg', 'png', 'image/png', 'gif', 'image/gif',
+        'webp', 'image/webp', 'bmp', 'image/bmp', 'svg', 'image/svg+xml', 'ico', 'image/x-icon',
+        'pdf', 'application/pdf', 'zip', 'application/zip', 'gz', 'application/gzip',
+        'tar', 'application/x-tar', '7z', 'application/x-7z-compressed',
+        'mp3', 'audio/mpeg', 'wav', 'audio/wav', 'mp4', 'video/mp4', 'webm', 'video/webm',
+        'doc', 'application/msword', 'xls', 'application/vnd.ms-excel',
+        'docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+    dot := InStr(name, '.', false, -1)
+    if !dot
+        return 'application/octet-stream'
+    ext := StrLower(SubStr(name, dot + 1))
+    return M.Has(ext) ? M[ext] : 'application/octet-stream'
+}
+
+; ============================================================================
 ;  Webhook：请求交给子进程跑，主进程只轮询结果
 ;  ---------------------------------------------------------------------------
 ;  WinHttp 是同步的，直接在脚本线程里调会冻住整个窗口（超时 10 秒就是 10 秒假死）。
@@ -1111,16 +1212,27 @@ DoWebhook(raw) {
     dir := HTTP_DIR '\' id
     try DirCreate(dir)
     ; 上一次的产物必须先清掉，否则轮询会立刻读到旧结果
-    for f in ['meta.ini', 'body.txt', 'spec.ini', 'h.txt', 'b.txt']
+    for f in ['meta.ini', 'body.txt', 'spec.ini', 'h.txt', 'b.txt', 'b.bin']
         try FileDelete(dir '\' f)
 
+    /* multipart：有文件要传就整个走它，body 不参与。
+       前端把清单压平成 "字段\u0001路径\u0001文件名\u0001MIME" 的字符串数组，
+       因为 JsonStr 只认顶层字符串字段，取不出 multipart.files 这种嵌套结构。 */
+    mpFiles := JsonStrArray(raw, 'mpFiles')
+    mpFields := JsonStrArray(raw, 'mpFields')
+    isMp := (mpFiles.Length > 0)
+    boundary := isMp ? '----QuickLaunch' RandAlnum(16) : ''
+
     ; 请求头由前端给成 "Name: Value" 的字符串数组 —— 避免在这里解析嵌套 JSON。
-    ; 每行过一次 HdrExpand：{{#ts}} / {{#hmac:...}} 这类动态值只在这里展开，
-    ; 展开失败（比如密钥名写错）直接拒发 —— 带着错签名发出去比不发更糟。
+    ; 每行过一次 HdrExpand：{{#ts}} / {{#hmac:...}} / {{#file:...}} 这类动态值只在这里
+    ; 展开，展开失败（密钥名写错、文件不存在）直接拒发 —— 带着错签名发出去比不发更糟。
     hs := ''
     try {
         for h in JsonStrArray(raw, 'headers')
             hs .= HdrLine(h) '`n'
+        /* boundary 是我们自己生成的，用户不可能提前写在配置里；真写了就尊重他 */
+        if (isMp && !RegExMatch(hs, 'i)content-type\s*:'))
+            hs .= 'Content-Type: multipart/form-data; boundary=' boundary "`n"
     } catch as e {
         try DirDelete(dir, true)
         JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
@@ -1129,15 +1241,62 @@ DoWebhook(raw) {
     }
     try FileAppend(hs, dir '\h.txt', 'UTF-8-RAW')
 
-    body := JsonStr(raw, 'body')
-    try FileAppend(body, dir '\b.txt', 'UTF-8-RAW')
+    bodyKind := 'text', bodyPath := dir '\b.txt'
+
+    if isMp {
+        fields := []
+        for line in mpFields {
+            parts := StrSplit(line, Chr(1), '', 2)      ; 只切一刀，值里再出现也不管
+            if (parts.Length >= 2)
+                fields.Push({ name: parts[1], value: parts[2] })
+        }
+        files := []
+        for line in mpFiles {
+            parts := StrSplit(line, Chr(1))
+            if (parts.Length < 2 || parts[2] = '')
+                continue
+            fname := (parts.Length >= 3) ? parts[3] : ''
+            if (fname = '')                              ; 没给就沿用磁盘上的文件名
+                fname := RegExReplace(parts[2], '^.*[\\/]', '')
+            ctype := (parts.Length >= 4) ? parts[4] : ''
+            if (ctype = '')
+                ctype := MimeOf(fname)
+            files.Push({ field: parts[1], path: parts[2], name: fname, ctype: ctype })
+        }
+
+        bodyPath := dir '\b.bin'
+        try
+            BuildMultipart(bodyPath, fields, files, boundary)
+        catch as e {
+            try DirDelete(dir, true)
+            JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
+                ',"truncated":0,"error":' JsonQuote('multipart 组包失败：' e.Message) ',"body":""}')
+            return
+        }
+        bodyKind := 'binary'
+    } else {
+        /* body 也过一次展开：{{#file:…}} 让「整个请求体来自一个本地文件」成立，
+           等价 curl 的 --data-binary @x。这里用 HdrExpand 而不是 HdrLine ——
+           后者会拒绝换行，而多行 JSON 是正常请求体。 */
+        body := JsonStr(raw, 'body')
+        try
+            body := HdrExpand(body)
+        catch as e {
+            try DirDelete(dir, true)
+            JsSend('{"type":"http-result","id":' JsonQuote(id) ',"ok":0,"status":0,"ms":0'
+                ',"truncated":0,"error":' JsonQuote('请求体展开失败：' e.Message) ',"body":""}')
+            return
+        }
+        try FileAppend(body, dir '\b.txt', 'UTF-8-RAW')
+    }
 
     spec := dir '\spec.ini'
     IniWrite(method, spec, 'req', 'Method')
     IniWrite(url, spec, 'req', 'Url')
     IniWrite(timeout, spec, 'req', 'Timeout')
     IniWrite(dir '\h.txt', spec, 'req', 'HeadersFile')
-    IniWrite(dir '\b.txt', spec, 'req', 'BodyFile')
+    IniWrite(bodyPath, spec, 'req', 'BodyFile')
+    IniWrite(bodyKind, spec, 'req', 'BodyKind')
     IniWrite(dir, spec, 'req', 'OutDir')
 
     pid := 0
@@ -2138,6 +2297,11 @@ WriteReply(path, json) {
 ;  单花括号只认 ts / tsms / uuid / nonce，不支持再套 hmac（避免递归自套）。
 ; ============================================================================
 HdrExpand(line) {
+    /* 哨兵：文件内容里的 "{{#" 先换成「哨兵 + #」，循环结束时再还原。
+       没有它的话，传一个 Handlebars / Jinja2 模板文件当请求体，第二轮展开
+       会把文件里的 {{#each …}} 当成占位符去算，内容当场变形。
+       用私用区字符（U+E000），正常文本里不会出现。 */
+    static GUARD := Chr(0xE000)
     if !InStr(line, '{{#')
         return line
     Loop 4 {                              ; 里层先展开，外层用结果再算一次
@@ -2146,17 +2310,26 @@ HdrExpand(line) {
         /* 内层允许一对单花括号：{{#hmac:demo:{ts}}} —— 但不能有第二层 */
         while RegExMatch(line, '\{\{#((?:[^{}]|\{[^{}]*\})*)\}\}', &m, pos) {
             r := HdrEval(m[1])
-            out .= SubStr(line, pos, m.Pos - pos) . (r.ok ? r.val : m[0])
-            if r.ok
+            if r.ok {
+                v := r.val
+                /* file 系列的结果是「数据」不是「模板」，不许再参与展开。
+                   只把**第一个**大括号换成哨兵，第二个原样留着 —— 换成两个的话
+                   还原时只能还原出一个，{{#each 会变成 {#each。 */
+                if (r.HasProp('nore') && r.nore)
+                    v := StrReplace(v, '{{#', GUARD '{#')
+                out .= SubStr(line, pos, m.Pos - pos) . v
                 hit := true
+            } else
+                out .= SubStr(line, pos, m.Pos - pos) . m[0]
             pos := m.Pos + m.Len
         }
         out .= SubStr(line, pos)
+        /* 哨兵不是 "{{#"，所以这里只认真占位符 —— 文件内容里的不会让循环白跑 */
         if (!hit || !InStr(out, '{{#'))
-            return out
+            return StrReplace(out, GUARD, '{')
         line := out
     }
-    return line
+    return StrReplace(line, GUARD, '{')
 }
 
 /* 展开一整行请求头，并挡住「换行注入」。
@@ -2194,6 +2367,15 @@ HdrEval(expr) {
             return {ok: true, val: RandAlnum(n)}
         case 'env':
             return {ok: true, val: HdrEnv(rest)}
+        /* file 系列的结果是文件内容，不是模板 —— 打上 nore，HdrExpand 不会再展开它 */
+        case 'file':
+            return {ok: true, val: HdrFile(rest, 'text'), nore: 1}
+        case 'file-raw':
+            return {ok: true, val: HdrFile(rest, 'raw'), nore: 1}
+        case 'filebase64':
+            return {ok: true, val: HdrFile(rest, 'base64'), nore: 1}
+        case 'filehash':
+            return {ok: true, val: HdrFileHash(rest), nore: 1}
         case 'md5', 'sha1', 'sha256', 'sha384', 'sha512':
             return {ok: true, val: HashHex(HdrInline(rest), HashAlgo(name))}
         case 'base64', 'base64url':
@@ -2224,6 +2406,172 @@ HdrEnv(name) {
     if (v = '')
         throw Error('环境变量「' name '」没有定义或为空')
     return v
+}
+
+/* {{#file:路径}} / {{#file-raw:路径}} / {{#filebase64:路径}} / {{#filehash:算法:路径}}
+   —— 把本地文件读进模板，补上 curl 的 `-d @file` / `-F file=@x` 那类能力。
+
+   三种读法对应三种去向，不能混：
+     text / raw   读成字符串（BOM 自动识别、GBK 回退），拼进 body 或请求头
+     base64       按字节读，编码成 ASCII，塞进 JSON 字段
+     hash         按字节读，算摘要，用于 X-Content-SHA256 这类校验头
+
+   二进制进 text/raw 是**静默损坏**：FileRead 按 UTF-8 解码，非法字节变成
+   U+FFFD，再编码回去就不是原文件了，而请求照样可能返回 200。所以这里主动扫
+   一遍 NUL 字节挡住它，报错让用户换 filebase64 —— 比发出去一个坏文件强得多。 */
+HdrFile(spec, mode) {
+    p := FileTargetPath(Trim(spec, ' ' . "`t"))
+    if (p = '')
+        throw Error('{{#file:…}} 少了文件路径')
+    if DirExist(p)
+        throw Error('这是个目录，不是文件：' p)
+    if !FileExist(p)
+        throw Error('文件不存在：' p)
+
+    size := 0
+    try size := FileGetSize(p)
+    if (size > TPL_FILE_MAX)
+        throw Error('文件太大（' FmtBytes(size) '），模板内联的上限是 ' FmtBytes(TPL_FILE_MAX)
+            . '；要传更大的文件请用 multipart')
+
+    blob := ReadBlob(p, size)
+
+    if (mode = 'base64')
+        return B64OfBlob(blob.buf, blob.size)
+    if (mode = 'hash')
+        return HashHexBytes(blob.buf, blob.size, 'SHA256')
+
+    if IsBinaryBlob(blob)
+        throw Error('这是二进制文件（' FmtBytes(size) '），拼进文本会损坏内容。'
+            . '改用 {{#filebase64:' Trim(spec) '}} 或 multipart 上传')
+
+    err := ''
+    s := ReadTextFile(p, &err)
+    if (err != '')
+        throw Error(err)
+    /* 默认裁掉尾部 CR/LF：token 文件、JSON 几乎都带一个编辑器补的换行。
+       不裁的话 {{#file:token.txt}} 塞进 Authorization 头会被 HdrLine 拒发，
+       而报错（"展开后出现换行"）完全指不到那个换行是文件带来的。 */
+    return (mode = 'raw') ? s : RTrim(s, "`r`n")
+}
+
+/* {{#filehash:算法:路径}} —— 按第一个冒号切，算法名不区分大小写 */
+HdrFileHash(rest) {
+    q := InStr(rest, ':')
+    if !q
+        throw Error('filehash 少了参数，写法是 {{#filehash:sha256:路径}}')
+    algo := StrUpper(Trim(SubStr(rest, 1, q - 1), ' ' . "`t"))
+    if !RegExMatch(algo, '^(MD5|SHA1|SHA256|SHA384|SHA512)$')
+        throw Error('filehash 不认这个算法：' algo '（支持 md5 / sha1 / sha256 / sha384 / sha512）')
+
+    p := FileTargetPath(Trim(SubStr(rest, q + 1), ' ' . "`t"))
+    if (p = '')
+        throw Error('filehash 少了文件路径')
+    if DirExist(p)
+        throw Error('这是个目录，不是文件：' p)
+    if !FileExist(p)
+        throw Error('文件不存在：' p)
+
+    size := 0
+    try size := FileGetSize(p)
+    if (size > TPL_FILE_MAX)
+        throw Error('文件太大（' FmtBytes(size) '），filehash 的上限是 ' FmtBytes(TPL_FILE_MAX))
+
+    blob := ReadBlob(p, size)
+    return HashHexBytes(blob.buf, blob.size, algo)
+}
+
+/* 按字节读文件，返回 {buf, size}。size 是实际读到的字节数。
+
+   **必须 Seek(0)**：文本模式打开时 AHK 会探测 BOM 并把文件指针挪到 BOM 之后，
+   于是 RawRead 拿到的第一个字节其实是第 3 个（UTF-8 BOM）或第 3 个（UTF-16 的
+   FE FF 之后）。RawRead 本身不做字符解码，但它从「当前指针」开始读 ——
+   少了这 2~3 字节，base64 和摘要都会算错，而且**一声不响**。
+   实测：18 字节的 UTF-16 文件不 Seek 时 got=16、首字节是 0x75。 */
+ReadBlob(path, size) {
+    buf := Buffer(Max(size, 1), 0)
+    f := FileOpen(path, 'r')
+    try {
+        f.Seek(0)
+        n := f.RawRead(buf, size)
+    } finally
+        f.Close()
+    return { buf: buf, size: n }
+}
+
+/* 这个 blob 是二进制吗？判据是「出现 NUL 字节」。
+   UTF-16 文本通篇都是 NUL，所以先看 BOM 放行 —— 否则存成 UTF-16 的 a.txt
+   会被当成二进制拒掉，而 FileRead 明明读得动。 */
+IsBinaryBlob(blob) {
+    if (blob.size = 0)
+        return false
+    if (blob.size >= 2) {
+        c0 := NumGet(blob.buf, 0, 'UChar')
+        c1 := NumGet(blob.buf, 1, 'UChar')
+        if ((c0 = 0xFF && c1 = 0xFE) || (c0 = 0xFE && c1 = 0xFF))
+            return false
+    }
+    /* 200 万字节自己循环太慢，交给 CRT 的 memchr（返回首次出现的地址，没有就是 0） */
+    return DllCall('msvcrt\memchr', 'ptr', blob.buf, 'int', 0, 'ptr', blob.size, 'ptr') != 0
+}
+
+/* 字节 → Base64。B64Encode 只吃文本（内部先 StrPut 成 UTF-8），
+   二进制喂给它会被当成字符串重新编码，必须另开一条路。 */
+B64OfBlob(buf, size) {
+    if (size <= 0)
+        return ''
+    flags := 0x40000001                  ; BASE64 | NOCRLF
+    cch := 0
+    if !DllCall('crypt32\CryptBinaryToStringW', 'ptr', buf, 'uint', size, 'uint', flags
+        , 'ptr', 0, 'uint*', &cch, 'int')
+        throw Error('Base64 编码失败（取长度）')
+    if (cch <= 1)
+        return ''
+    out := Buffer(cch * 2, 0)
+    if !DllCall('crypt32\CryptBinaryToStringW', 'ptr', buf, 'uint', size, 'uint', flags
+        , 'ptr', out, 'uint*', &cch, 'int')
+        throw Error('Base64 编码失败')
+    return Trim(StrGet(out, 'utf-16'), "`r`n")
+}
+
+/* 字节 → 十六进制摘要。和 HashHex 同源，只是数据源从 UTF-8 文本换成原始字节。
+   独立实现是为了不碰已经跑通、还带 HMAC 分支的那条。 */
+HashHexBytes(buf, size, algo := 'SHA256') {
+    hAlg := 0, hHash := 0
+    if DllCall('bcrypt\BCryptOpenAlgorithmProvider'
+        , 'ptr*', &hAlg, 'wstr', algo, 'ptr', 0, 'uint', 0, 'int')
+        throw Error('系统不支持摘要算法：' algo)
+    try {
+        szBuf := Buffer(4, 0), got := 0
+        DllCall('bcrypt\BCryptGetProperty', 'ptr', hAlg, 'wstr', 'ObjectLength'
+            , 'ptr', szBuf, 'uint', 4, 'uint*', &got, 'uint', 0, 'int')
+        objLen := NumGet(szBuf, 0, 'uint')
+        DllCall('bcrypt\BCryptGetProperty', 'ptr', hAlg, 'wstr', 'HashDigestLength'
+            , 'ptr', szBuf, 'uint', 4, 'uint*', &got, 'uint', 0, 'int')
+        hashLen := NumGet(szBuf, 0, 'uint')
+        if (!objLen || !hashLen)
+            throw Error('取不到摘要长度：' algo)
+
+        objBuf := Buffer(objLen, 0)
+        if DllCall('bcrypt\BCryptCreateHash', 'ptr', hAlg, 'ptr*', &hHash
+            , 'ptr', objBuf, 'uint', objLen, 'ptr', 0, 'uint', 0, 'uint', 0, 'int')
+            throw Error('BCryptCreateHash 失败')
+        if DllCall('bcrypt\BCryptHashData', 'ptr', hHash, 'ptr', buf, 'uint', size, 'uint', 0, 'int')
+            throw Error('BCryptHashData 失败')
+        outBuf := Buffer(hashLen, 0)
+        if DllCall('bcrypt\BCryptFinishHash', 'ptr', hHash, 'ptr', outBuf, 'uint', hashLen, 'uint', 0, 'int')
+            throw Error('BCryptFinishHash 失败')
+
+        hex := ''
+        Loop hashLen
+            hex .= Format('{:02x}', NumGet(outBuf, A_Index - 1, 'uchar'))
+        return hex
+    } finally {
+        if hHash
+            DllCall('bcrypt\BCryptDestroyHash', 'ptr', hHash, 'int')
+        if hAlg
+            DllCall('bcrypt\BCryptCloseAlgorithmProvider', 'ptr', hAlg, 'uint', 0, 'int')
+    }
 }
 
 /* 占位符名 -> bcrypt 的算法标识。
@@ -2772,6 +3120,11 @@ SchedLog(id, kind, text) {
 ;                        [dl]   File / Name / Size / Skipped / Backup   （仅 download）
 ;    <OutDir>\body.txt   响应正文（UTF-8 无 BOM，仅 http 模式）
 ;
+;  [req] BodyKind 决定 b.txt 怎么读：
+;    text（默认）  FileRead UTF-8，按字符串发
+;    binary        ADODB.Stream 读成 SafeArray 再 Send —— multipart 的包体走这条，
+;                  必须按字节发，经一趟字符集转换就全坏了
+;
 ;  注意：这里刻意不做任何 JSON 解析 —— 正文原样落盘，交给前端的 JSON.parse。
 ; ============================================================================
 
@@ -2833,6 +3186,7 @@ WebhookMain(spec, opt := '') {
     timeout  := WhIntOr(IniRead(spec, 'req', 'Timeout', '15'), 15)
     hdrsFile := IniRead(spec, 'req', 'HeadersFile', '')
     bodyFile := IniRead(spec, 'req', 'BodyFile', '')
+    bodyKind := IniRead(spec, 'req', 'BodyKind', 'text')
     outDir   := IniRead(spec, 'req', 'OutDir', '')
 
     ; download 专用
@@ -2884,8 +3238,25 @@ WebhookMain(spec, opt := '') {
         }
 
         if (bodyFile != '' && FileExist(bodyFile)) {
-            reqBody := FileRead(bodyFile, 'UTF-8')
-            req.Send(reqBody)
+            if (bodyKind = 'binary') {
+                /* multipart 的包体是字节流：交给 ADODB 转成 SafeArray(VT_UI1)，
+                   WinHttp 收到这种变体就按二进制发，不经过任何字符集转换。
+                   走 FileRead(UTF-8) 的话，一个 PNG 会被拆成 U+FFFD 再编码，
+                   内容和体积全变，服务端只能收到坏文件。 */
+                st := ComObject('ADODB.Stream')
+                st.Type := 1                     ; adTypeBinary
+                st.Open()
+                try {
+                    st.LoadFromFile(bodyFile)
+                    reqBody := st.Read()
+                } finally {
+                    st.Close()
+                }
+                req.Send(reqBody)
+            } else {
+                reqBody := FileRead(bodyFile, 'UTF-8')
+                req.Send(reqBody)
+            }
         } else {
             req.Send()
         }
