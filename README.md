@@ -155,6 +155,8 @@ wv2-launcher/
 │  ├─ jsonfile.test.js  jsonfile 类型：target 原样保留/类型标签/参数校验（20 条）
 │  ├─ config-format.test.js  YAML/TOML：解析分派/Date 与循环引用/报错行列（39 条）
 │  ├─ multipart.test.js multipart 归一化/模板替换/请求头不补 JSON/压平格式（40 条）
+│  ├─ callback.test.js  _ql_callback：AHK 切片夹具 + 解析/计划/防环（46 条）
+│  ├─ callback/         切片夹具：根/数组/深层同名/转义引号/字符串里的括号
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
 │  ├─ gen-pinyin.ps1     从 pinyin-data 重新生成 ui/pinyin.js
@@ -173,6 +175,7 @@ wv2-launcher/
 │  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进，并验证 hidden 条目不上界面（45 项）
 │  ├─ jsonfile-check.js  jsonfile 真机全链路：真读盘、真渲染、点刷新时改文件看内容跟不跟（67 项）
 │  ├─ mp-e2e.js          multipart 与模板读文件端到端：本地回显服务逐字节比对包体和文件（36 项）
+│  ├─ cb-check.js        回调端到端：真请求 → 真回调 → 真起进程 / 防环 / 上限 / 回执不被弹框堵（22 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -198,12 +201,14 @@ wv2-launcher/
 > node tests/jsonfile.test.js  # 20 条（jsonfile 的 target 原样保留 / 参数校验 / Tab 补全判定）
 > node tests/config-format.test.js # 39 条（YAML/TOML 解析分派、Date 与循环引用、报错行列）
 > node tests/multipart.test.js # 40 条（multipart 三种写法 / 模板替换 / 请求头 / 交给 AHK 的压平格式）
+> node tests/callback.test.js  # 46 条（_ql_callback 的切片 / 解析 / 计划；含真跑 AHK 切片器）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
 > node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用与隐藏条目/模板（66 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log；含 hidden 条目）
+> node tools/cb-check.js       # 回调端到端：真请求、真回调、真起进程（22 项，会弹两个 1 秒自动关的提示框）
 > node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC/文件与 crypto 对照（58 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
@@ -776,6 +781,116 @@ global SIG_KEYS := Map(
 
 > 想传「内容」而不是「文件」时用 `{{#file:…}}`；想传「文件」时用 `multipart`。
 > 分不清就看服务端要什么：收 `application/json` 的要前者，收 `multipart/form-data` 的要后者。
+
+### 回调：响应里带 `_ql_callback` 就执行本地动作
+
+接口不光能"回数据"，还能"回动作"：在响应 JSON 的**根对象**上带一个 `_ql_callback`，
+程序就按里面的 `actions` 去弹提示、跑条目。**没有这个键时一切照旧** —— 现有接口一个字都不用改。
+
+```json
+{
+  "code": 0,
+  "data": { "count": 3 },
+  "_ql_callback": {
+    "v": 1,
+    "actions": [
+      { "type": "run", "id": "open-backup-dir" },
+      { "type": "msg", "level": "success", "title": "备份完成", "text": "已上传 3 个文件\n用时 1.8s" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `v` | 协议版本，缺省按 `1`。写成 `2` 这类**更大的数会被整块忽略**（老程序不会被新协议带偏），并记一行日志 |
+| `actions` | 动作数组，**按顺序执行**；默认最多 5 个，多的截断并记日志 |
+
+两类动作：
+
+| `type` | 字段 | 行为 |
+|---|---|---|
+| `msg` | `level`：`success` / `error`（也认 `ok` / `fail`）；`title`（默认 QuickLaunch）；`text`（必填，空则忽略）；`timeout`：秒，`0`/缺省 = 不自动关 | 弹出系统消息框：成功用信息图标、错误用错误图标 |
+| `run` | `id`：config.json 里的条目 id | 等同于 `ql run <id>`：app / cmd / ahk / url / folder / **webhook** / download / jsonfile 都行 |
+
+宽容写法（远端不必为配合我们写得多别扭）：`_ql_callback` 直接是数组 → 当作 `actions`；
+直接是单个动作对象（带 `type`）→ 当作一个动作；`actions` 给成单个对象也认。
+`msg` / `run` 还认 `popup` / `exec` 别名。
+
+**错误响应同样能回调**：HTTP 4xx/5xx 在 WinHttp 里不算异常，正文照常拿得到。所以鉴权失败
+可以用 400 带一条 `"level": "error"` 的提示，而不是让用户对着一个状态码猜。
+
+```json
+{ "error": "invalid signature",
+  "_ql_callback": { "actions": [{ "type": "msg", "level": "error", "text": "签名校验失败，请检查密钥" }] } }
+```
+
+几条执行规则：
+
+- 只看**根对象第一层**。`{"data":{"_ql_callback":…}}` 这种深层同名字段不触发 ——
+  既是防撞（业务响应深处出现同名键不该动本地），也是防误伤（第三方接口返回一坨原文里
+  恰好带这个串）。
+- **先回执、再执行**：结果面板/命令行的回执照常先落地，回调的副作用在下一拍才开始。
+  不这么做的话，模态消息框会把 `ql run x --wait` 堵到用户点确定为止。
+- `run` 的忽略清单（**静默跳过，只记日志，绝不弹错误**）：id 不存在、条目被 `enabled:false`
+  停用、条目还缺必填参数、模板变量写错、允许列表里没有它。
+- 一条链上默认最多 5 跳（见下），一次响应最多 5 个动作，两个上限互相独立。
+
+#### 防环：链上不能调回祖先
+
+回调调 webhook 是正常用法（A 的响应让程序去跑 B），但 A→B→A 这种环必须停得下来。
+每条请求带着一条**链**（`path` = 这条链上已经跑过的条目 id，按顺序）：
+
+| 情况 | 结果 |
+|---|---|
+| 目标 id 在链上（是**祖先**） | 阻断，日志写 `环已阻断（a→b→a）` |
+| 链上长度已达 `maxDepth` | 阻断，日志写 `链深已达上限` |
+| 其它 | 放行，新链 = 原链 + 目标 id |
+
+判的是"祖先"不是"访问过"：A 的两个回调分别调 B 和 C，都能跑（兄弟不算环）；B 再想调回 A
+才会被挡。真环第一步就停，不是"跑满 5 次再停"——后者会发 5 次请求、弹 5 个框。
+
+#### 开关与白名单
+
+config.json 顶层可选（**不写就是默认值**，老配置不用改）：
+
+```json
+"callback": { "enabled": true, "max": 5, "maxDepth": 5, "allow": [], "onQuiet": "notify" }
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `true` | `false` = 整块忽略，连日志都不写 |
+| `max` | `5` | 一次响应最多执行几个动作（1~20） |
+| `maxDepth` | `5` | 一条链最多几跳（1~20） |
+| `allow` | `[]` | 非空时**只有列出的 id** 能被回调拉起。远端能间接决定"跑哪条命令"，留个闸 |
+| `onQuiet` | `"notify"` | 定时任务触发的链：`notify` = 托盘提示 + 日志，`popup` = 照常弹框 |
+
+"有没有人在看"是沿链继承的：定时任务触发的那条链，第三跳也不会半夜弹模态框；
+你手动点出来的一条链，第二跳照常弹。
+
+#### 日志
+
+每一条回调都落在脚本目录的 `launcher.log`，一行一条，带时间戳：
+
+```
+2026-11-19 21:40:46  [cb] 执行 marker（链 hook-ok→marker）
+2026-11-19 21:40:46  [cb] 消息框 success：ok 分支（hook-ok / r1-mwnl8v）
+2026-11-19 21:40:51  [cb] 跳过 hook-loop：环已阻断（hook-loop→hook-loop）
+2026-11-19 21:40:54  [cb] 检测到 _ql_callback，但这一块切不出来（响应不是合法 JSON？）—— 已忽略
+```
+
+最后那条是刻意留的：真出现"说了要弹框却没弹"，先看这行 —— 它把"没有这个键"和
+"有但切坏了"区分开了。
+
+#### 不生效的地方
+
+- **单跑 `ql --webhook spec.ini` 不执行回调**：那个进程只发一次请求、写 meta.ini 就退出，
+  没有启动器实例，也没有"谁来看这个框"。要在终端里验回调，用 `ql run <条目> --wait`。
+- 回调拉起的 webhook **不占结果面板**（不会把你正在看的响应顶掉），它的结果靠自己的
+  `msg` 回来说。
+- 回调跑一个 cmd，那条 cmd 自己又去 `ql run …` —— 那是**另一个进程发起的新请求**，
+  链信息过不去。任何进程内方案都拦不住，只能靠你自己别把脚本写成环。
 
 ### 响应不对劲？在终端手跑一遍
 
@@ -1903,6 +2018,11 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 - webhook 只处理**文本**响应：二进制（图片/文件）会被当作文本读，得到乱码。要下文件请用 `download` 类型。
 - webhook 响应超过 **40 万个字符**（`HTTP_MAX_BODY`）会被截断（面板会标「响应过大已截断」）。
   按字符算，不是按字节：纯 ASCII 约 400KB，中文正文（3 字节/字）能到 1.2MB 左右。
+  回调不受这条影响：`_ql_callback` 是在截断**之前**从完整正文里切的。
+- 回调只看响应**根对象第一层**，深层同名字段一律不触发（既是防撞也是防误伤）。
+- 防环只管"回调链"内部：回调跑起的 cmd 如果自己再 `ql run …`，那是另一个进程发起的新请求，
+  链信息带不过去，任何进程内方案都拦不住 —— 别把脚本写成环。
+- 单跑 `ql --webhook spec.ini` **不执行回调**（那个进程只发一次请求、写完 meta.ini 就退出）。
 - `{{#file:…}}` 和 `multipart` 都是**整个文件读进内存**，所以只适合小文件：
   模板内联上限 2MB，multipart 单文件 8MB。超了直接报错，不截断、不分片、没有进度条。
 - multipart 的文件名按 UTF-8 原文写进 `Content-Disposition`，没走 RFC 5987 的

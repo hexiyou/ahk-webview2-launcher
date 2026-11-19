@@ -1,0 +1,11 @@
+{
+  "code": 0,
+  "data": { "count": 3 },
+  "_ql_callback": {
+    "v": 1,
+    "actions": [
+      { "type": "run", "id": "open-backup-dir" },
+      { "type": "msg", "level": "success", "text": "已上传 3 个文件" }
+    ]
+  }
+}

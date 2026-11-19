@@ -4,6 +4,7 @@
 ;  结构：
 ;    launcher.ahk        本文件：Win32 无边框窗口 + WebView2 宿主 + 全局热键 + 启动逻辑
 ;                        + HTTP 执行器（`--webhook <spec>` 分支，见文末同名小节）
+;                        + 回调切块/消息框（`_ql_callback`，见「回调」小节）
 ;    launcher.ini        AHK 侧设置（热键 / 窗口尺寸 / 行为）
 ;    config.json         数据源（应用条目，由前端 JS 读取解析）
 ;    ui/                 前端界面（HTML + CSS + JS）
@@ -71,6 +72,11 @@ global dropSeen := ''         ; 上一次转给页面的拖入 URI（同一次�
 global dropSeenAt := 0
 global ncDrag := false        ; WebView2 原生非客户区拖拽是否可用
 global httpJobs := Map()      ; 进行中的 webhook 请求：id -> {dir, pid, deadline}
+global cbBoxQ := []           ; 待弹的回调消息框（串行，见 DoCallbackMsg）
+global cbBoxBusy := false     ; 正在弹（MsgBox 会跑嵌套消息循环，可能再进来一条）
+global CB_TEXT_MAX := 2000    ; 回调消息框正文上限：400KB 的正文不该变成一个巨型对话框
+global CB_TITLE_MAX := 120
+global CB_RAW_MAX := 16384    ; _ql_callback 原始片段上限：比这大的不是回调，是事故
 global ipcGui := 0            ; 收件箱窗口（接收命令行请求）
 global mutexHandle := 0
 global cliQueue := []         ; 还没投递给页面的请求
@@ -104,6 +110,12 @@ whSpec := ''
 whOpt := ''
 if WebhookArg(A_Args, &whSpec, &whOpt)
     ExitApp(WebhookMain(whSpec, whOpt))
+
+/* 回调切片器的自检：只跑「从正文里切 _ql_callback」这一步（不弹框、不建窗口），
+   每行打一个 JSON，由 tests/callback.test.js 断言。放在这里同样是为了不碰界面。 */
+cbTestDir := ''
+if CbTestArg(A_Args, &cbTestDir)
+    ExitApp(CbTest(cbTestDir))
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
@@ -972,6 +984,12 @@ OnWebMessage(sender, args) {
             DoReadJson(raw)
         case 'log':
             FileAppend(JsonStr(raw, 'text') '`n', SCRIPT_DIR '\launcher.log', 'UTF-8')
+        /* 回调（_ql_callback）：页面解析动作，本地能做的两件事在这里 ——
+           弹原生消息框、写日志。见文末「回调」小节。 */
+        case 'cb-msg':
+            DoCallbackMsg(raw)
+        case 'cb-log':
+            CbLog(JsonStr(raw, 'text'))
     }
 }
 
@@ -1413,6 +1431,21 @@ CheckHttp() {
                 . ',"backup":' JsonQuote(bakFile)
                 . ',"purpose":' JsonQuote(job.purpose) '}')
         } else {
+            /* 回调片段在**截断之前**切：面板只显示前 400KB，但 _ql_callback 完全
+               可能落在后面。切出来的是原始 JSON 片段，解析交给页面（JSON.parse）。 */
+            cbRaw := ''
+            if (err = '') {
+                sl := CbSlice(body)
+                if (sl.why = 'bad')
+                    CbLog('检测到 _ql_callback，但这一块切不出来（响应不是合法 JSON？）—— 已忽略')
+                else if (sl.raw != '') {
+                    if (StrLen(sl.raw) > CB_RAW_MAX)
+                        CbLog('_ql_callback 超过 ' CB_RAW_MAX ' 字符（' StrLen(sl.raw) '）—— 已忽略')
+                    else
+                        cbRaw := sl.raw
+                }
+            }
+
             truncated := 0
             if (StrLen(body) > HTTP_MAX_BODY) {
                 body := SubStr(body, 1, HTTP_MAX_BODY)
@@ -1426,6 +1459,7 @@ CheckHttp() {
                     . ',"ms":' ms
                     . ',"truncated":' truncated
                     . ',"error":' JsonQuote(err)
+                    . ',"cb":' JsonQuote(cbRaw)
                     . ',"body":' JsonQuote(body) '}')
             }
         }
@@ -1437,6 +1471,214 @@ CheckHttp() {
     }
     if !httpJobs.Count
         SetTimer(CheckHttp, 0)
+}
+
+; ============================================================================
+;  回调（_ql_callback）
+;  ---------------------------------------------------------------------------
+;  远端接口在响应 JSON 的**根对象**上带一个 _ql_callback，就按里面的 actions
+;  执行本地动作；没有这个键 = 什么都没发生（现有行为一字不变）。
+;
+;  为什么只认根对象第一层：既是防撞（业务响应深处出现同名字段不该触发本地动作），
+;  也是防误伤（第三方接口返回一坨原文里带这个串，不该被执行）。
+;
+;  分工（刻意这么切）：
+;    AHK  只做本地才能做的两件事 —— 从正文里切出这块原始 JSON（正文和 400KB
+;         截断都在主进程），以及弹原生消息框 / 写日志。
+;    页面 解析与执行。WebView 里 JSON.parse 天然稳妥；"调用某个条目"直接复用
+;         用户点条目时那条 launch()，app / cmd / ahk / url / folder / webhook /
+;         download / jsonfile 全都走同一套实现。
+;
+;  为什么不在这里解析 action：run 到一个 webhook 条目要拼 URL、展开模板、组
+;  multipart —— 在这里再写一份就是第二份实现，早晚和页面那份对不上（这个项目
+;  最贵的一课）。AHK 只管"切"，不管"懂"。
+;
+;  防环（链）由页面携带，见 ui/app.js 的 cbDispatch：按 id 记祖先 + 深度兜底。
+; ============================================================================
+
+CbLog(text) {
+    line := FormatTime(A_Now, 'yyyy-MM-dd HH:mm:ss') '  [cb] ' text "`n"
+    try FileAppend(line, SCRIPT_DIR '\launcher.log', 'UTF-8')
+}
+
+/* 标量/容器值的结束位置（不含）。字符串用正则一次跳过整段 —— 逐字符 SubStr
+   在 400KB 正文上要 100ms 以上，而开销几乎全在"跳过很长的字符串值"。 */
+SkipWs(s, i, n) {
+    while (i <= n && InStr(" `t`r`n", SubStr(s, i, 1)))
+        i++
+    return i
+}
+
+/* 入参 i 指向开引号，返回闭合引号**之后**的位置；没有闭合引号返回 0 */
+StrEnd(s, i) {
+    if RegExMatch(s, '(?s)"[^"\\]*(?:\\.[^"\\]*)*"', &m, i) && m.Pos = i
+        return i + m.Len
+    return 0
+}
+
+ValEnd(s, i) {
+    static STRUCT := '["\[\]{}]'
+    n := StrLen(s)
+    if (i > n)
+        return 0
+    c := SubStr(s, i, 1)
+    if (c = '"')
+        return StrEnd(s, i)
+    if (c = '{' || c = '[') {
+        open := c
+        close := (c = '{') ? '}' : ']'
+        depth := 0
+        j := i
+        while (j <= n) {
+            if !RegExMatch(s, STRUCT, &m, j)      ; 跳到下一个结构字符，中间整段跳过
+                return 0
+            j := m.Pos
+            if (m[0] = '"') {
+                e := StrEnd(s, j)
+                if !e
+                    return 0
+                j := e
+                continue
+            }
+            if (m[0] = open)
+                depth++
+            else if (m[0] = close) {
+                depth--
+                if (depth = 0)
+                    return j + 1
+            }
+            j++
+        }
+        return 0
+    }
+    if RegExMatch(s, '[,\]}\s]', &m, i)           ; 数字 / true / false / null
+        return (m.Pos > i) ? m.Pos : 0
+    return n + 1
+}
+
+/* 从响应正文切出根对象上的 _ql_callback 原始片段。
+   返回 {raw, why}：why = 'none' 没有这个键 / 'nested' 只在深层出现（按设计忽略）
+   / 'bad' 根上有但切不动（正文不是合法 JSON）/ '' 切到了。 */
+CbSlice(body) {
+    if !InStr(body, '_ql_callback', false)
+        return { raw: '', why: 'none' }
+    n := StrLen(body)
+    i := SkipWs(body, 1, n)
+    if (SubStr(body, i, 1) != '{')
+        return { raw: '', why: 'nested' }
+    i := SkipWs(body, i + 1, n)
+    while (i <= n) {
+        c := SubStr(body, i, 1)
+        if (c = '}')
+            return { raw: '', why: 'nested' }
+        if (c = ',') {                            ; 容错：多余的逗号
+            i := SkipWs(body, i + 1, n)
+            continue
+        }
+        if (c != '"')
+            return { raw: '', why: 'bad' }
+        e := StrEnd(body, i)
+        if !e
+            return { raw: '', why: 'bad' }
+        key := SubStr(body, i + 1, e - i - 2)
+        i := SkipWs(body, e, n)
+        if (SubStr(body, i, 1) != ':')
+            return { raw: '', why: 'bad' }
+        i := SkipWs(body, i + 1, n)
+        vEnd := ValEnd(body, i)
+        if !vEnd
+            return { raw: '', why: 'bad' }
+        if (key = '_ql_callback')
+            return { raw: SubStr(body, i, vEnd - i), why: '' }
+        i := SkipWs(body, vEnd, n)
+        if (SubStr(body, i, 1) = ',')
+            i := SkipWs(body, i + 1, n)
+    }
+    return { raw: '', why: 'nested' }
+}
+
+/* 消息框走队列 + 定时器，不直接在 WebView2 的消息回调里弹：
+   MsgBox 会跑嵌套消息循环，在 COM 回调栈上弹模态框是自找麻烦。 */
+DoCallbackMsg(raw) {
+    global cbBoxQ
+    text := SubStr(JsonStr(raw, 'text'), 1, CB_TEXT_MAX)
+    if (Trim(text, " `t`r`n") = '')
+        return
+    title := Trim(JsonStr(raw, 'title'), ' `t')
+    title := (title = '') ? 'QuickLaunch' : SubStr(title, 1, CB_TITLE_MAX)
+    cbBoxQ.Push({
+        level: (JsonStr(raw, 'level') = 'error') ? 'error' : 'ok',
+        title: title,
+        text: text,
+        timeout: Max(0, Min(600, Floor(JsonNum(raw, 'timeout', 0)))),
+        quiet: JsonNum(raw, 'quiet', 0) ? 1 : 0
+    })
+    CbLog('消息框入队（' cbBoxQ[cbBoxQ.Length].level '）：' OneLine(text, 100))
+    SetTimer(CallbackPump, -1)
+}
+
+CallbackPump() {
+    global cbBoxQ, cbBoxBusy
+    if (cbBoxBusy || !cbBoxQ.Length)
+        return
+    cbBoxBusy := true
+    a := cbBoxQ.RemoveAt(1)
+    try {
+        if a.quiet {
+            /* 定时任务触发的链：没人看着，弹个模态框只会半夜挂在那里 */
+            TrayTip(a.text, a.title)
+            CbLog('安静模式：改用托盘提示（' a.level '）')
+        } else {
+            opts := (a.level = 'error') ? 'Iconx' : 'Iconi'
+            if a.timeout
+                opts .= ' T' a.timeout
+            MsgBox(a.text, a.title, opts)
+            CbLog('消息框已关闭（' a.level '）')
+        }
+    } catch as e {
+        CbLog('消息框失败：' CleanComError(e.Message))
+    }
+    cbBoxBusy := false
+    if cbBoxQ.Length
+        SetTimer(CallbackPump, -1)
+}
+
+/* 日志里一行一条：正文里的换行会把一条日志撑成好几行，排障时很难读 */
+OneLine(s, max := 80) {
+    s := StrReplace(StrReplace(StrReplace(s, "`r", ' '), "`n", ' / '), "`t", ' ')
+    return (StrLen(s) > max) ? SubStr(s, 1, max) '…' : s
+}
+
+; ---- 自检：只跑切片，不弹框、不建窗口（见 tests/callback.test.js） -----------
+
+CbTestArg(argv, &dir) {
+    dir := ''
+    if (argv.Length < 2 || argv[1] != '--selftest-callback')
+        return false
+    dir := Trim(argv[2], ' `t"')
+    return true
+}
+
+CbTest(dir) {
+    if !InStr(FileExist(dir), 'D') {
+        StdOut('目录不存在：' dir '`n', true)
+        return 2
+    }
+    n := 0
+    Loop Files, dir '\*.json', 'F' {
+        f := A_LoopFileFullPath
+        try body := FileRead(f, 'UTF-8')
+        catch {
+            StdOut('{"file":' JsonQuote(A_LoopFileName) ',"error":"read"}' '`n')
+            continue
+        }
+        r := CbSlice(body)
+        StdOut('{"file":' JsonQuote(A_LoopFileName)
+            . ',"raw":' JsonQuote(r.raw) ',"why":' JsonQuote(r.why) '}' '`n')
+        n++
+    }
+    StdOut('{"summary":{"files":' n '}}' '`n')
+    return 0
 }
 
 ; ============================================================================

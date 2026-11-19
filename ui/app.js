@@ -1877,12 +1877,17 @@
     const cli = !!(opts && opts.cli);
     /* 定时调度发起的执行：同样没人看着，而且不能动界面（不弹结果面板、不计使用频率） */
     const quiet = !!(opts && opts.quiet);
+    /* 由 _ql_callback 触发的执行：和 CLI 一样"没人能接着敲"，区别是它不能报错给人看，
+       只能记日志、然后跳过 —— 远端不该因为本机少配了一条条目而弹一堆错误 */
+    const cb = !!(opts && opts.cb);
+    const chain = (opts && opts.chain) || null;
 
     /* 模板里写了个没声明的变量：宁可拒绝，也别悄悄替换成空串跑出个歪结果。
        载入配置时就查过一遍（见 templateIssues），这里是最后一道闸。 */
     if (item.tplErr && item.tplErr.length) {
       const msg = '配置有误：' + item.tplErr.join('；');
       if (cli) { cliDone(4, msg); return false; }
+      if (cb) { cbLog('跳过 ' + item.id + '：' + msg); return false; }
       toast(msg, 5000);
       return false;
     }
@@ -1893,6 +1898,8 @@
     if (w.missing.length) {
       /* 点了没填参数的必填条目：别直接报错，把人送进参数态 */
       if (cli) { cliDone(3, '还缺参数：' + w.missing.join('、')); return false; }
+      /* 回调更糟：窗口可能根本没露脸，进参数态等于卡在一个没人看得见的界面里 */
+      if (cb) { cbLog('跳过 ' + item.id + '：还缺必填参数 ' + w.missing.join('、')); return false; }
       if (!raw.trim()) { enterParamFor(item); return false; }
       toast('还缺参数：' + w.missing.join('、'));
       return false;
@@ -1901,7 +1908,7 @@
     if (item.type === 'webhook' || item.type === 'download' || item.type === 'jsonfile') {
       if (item.type === 'download') runDownload(w.item, cli, quiet);
       else if (item.type === 'jsonfile') runLocalJson(w.item, cli, quiet);
-      else runWebhook(w.item, raw, cli, quiet);
+      else runWebhook(w.item, raw, cli, quiet, chain);
       if (!quiet) bumpUsage(item);
       return true;
     }
@@ -2084,9 +2091,16 @@
     };
   }
 
-  function runWebhook(item, raw, cli, quiet) {
+  function runWebhook(item, raw, cli, quiet, chain) {
     const id = 'r' + (++state.reqSeq).toString(36) + '-' + Date.now().toString(36);
-    state.pending.set(id, { item: item, cli: !!cli, quiet: !!quiet });
+    /* 链跟着请求走：回调要判断"这条命令是不是这条链的祖先"，必须知道这次请求
+       是从哪条链上来的。手动 / 定时发起的，链就是它自己。
+       quiet 也记进链里 —— 它表达的是"这次有没有人在看"，和"要不要占结果面板"
+       是两件事（链上的请求一律不占面板，但人工触发的链仍然该弹提示框）。 */
+    state.pending.set(id, {
+      item: item, cli: !!cli, quiet: !!quiet,
+      chain: chain || { path: [item.id], depth: 0, quiet: !!quiet }
+    });
 
     /* 定时调度触发的请求不碰结果面板：窗口是藏着的，占了面板反而让用户
        下次开窗看到一条莫名其妙的旧结果。结果摘要已经进 sched.log 了。 */
@@ -2112,6 +2126,7 @@
     }
 
     const mp = mpFlat(item);
+    /* quiet 要带给 AHK：回调的"安静模式"（定时链路不弹模态框）由它决定 */
     post({
       type: 'http',
       id: id,
@@ -2120,6 +2135,7 @@
       headers: headerLines(item),
       body: buildBody(item),
       timeout: item.timeout,
+      quiet: quiet ? 1 : 0,
       mpFiles: mp.files,
       mpFields: mp.fields
     });
@@ -2128,6 +2144,12 @@
   function onHttpResult(msg) {
     const pend = state.pending.get(msg.id);
     state.pending.delete(msg.id);
+    /* 回调必须在所有早退之前处理：定时（安静）请求、面板已被关掉、命令行收尾
+       这几种情况都会提前 return，但"接口说了要执行什么"和这些无关。 */
+    if (msg.cb) {
+      try { cbDispatch(msg.cb, pend, msg); }
+      catch (e) { cbLog('内部错误：' + ((e && e.message) || e)); }
+    }
     const wasCli = !!(pend && pend.cli);
     if (pend && pend.quiet) {
       cliDone(msg.ok ? 0 : 4, msg.ok
@@ -2159,6 +2181,230 @@
         ? ('HTTP ' + (msg.status | 0) + ' · ' + (msg.ms | 0) + 'ms')
         : ('请求失败：' + (msg.error || '未知错误')));
     }
+  }
+
+  /* ---------------------------------------------------------- 回调（_ql_callback）
+
+     远端接口在响应**根对象**上带一个 _ql_callback，就按里面的 actions 执行本地动作；
+     没有这个键就什么都不发生（现有行为一字不变）。
+
+     AHK 只负责两件本地才能做的事：把这块原始 JSON 从正文里切出来（正文在它手上，
+     400KB 截断也发生在切之后），以及弹原生消息框。解析与执行都在这里 —— WebView 的
+     JSON.parse 稳妥，而"调用某个条目"直接复用 launch()，app / cmd / ahk / url /
+     folder / webhook / download / jsonfile 一次性全覆盖，不用在 AHK 里再写一份
+     拼 URL、组 multipart 的实现。
+
+     防环：每条请求带着一条链（path = 链上已经跑过的条目 id，按顺序）。回调要跑 X 时，
+     X 是链上的**祖先**才阻断 —— 兄弟不算（A 同时调 B 和 C 都放行），A→B→A 这种真环
+     第一步就被挡下。maxDepth 只是兜底，防的是"判不出 id"的情形。
+     ---------------------------------------------------------- */
+
+  const CB_TEXT_MAX = 2000;     /* 和 launcher.ahk 的 CB_TEXT_MAX 对齐 */
+  const CB_TITLE_MAX = 120;
+
+  /* 配置块：config.json 顶层的 callback。不写就全用默认值 ——
+     老配置一个字都不用改，加完功能立刻能用。 */
+  function cbCfg() {
+    const c = (state.cfg && !Array.isArray(state.cfg) && state.cfg.callback) || {};
+    /* 写了数字就夹进 1~20；写错（字符串、null、NaN）才退回默认 ——
+       写成 0 的意思是"别执行"，夹到 1 比悄悄按 5 处理更可预期 */
+    const clamp = (v, def) => {
+      const n = Number(v);
+      return (v == null || v === '' || !isFinite(n)) ? def : Math.max(1, Math.min(20, Math.floor(n)));
+    };
+    return {
+      enabled: c.enabled !== false,
+      /* 单次响应最多几个动作 / 一条链最多几跳。两个独立，各自兜一层 */
+      max: clamp(c.max, 5),
+      maxDepth: clamp(c.maxDepth, 5),
+      /* 非空 = 只有这些 id 能被回调拉起（远端可控的东西，得留个闸） */
+      allow: Array.isArray(c.allow) ? c.allow.map(String) : [],
+      /* 定时任务触发的链：默认只托盘提示，不弹模态框 */
+      onQuiet: String(c.onQuiet || '').toLowerCase() === 'popup' ? 'popup' : 'notify'
+    };
+  }
+
+  function cbLog(text) {
+    post({ type: 'cb-log', text: String(text) });
+  }
+
+  function cbType(v) {
+    const s = String(v == null ? '' : v).trim().toLowerCase();
+    if (s === 'msg' || s === 'popup' || s === 'box' || s === 'message') return 'msg';
+    if (s === 'run' || s === 'exec' || s === 'launch' || s === 'cmd') return 'run';
+    return '';
+  }
+
+  function cbLevel(v) {
+    const s = String(v == null ? '' : v).trim().toLowerCase();
+    if (s === 'error' || s === 'err' || s === 'fail' || s === 'failed' || s === 'danger') return 'error';
+    return 'success';
+  }
+
+  /* 把 _ql_callback 这块原始 JSON 归一成动作列表。宽容：数组、单个对象、
+     {actions:[…]}、{actions:{…}} 都认 —— 远端不该为了配合我们写得多别扭。 */
+  function cbParse(raw) {
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (e) { return { actions: [], err: 'JSON 解析失败：' + ((e && e.message) || e) }; }
+
+    /* 版本：缺省按 1。将来协议改了，老程序要能把新块整块忽略，
+       而不是按自己那套理解跑一半 */
+    if (data && typeof data === 'object' && !Array.isArray(data) && data.v != null) {
+      const v = Number(data.v);
+      if (isFinite(v) && v > 1) return { actions: [], err: '', skip: 'v' + v };
+    }
+
+    let list;
+    if (Array.isArray(data)) list = data;
+    else if (data && typeof data === 'object') {
+      if (Array.isArray(data.actions)) list = data.actions;
+      else if (data.actions && typeof data.actions === 'object') list = [data.actions];
+      else if (data.type) list = [data];              /* 单个动作对象的简写 */
+      else list = [];
+    } else list = [];
+
+    const actions = [];
+    list.forEach(x => {
+      if (!x || typeof x !== 'object') return;
+      const t = cbType(x.type);
+      if (t === 'msg') {
+        const text = String(x.text != null ? x.text : (x.message != null ? x.message : ''));
+        if (!text.trim()) return;                     /* 空文本不弹空框 */
+        actions.push({
+          kind: 'msg',
+          level: cbLevel(x.level),
+          title: x.title == null ? '' : String(x.title).slice(0, CB_TITLE_MAX),
+          text: text.slice(0, CB_TEXT_MAX),
+          timeout: Math.max(0, Math.min(600, Number(x.timeout) || 0))
+        });
+      } else if (t === 'run') {
+        const id = String(x.id != null ? x.id : (x.cmd != null ? x.cmd : '')).trim();
+        if (id) actions.push({ kind: 'run', id: id });
+      }
+    });
+    return { actions: actions, err: '' };
+  }
+
+  /* 按 id 找条目。先精确、再忽略大小写 —— 配置里的 id 都是小写，
+     远端写 "Notepad" 不该变成"没找到"。停用的条目不在 state.all 里，
+     所以这里天然调不到（和 ql run 一致）。 */
+  function cbFindItem(id) {
+    const want = String(id == null ? '' : id).trim();
+    if (!want) return null;
+    let hit = null;
+    state.all.forEach(it => { if (!hit && String(it.id) === want) hit = it; });
+    if (hit) return hit;
+    const low = want.toLowerCase();
+    state.all.forEach(it => { if (!hit && String(it.id).toLowerCase() === low) hit = it; });
+    return hit;
+  }
+
+  /* 纯函数：动作列表 + 链 + 配置 → 执行计划。副作用留给 cbDispatch，
+     这样"什么时候该拒"能单独测（见 tests/callback.test.js）。 */
+  function cbPlan(actions, ctx) {
+    const cfg = ctx.cfg;
+    const path = (ctx.chain && Array.isArray(ctx.chain.path)) ? ctx.chain.path.slice() : [];
+    /* 白名单按小写比：配置是手写的，别让一个大小写差异把命令悄悄挡掉 */
+    const allow = (cfg.allow || []).map(x => String(x).toLowerCase());
+    const out = [];
+    actions.slice(0, cfg.max).forEach(a => {
+      if (a.kind === 'msg') { out.push(a); return; }
+
+      if (allow.length && allow.indexOf(String(a.id).toLowerCase()) < 0) {
+        out.push({ kind: 'skip', why: 'allow', id: a.id });
+        return;
+      }
+      const item = ctx.find(a.id);
+      if (!item) {
+        out.push({ kind: 'skip', why: 'not-found', id: a.id });
+        return;
+      }
+      const low = String(item.id).toLowerCase();
+      if (path.some(x => String(x).toLowerCase() === low)) {
+        out.push({ kind: 'skip', why: 'loop', id: item.id, path: path.concat([item.id]) });
+        return;
+      }
+      if (path.length >= cfg.maxDepth) {
+        out.push({ kind: 'skip', why: 'depth', id: item.id, path: path });
+        return;
+      }
+      out.push({
+        kind: 'run',
+        item: item,
+        /* quiet 一路带下去：定时任务触发的链，第三跳也不该半夜弹框 */
+        chain: {
+          path: path.concat([item.id]),
+          depth: path.length,
+          quiet: !!(ctx.chain && ctx.chain.quiet)
+        }
+      });
+    });
+    return out;
+  }
+
+  function cbWhy(step) {
+    if (step.why === 'allow') return '不在 callback.allow 白名单里';
+    if (step.why === 'not-found') return 'config.json 里没有这个 id';
+    if (step.why === 'loop') return '环已阻断（' + step.path.join('→') + '）';
+    if (step.why === 'depth') return '链深已达上限 ' + step.path.length;
+    return step.why;
+  }
+
+  function cbOneLine(s, max) {
+    const t = String(s).replace(/\r/g, ' ').replace(/\n/g, ' / ').replace(/\t/g, ' ');
+    return t.length > (max || 80) ? t.slice(0, max || 80) + '…' : t;
+  }
+
+  function cbDispatch(raw, pend, msg) {
+    const cfg = cbCfg();
+    if (!cfg.enabled) return;
+
+    const p = cbParse(raw);
+    if (p.skip) { cbLog('协议版本 ' + p.skip + ' 不认识，整块忽略'); return; }
+    if (p.err) { cbLog('解析失败，已忽略：' + p.err); return; }
+    if (!p.actions.length) return;
+
+    const chain = (pend && pend.chain) || { path: [], depth: 0, quiet: !!(pend && pend.quiet) };
+    const plan = cbPlan(p.actions, { cfg: cfg, chain: chain, find: cbFindItem });
+    /* "有没有人在看"取自链，不是取自这次请求的 quiet —— 链上的请求一律 quiet
+       （不占结果面板），但人工点出来的那条链仍然该弹提示框 */
+    const quiet = !!chain.quiet;
+    const tag = (pend && pend.item ? pend.item.id : '?') + ' / ' + ((msg && msg.id) || '?');
+
+    /* 副作用推到下一拍再执行：onHttpResult 后面还要给命令行回执（cli-result），
+       先把回执送出去。消息框是模态的，不推这一下，`ql run x --wait` 就得等用户
+       点了确定才拿到结果 —— "请求成功没成功"和"要不要弹个框"本来就不该互相堵。 */
+    setTimeout(() => {
+      try {
+        if (p.actions.length > cfg.max)
+          cbLog('动作数超过上限 ' + cfg.max + '，只执行前 ' + cfg.max + ' 个（' + tag + '）');
+
+        plan.forEach(step => {
+          if (step.kind === 'skip') {
+            cbLog('跳过 ' + step.id + '：' + cbWhy(step) + '（' + tag + '）');
+            return;
+          }
+          if (step.kind === 'msg') {
+            post({
+              type: 'cb-msg',
+              level: step.level,
+              title: step.title,
+              text: step.text,
+              timeout: step.timeout,
+              /* 定时链路默认不弹模态框：半夜挂一个没人关的对话框是最糟的"成功" */
+              quiet: (quiet && cfg.onQuiet !== 'popup') ? 1 : 0
+            });
+            cbLog('消息框 ' + step.level + '：' + cbOneLine(step.text) + '（' + tag + '）');
+            return;
+          }
+          cbLog('执行 ' + step.item.id + '（链 ' + step.chain.path.join('→') + '）');
+          launch(step.item, '', { quiet: true, cb: true, chain: step.chain });
+        });
+      } catch (e) {
+        cbLog('执行回调失败：' + ((e && e.message) || e));
+      }
+    }, 0);
   }
 
   /* ---------------------------------------------------------- Download */
