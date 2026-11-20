@@ -125,11 +125,13 @@ wv2-launcher/
 ├─ launcher.ini          AHK 侧设置：热键/尺寸/圆角/行为
 ├─ config.json           数据源：应用条目 + 分组 + 定时任务（前端读取解析）
 ├─ usage.json            使用记录：次数 / 上次时间 / 参数历史（首次启动自动生成）
+├─ machine.ini           本机设备指纹：机器码缓存 + 本机盐（首次启动自动生成，换硬件后 --machine-refresh）
 ├─ sched.log             定时任务的执行记录（配了 schedules 才会有，一行一条，见「七、定时调度」）
 ├─ ui/
 │  ├─ index.html         界面结构
 │  ├─ app.css            样式（亮色、圆角、卡片、列表、Toast）
 │  ├─ pinyin.js          拼音表（自动生成，42KB，GB2312 6763 字）
+│  ├─ fingerprint.js     设备指纹（纯 JS，无依赖，可单独抠出去给别的网页应用用）
 │  ├─ vendor/
 │  │  ├─ js-yaml.min.js  YAML 解析器（5.5.0，MIT，官方 UMD 产物）
 │  │  └─ smol-toml.js    TOML 解析器（1.9.1，BSD-3，CJS 单文件 + IIFE 垫片）
@@ -177,6 +179,7 @@ wv2-launcher/
 │  ├─ mp-e2e.js          multipart 与模板读文件端到端：本地回显服务逐字节比对包体和文件（36 项）
 │  ├─ cb-check.js        回调端到端：真请求 → 真回调 → 真起进程 / 防环 / 上限 / 参数与模板 / 回执不被弹框堵（29 项）
 │  ├─ cfg-e2e.js         内置变量 {{@config}} 端到端：真发请求，服务端逐字节比对快照（18 项）
+│  ├─ fp-e2e.js          设备指纹端到端：机器码（AHK）与浏览器指纹（页面）同请求、真发、真比对（21 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -203,6 +206,7 @@ wv2-launcher/
 > node tests/config-format.test.js # 39 条（YAML/TOML 解析分派、Date 与循环引用、报错行列）
 > node tests/multipart.test.js # 40 条（multipart 三种写法 / 模板替换 / 请求头 / 交给 AHK 的压平格式）
 > node tests/callback.test.js  # 76 条（_ql_callback 的切片 / 解析 / 计划 / args·params / 响应模板 / 弹窗机制）
+> node tests/finger.test.js    # 43 条（设备指纹：Edge 升级不变 / 什么变了必须变 / 缺信号兜底 / 接模板）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
@@ -591,6 +595,99 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 > 为什么不做二次弹窗：弹窗要经过"选中 → 确认 → 输入 → 再确认"，焦点跳两次；
 > 空格分界只在原有路径上多按一个键，焦点始终不离开搜索框。
 
+#### 内置变量 `{{#machine}}` / `{{@fp}}`：两套设备指纹
+
+需要「这台机器是谁」的时候（设备登记、许可绑定、日志里标机器、给云端做设备去重），
+有这两套。它们不是同一个算法，语法上的 `#` 和 `@` 正好说明差别：
+
+| 变量 | 谁算的 | 出来什么 | 用在哪 |
+|---|---|---|---|
+| `{{#machine}}` | AHK（WMI 读主板 + 系统盘） | `MC1-1a2b3c4d-…`（32 hex / 128 bit） | 本机采集；浏览器碰不到硬件 |
+| `{{#machine:short}}` | 同上 | 前两段（21 字符） | 手抄 / 电话报读 |
+| `{{@fp}}` | 页面 JS（`ui/fingerprint.js`） | `FP1-1a2b3c4d-…` | 要拿到**别的网页应用**里校验 |
+| `{{@fp.short}}` | 同上 | 前两段 | 放请求头 / URL |
+| `{{@fp.bound}}` | 页面 JS + AHK 的本机盐 | `FPB1-…` | 只在本机可复算的强绑定版 |
+| `{{@fp.parts}}` | 同上 | `v=1\|os=Win32\|cores=16\|…` | 排查 / 服务端做差分 |
+
+```json
+{ "id": "device-register", "type": "webhook", "method": "POST",
+  "target": "https://api.example.com/device/register",
+  "body": { "machine": "{{#machine}}", "fp": "{{@fp}}", "fp_bound": "{{@fp.bound}}" } }
+```
+
+**`{{#machine}}` 为什么是 `#` 不是 `@`**：页面侧的模板替换是**同步**的，而 WMI 只有 AHK
+能碰。做成 `{{@machine}}` 就得先把结果注入页面（多一条泄露路径 + 启动时序依赖），要么
+页面发消息来问（异步，赶不上）。放在 `#` 这一层不用任何折中 —— 它和 `{{#ts}}` 一样，
+在**发送前**由 AHK 展开，所以请求头里也能用（`X-Device: {{#machine}}`），
+还能嵌进签名（`{{#hmac:demo:{machine}}}`，单花括号是那套的嵌套写法）。
+
+**算法**：`SHA256("MC1|<编译期盐>|<主板序列号>|<盘标识>|<来源>")`，取前 32 hex。
+编译期盐写在 `launcher.ahk` 里，编译成 exe 后不在明文。
+
+**降级链**：
+
+| 级 | 来源 | 什么时候不用它 |
+|---|---|---|
+| 1 | `Win32_DiskDrive.SerialNumber` | 空 / 全 0 / NVMe 占位值 / OEM 常见占位串 |
+| 2 | 同盘的 `PNPDeviceID` 实例段 | 取不到 |
+| 3 | 系统卷序列号（`GetVolumeInformation`） | 取不到 |
+| 4 | `MachineGuid` | 取不到（连主板都读不到时） |
+
+> **这是实测踩出来的**：本机系统盘是 NVMe，`Win32_DiskDrive.SerialNumber` 返回的是
+> `0100_0000_0000_0000.` —— 很多 NVMe 控制器根本不吐真实序列号。直接拿它哈希，等于往
+> 哈希里塞了个常量，"主板 + 硬盘"会退化成"只看主板"（同批采购的机器就撞了）。所以每一级
+> 都先过一遍「这是不是垃圾值」，判不了就往下走。第 2 级选 PNP 而不是卷序列号，是因为
+> **格式化会变卷序列号、而 PNP 实例路径不变**（重装系统也不变），日常里格式化比重装常见。
+
+结果缓存在 `machine.ini`（同目录，跟着 config.json 一起备份迁移；**不存原始序列号**）：
+
+```bat
+runtime\AutoHotkey64.exe launcher.ahk --machine
+:: {"ok":1,"code":"MC1-…","source":"disk-pnp","ms":2,"file":"…"}
+
+:: 换主板 / 换系统盘之后重算（salt 不动，所以 {{@fp.bound}} 不会跟着变）
+runtime\AutoHotkey64.exe launcher.ahk --machine-refresh
+```
+
+命中缓存约 1 ms，未命中约 70 ms（WMI 冷启动 16 + 主板 16 + 盘关联 31），所以不做启动预热。
+
+**第二套为什么能在 Edge 升级后不变**：信号集是**白名单**，只收跟操作系统 / 硬件 / 区域
+设置有关的那几项。`userAgent`、`userAgentData.brands`、`canvas`、`WebGL`、`AudioContext`、
+字体枚举、`devicePixelRatio`、`availWidth/Height` **一个都不采** —— 前两类带版本号
+（每次升级必变），后几类随图形栈、驱动、缩放比例漂移（这正是各种开源指纹库"升级就认不出
+设备"的来源）。实际采的是：
+
+```
+platform / hardwareConcurrency / deviceMemory / screen 宽高 / colorDepth
+languages / 时区 / maxTouchPoints / userAgentData.platform（只取平台名，不取 brands）
+```
+
+代价是区分度不如 canvas/WebGL 那类方案（同型号办公机可能撞），收益是**升级不漂** ——
+反作弊本来就不是这里的目标。单测里有一条把这个口径钉死：UA 从 Edge 130 换成 132、
+brands 一起换，指纹必须一模一样；反过来，改分辨率 / 核数 / 时区 / 语言必须变。
+
+**`{{@fp.bound}}` 是唯一带秘密的那一半**：AHK 首次运行生成 16 字节随机盐，存进
+`machine.ini`，经 `__BOOTSTRAP__.finger` 注入页面，`bound = SHA256(fp + 盐)`。
+盐不在 JS 里，所以别人抄走 `fingerprint.js` 也算不出这台机器的 bound 值。
+**纯浏览器打开 `ui/index.html` 时没有盐，`bound` 就等于 `fp`** —— 那一刻它只是普通指纹，
+别当绑定凭据用。
+
+**要拿到别的网页应用里校验**：把 `ui/fingerprint.js` 抠出来直接 `<script src>` 引，
+调 `QLFinger.describe().fp`。同一台机器、同一浏览器引擎族，算出来的值和 QuickLaunch 里
+一致 —— **WebView2 内核和系统 Edge 版本不同也不影响**，因为信号里根本没有版本号。
+`crypto.subtle` 这边用不了（`file://` 不是 secure context，而且它是异步的，塞不进同步的
+模板替换），所以文件里带了一份同步 SHA-256，已用标准向量自测。
+
+几条边界：
+
+- **`{{@fp}}` 不是秘密**。要能被任意纯 JS 重算，算法就必须在 JS 里 —— 这是「可校验」和
+  「保护算法」的固有矛盾，这里按「可校验」优先；真正藏住的只有 `bound` 的盐。
+- **会变的操作**：改分辨率、改时区、改语言、换硬件、换浏览器内核族（Firefox / Safari 缺
+  `deviceMemory`，值会不同）。**改缩放、挪任务栏不会变**（那两项没采）。
+- **机器码会变**：换主板、换系统盘、换 M.2 插槽；降级到第 3 / 4 级时，格式化系统盘、
+  重装系统也会变。
+- **两套都含硬件特征**，写进 `config.json` 就是会发给远端 —— 目标地址要可信。
+
 ### webhook 类型
 
 请求由 AHK 侧用 `WinHttp.WinHttpRequest.5.1` 发出（不是页面 `fetch` —— `file://` 页面直连外部 API 会被 CORS 拦），
@@ -679,6 +776,8 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 | `{{#base64url:文本}}` | base64url：`+`→`-`、`/`→`_`、去掉 `=` |
 | `{{#hmac:密钥名:待签内容}}` | HMAC-SHA256，十六进制小写；密钥取自 `launcher.ahk` 的 `SIG_KEYS` |
 | `{{#hmac-md5:密钥名:内容}}` | 同上，换算法。另有 `hmac-sha1` / `hmac-sha256` / `hmac-sha384` / `hmac-sha512` |
+| `{{#machine}}` | 本机机器码 `MC1-…`（32 hex）。读 WMI，首次约 70 ms、之后走缓存；详见「设备指纹」 |
+| `{{#machine:short}}` | 同上，只留前两段（21 字符） |
 
 这批算法全部走 **Windows 自带实现**，没有第三方 DLL、没有外部 exe：摘要和 HMAC 用 `bcrypt`，
 Base64 用 `crypt32` 的 `CryptBinaryToStringW`。所以编译成 exe 之后一样能用，不用额外打包什么。
@@ -2126,6 +2225,10 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 
 ## 八、已知限制
 
+- 设备指纹不是唯一 ID：`{{@fp}}` 只认「设备 + 浏览器引擎族」，同型号办公机可能算出同一个值；
+  换分辨率 / 时区 / 硬件都会变，而改缩放、挪任务栏不会。`{{#machine}}` 在 NVMe 机器上会从
+  硬盘序列号降级到 PNP 实例路径（多数 NVMe 控制器不吐真实 SN）。要更强区分度就得加
+  canvas / WebGL 那类信号，代价是 Edge 一升级就漂 —— 那是刻意不做的取舍。
 - 没有做窗口动画（缩放/淡入），AHK 侧做需要额外 DWM 调用。
 - 没有做「托盘图标左键 / 双击」快捷行为（AHK 不暴露托盘点击回调），只能走菜单。
 - 图标按 32×32 提取，4K 屏上放大到 30px 显示会略糊。

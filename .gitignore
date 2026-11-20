@@ -23,6 +23,10 @@ sched.log.1
 usage.json
 usage.json.tmp
 
+# ── 设备指纹（机器码缓存 + 本机盐，每台机器不同；换硬件后 --machine-refresh） ──
+machine.ini
+machine.ini.tmp
+
 # ── 拉取在线配置时自动留的备份（本机状态，不进仓库） ──
 config.json.bak
 

@@ -415,11 +415,49 @@
         {{@config}}        JSON 字符串内容（已转义，可直接放进 JSON 字符串里）
         {{@config.raw}}    原文（多行；适合 text/plain 或当文件内容）
         {{@config.b64}}    UTF-8 → Base64（单行纯 ASCII，唯一能安全放请求头的形式）
-     `.json` 是 `{{@config}}` 的别名，写全一点更好读。 */
-  const BUILTIN_HELP = '{{@config}} / {{@config.raw}} / {{@config.b64}}';
-  const BUILTIN_KEYS = new Set(['config', 'config.json', 'config.raw', 'config.b64']);
+     `.json` 是 `{{@config}}` 的别名，写全一点更好读。
+
+     {{@fp}} 一族是设备指纹（见 ui/fingerprint.js 与 launcher.ahk 的 {{#machine}}）：
+        {{@fp}}            FP1-…  浏览器侧稳定信号 + SHA-256
+        {{@fp.short}}      同上，只留前两段（21 字符，给请求头用）
+        {{@fp.bound}}      FPB1-… 再拌一次 AHK 生成的本机盐（没盐时等于 {{@fp}}）
+        {{@fp.parts}}      明细串（排查 / 服务端做差分用） */
+  const BUILTIN_HELP = '{{@config}} / {{@config.raw}} / {{@config.b64}} / {{@fp}} / {{@fp.bound}}';
+  const BUILTIN_KEYS = new Set(['config', 'config.json', 'config.raw', 'config.b64'
+    , 'fp', 'fp.short', 'fp.bound', 'fp.parts']);
 
   function isBuiltinKey(k) { return !!k && k.charCodeAt(0) === 64; }
+
+  /* ---------------------------------------------------------- 设备指纹 */
+
+  /* 指纹算一次就够：同一页面生命周期里硬件 / 区域设置不会变。
+     真变了（改分辨率、插显示器）刷新页面即可 —— 这也是「不采 DPR、
+     不采 availWidth」的另一个理由：那些东西会让人怀疑指纹坏了。 */
+  let fpCache = null;
+
+  function fpDesc() {
+    if (fpCache) return fpCache;
+    /* 用 globalThis 而不是 window：单测在 Node 里 eval 这段代码时没有 window。
+       ui/fingerprint.js 自己把 API 挂在全局对象上，两边的对象是同一个。 */
+    const G = (typeof globalThis !== 'undefined') ? globalThis : null;
+    const F = G && G.QLFinger;
+    if (!F) {
+      /* 指纹脚本没加载（被裁掉的构建 / 老版本浏览器）：给空串，
+         不要拿假数据冒充设备身份。体检那边会照常报「认不出的内置变量」。 */
+      fpCache = { fp: '', short: '', bound: '', parts: '' };
+      return fpCache;
+    }
+    const salt = (boot && boot.finger && boot.finger.salt) || '';
+    /* __QL_FP_ENV__ 是给单测的注入点：Node 里没有 navigator / screen，
+       靠它喂一份假环境。生产环境里这个变量不存在，describe(null) 就用真实 window。 */
+    const env = (G && G.__QL_FP_ENV__) || null;
+    const r = F.describe(env, salt);
+    const parts = F.partsOf(r.signals);
+    /* short 走「砍掉后两段」而不是 SubStr(0, 22)：段长由 hex4 决定，
+       写死字符数迟早错一位（第一版就写成 22，实际是 21）。 */
+    fpCache = { fp: r.fp, short: r.fp.split('-').slice(0, 3).join('-'), bound: r.bound, parts: parts };
+    return fpCache;
+  }
 
   /* JSON 字符串的内容部分（不含两侧引号）。JSON.stringify 顺带把 " \ 和所有
      控制字符转义掉，这是把多行文本塞进 JSON body 唯一可靠的办法。 */
@@ -460,6 +498,15 @@
   function builtinValue(k, rawDefault) {
     const name = k.slice(1);                 /* '@config.raw' → 'config.raw' */
     if (!BUILTIN_KEYS.has(name)) return null;
+    /* 指纹不走 guardHash：它的字符集只有 [0-9a-zA-Z-] 和 "=,|."，
+       不可能凑出 {{#，套一层哨兵反而把可读性弄没了 */
+    if (name === 'fp' || name.indexOf('fp.') === 0) {
+      const f = fpDesc();
+      if (name === 'fp.parts') return f.parts;
+      if (name === 'fp.bound') return f.bound;
+      if (name === 'fp.short') return f.short;
+      return f.fp;
+    }
     const text = state.cfgText || '';
     if (name === 'config.b64') return utf8b64(text);
     if (name === 'config.raw' || (name === 'config' && rawDefault)) return guardHash(text);

@@ -159,6 +159,9 @@
 <script src="vendor/js-yaml.min.js"></script>
 <script src="vendor/smol-toml.js"></script>
 <script src="pinyin.js"></script>
+<!-- 设备指纹（{{@fp}}）。必须排在 app.js 之前：app.js 在模板替换时会直接用它。
+     这个文件也可以单独复制到别的网页应用里用，见文件头注释。 -->
+<script src="fingerprint.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

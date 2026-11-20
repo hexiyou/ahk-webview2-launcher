@@ -55,6 +55,17 @@ global SIG_KEYS := Map(
     'demo', 'ql-demo-2026-secret'
 )
 
+; ---------------------------- 设备指纹 --------------------------------------
+/* 机器码（{{#machine}}）与本机盐（{{@fp.bound}} 用）。
+   machine.ini 存本机状态（机器码缓存 + 盐），不进仓库；换硬件后 `--machine-refresh` 重算。 */
+global FINGER_PATH := SCRIPT_DIR '\machine.ini'
+global MC_VER      := 1                  ; 算法版本：改归一化规则/数据源就 +1，机器码缓存自动失效
+/* 编译期常量盐。作用是「知道算法也算不出某块主板的机器码」，编译成 exe 后不在明文里。
+   换掉它 = 所有机器的机器码全变，别随手动。 */
+global MC_SALT     := 'QLMC1|7f3a9c2e4d184b6a9e218c5d0f6b3a71'
+global MC_CACHE    := ''                 ; 进程内缓存（空 = 本进程还没算过）
+global FP_SALT     := ''                 ; 本机盐，启动时由 EnsureFingerFile 填好，注入页面
+
 ; 单实例 / 进程间通信的标识：跟着脚本目录走，同一份程序的多个副本互不干扰
 global INST_KEY   := HashText(StrLower(SCRIPT_DIR))
 global MUTEX_NAME := 'Local\QuickLaunch-' INST_KEY
@@ -119,6 +130,17 @@ if WebhookArg(A_Args, &whSpec, &whOpt)
 cbTestDir := ''
 if CbTestArg(A_Args, &cbTestDir)
     ExitApp(CbTest(cbTestDir))
+
+/* 机器码自检 / 手动刷新：只读 WMI + 写一行缓存，不建窗口、不碰界面。
+   --machine          打印机器码 JSON（命中缓存就 1ms）
+   --machine-refresh  丢掉缓存重算（换主板 / 换系统盘之后用） */
+if MachineArg(A_Args) {
+    refresh := false
+    for a in A_Args
+        if (a = '--machine-refresh')
+            refresh := true
+    ExitApp(MachineMain(refresh))
+}
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
@@ -451,12 +473,19 @@ ApplyRoundRegion(hwnd, w, h, r) {
 InjectBootstrap() {
     ; 把 config.json 原文注入页面（AHK 不解析 JSON，只做原文转发）
     ; 使用「文档创建时执行」的脚本，先于页面自身 JS 运行
-    global wv, SCRIPT_DIR, settings, ncDrag
+    global wv, SCRIPT_DIR, settings, ncDrag, FP_SALT, MC_VER
+    /* 本机盐必须在页面加载前就绪（{{@fp.bound}} 要用）。这一步只读写
+       machine.ini 的一个字段，实测 <1ms，不查 WMI。
+       目录只读时静默放弃：页面侧看到空 salt 会退回纯信号指纹 {{@fp}}。 */
+    try EnsureFingerFile()
+    catch
+        FP_SALT := ''
     script := 'window.__BOOTSTRAP__={config:' ReadConfigText()
     script .= ',usage:' ReadUsageText()
     script .= ',scriptDir:' JsonQuote(SCRIPT_DIR)
     script .= ',appName:' JsonQuote('QuickLaunch')
     script .= ',nativeDrag:' (ncDrag ? '1' : '0')
+    script .= ',finger:{v:' MC_VER ',salt:' JsonQuote(FP_SALT) '}'
     script .= ',window:{radius:' settings.radius ',width:' settings.width ',height:' settings.height '}};'
     wv.AddScriptToExecuteOnDocumentCreatedAsync(script).await()
 }
@@ -2829,6 +2858,7 @@ WriteReply(path, json) {
 ;    {{#base64:文本}}           UTF-8 文本的 Base64；base64url 版本去掉 +/ 补位（=）
 ;    {{#hmac:密钥名:待签内容}}   十六进制 HMAC-SHA256，密钥取自 SIG_KEYS
 ;    {{#hmac-sha1:密钥名:内容}}  同族还有 hmac-md5 / hmac-sha256 / hmac-sha384 / hmac-sha512
+;    {{#machine}}               本机机器码 MC1-xxxxxxxx-…（主板 + 系统盘，见下面「设备指纹」）
 ;
 ;  所有"吃文本"的函数（摘要 / base64 / hmac）都先过一遍单花括号展开，
 ;  所以 {{#base64:{uuid}}}、{{#hmac:demo:GET{ts}}} 都能用。
@@ -2837,8 +2867,305 @@ WriteReply(path, json) {
 ;  —— 为什么不是 {{#hmac:demo:{{#ts}}}}：内层收尾紧跟外层收尾会凑出 }}}}，
 ;  那是前端「输出字面 }}」的逃生口（见 ui/app.js 的 TPL_RE），会被吃成 }}，
 ;  于是签名占位符少两个括号、整条失效。单花括号两头都不碰，最省事。
-;  单花括号只认 ts / tsms / uuid / nonce，不支持再套 hmac（避免递归自套）。
+;  单花括号只认 ts / tsms / uuid / nonce / machine，不支持再套 hmac（避免递归自套）。
 ; ============================================================================
+; ---------------------------------------------------------------------------
+;  设备指纹 · 第一套：机器码 {{#machine}}
+;
+;  只有 AHK 算得出来（要靠 WMI 读主板 / 系统盘），所以它必须待在 # 这一层。
+;  做成 {{@machine}} 是走不通的：页面侧的模板替换是**同步**的，而 WMI 只有
+;  AHK 能碰 —— 要么先把结果注入页面（多一条泄露路径 + 启动时序依赖），
+;  要么页面发消息来问 AHK（异步，赶不上同步替换）。# 这一层不用任何折中。
+;
+;  ★ 实测踩到的坑：NVMe 盘的 Win32_DiskDrive.SerialNumber 不是真实序列号。
+;    本机（Asgard AN2+ 256G）返回的是 "0100_0000_0000_0000." —— 很多 NVMe
+;    控制器根本不吐真实 SN，取到的是控制器占位值。直接拿去哈希，等于往哈希里
+;    塞了个常量，"主板 + 硬盘"会退化成"只看主板"。
+;    所以每一级都先过 IsJunkSerial()，按下面的顺序降级：
+;
+;      1 盘序列号（有效）    换盘即变，最干净
+;      2 盘的 PNP 实例路径    序列号是占位值时用它。格式化 / 重装系统都不变，
+;                            只在换插槽、换主板时变 —— 比卷序列号稳得多
+;                             （重装系统比换插槽常见得多）
+;      3 系统卷序列号         GetVolumeInformation 的 SerialNumber，格式化即变，
+;                            但任何机器上都取得到
+;      4 MachineGuid         连主板都取不到时的最后兜底（重装系统即变）
+;
+;  结果缓存在 machine.ini。命中约 1ms；未命中实测 ~70ms（WMI 冷启动 16ms +
+;  主板 16ms + 盘关联 31ms）—— 比 PowerShell 的 366ms 快一个量级，
+;  所以不做启动预热，第一次用到时同步算即可。
+; ---------------------------------------------------------------------------
+
+MachineArg(argv) {
+    for a in argv
+        if (a = '--machine' || a = '--machine-refresh')
+            return true
+    return false
+}
+
+/* machine.ini 的读写：自己写 key=value，**不用 IniWrite**。
+   AHK v2 的 IniWrite 一律用 UTF-16 LE + BOM，用户在编辑器里看到的是乱码，
+   grep / git diff 也认不出来 —— 这个文件是要给人看、要能按行排查的。
+   自己写还能保住注释和键顺序。
+
+   写入走「临时文件 + 覆盖改名」，半路崩掉不会留下一个截断的文件。 */
+FingerAll() {
+    global FINGER_PATH
+    m := Map()
+    if !FileExist(FINGER_PATH)
+        return m
+    t := ''
+    try t := FileRead(FINGER_PATH, 'UTF-8')
+    catch
+        return m
+    for line in StrSplit(t, '`n', '`r') {
+        line := Trim(line, ' ' . "`t`r")
+        if (line = '' || SubStr(line, 1, 1) = '[' || SubStr(line, 1, 1) = ';')
+            continue
+        p := InStr(line, '=')
+        if !p
+            continue
+        k := Trim(SubStr(line, 1, p - 1), ' ' . "`t")
+        if (k = '')
+            continue
+        m[k] := Trim(SubStr(line, p + 1), ' ' . "`t`r")
+    }
+    return m
+}
+
+FingerSave(m) {
+    global FINGER_PATH
+    s := '; QuickLaunch 本机设备指纹（自动生成；换硬件后跑 --machine-refresh 重算）`n[fp]`n'
+    for k in ['v', 'code', 'source', 'salt', 'at']
+        if m.Has(k)
+            s .= k '=' m[k] '`n'
+    tmp := FINGER_PATH '.tmp'
+    try FileDelete(tmp)
+    /* UTF-8-RAW：不加 BOM。带 BOM 的话第一行注释前面会多出 U+FEFF，
+       用 grep / 别的语言读都得多处理一步。 */
+    FileAppend(s, tmp, 'UTF-8-RAW')
+    FileMove(tmp, FINGER_PATH, 1)
+}
+
+/* --machine 的输出是给脚本 / 人核对用的，走 stdout 不写日志：
+   {"ok":1,"code":"MC1-…","source":"disk-pnp","ms":2,"file":"…"} */
+MachineMain(refresh) {
+    global MC_CACHE, FINGER_PATH
+    if refresh {
+        /* 只清机器码，**绝不动 salt** —— salt 变了会让所有 {{@fp.bound}} 当场作废 */
+        m := FingerAll()
+        m.Delete('code')
+        m.Delete('v')
+        try FingerSave(m)
+        MC_CACHE := ''
+    }
+    t := A_TickCount
+    try
+        code := MachineCode()
+    catch as e {
+        StdOut('{"ok":0,"error":' JsonQuote(CleanComError(e.Message)) '}`n')
+        return 1
+    }
+    ms := A_TickCount - t
+    src := FingerAll().Get('source', '')
+    StdOut('{"ok":1,"code":' JsonQuote(code) ',"source":' JsonQuote(src)
+        . ',"ms":' ms ',"file":' JsonQuote(FINGER_PATH) '}`n')
+    return 0
+}
+
+/* 机器码。short = 只要前两段（MC1-xxxxxxxx-xxxxxxxx），
+   给人抄在纸上时 39 个字符太长。 */
+MachineCode(short := false) {
+    global MC_CACHE, MC_VER
+    if (MC_CACHE = '') {
+        EnsureFingerFile()
+        m := FingerAll()
+        code := m.Get('code', '')
+        if (code = '' || m.Get('v', '') != String(MC_VER))
+            code := MachineCompute()
+        MC_CACHE := code
+    }
+    if !short
+        return MC_CACHE
+    ; MC1-xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx → MC1-xxxxxxxx-xxxxxxxx
+    ; 按第 3 个连字符切，不写死字符数（段长改了也不会错位）
+    p := InStr(MC_CACHE, '-', , 1, 3)
+    return (p > 0) ? SubStr(MC_CACHE, 1, p - 1) : MC_CACHE
+}
+
+MachineCompute() {
+    global MC_VER, MC_SALT
+    p := MachineProbe()
+    if (p.mb = '' && p.disk = '')
+        throw Error('取不到主板序列号，也取不到系统盘标识（WMI 服务不可用？）')
+    /* source 也进哈希：同一台机器从 disk-serial 降级到 volume-serial 时，
+       哈希原料变了，机器码跟着变 —— 这是想要的（说明身份依据变了） */
+    h := HashHex('MC' MC_VER '|' MC_SALT '|' p.mb '|' p.disk '|' p.source, 'SHA256')
+    code := 'MC' MC_VER '-' Hex4(SubStr(h, 1, 32))
+    m := FingerAll()
+    m['v'] := String(MC_VER)
+    m['code'] := code
+    m['source'] := p.source
+    m['at'] := FormatTime(A_Now, 'yyyy-MM-ddTHH:mm:ss')
+    /* 写不进去（目录只读）也照样返回 —— 本次运行照常用，只是下次要重算 */
+    try FingerSave(m)
+    return code
+}
+
+Hex4(h32) {
+    return SubStr(h32, 1, 8) '-' SubStr(h32, 9, 8) '-' SubStr(h32, 17, 8) '-' SubStr(h32, 25, 8)
+}
+
+/* 采集。任何一步失败都只影响那一级，不往外抛 —— 取不到就该降级，不是该崩。 */
+MachineProbe() {
+    r := {mb: '', disk: '', source: ''}
+    svc := 0
+    try svc := ComObjGet('winmgmts:{impersonationLevel=impersonate}!\\.\root\cimv2')
+    if IsObject(svc) {
+        try {
+            for o in svc.ExecQuery('SELECT SerialNumber FROM Win32_BaseBoard')
+                r.mb := o.SerialNumber
+        }
+        pnp := ''
+        try {
+            /* C: → 分区 → 物理盘。ASSOCIATORS OF 比手写 JOIN 少两次往返，
+               实测三步共 31ms。 */
+            q1 := "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='C:'}"
+                . ' WHERE AssocClass=Win32_LogicalDiskToPartition'
+            for part in svc.ExecQuery(q1) {
+                q2 := "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='" part.DeviceID "'}"
+                    . ' WHERE AssocClass=Win32_DiskDriveToDiskPartition'
+                for d in svc.ExecQuery(q2) {
+                    if !IsJunkSerial(d.SerialNumber) {
+                        r.disk := d.SerialNumber
+                        r.source := 'disk-serial'
+                        break 2
+                    }
+                    if (pnp = '')
+                        pnp := PnpInstance(d.PNPDeviceID)
+                }
+            }
+        }
+        if (r.disk = '' && pnp != '') {
+            r.disk := pnp
+            r.source := 'disk-pnp'
+        }
+    }
+    if (r.disk = '') {
+        vs := VolumeSerial('C:\')
+        if (vs != '') {
+            r.disk := vs
+            r.source := 'volume-serial'
+        }
+    }
+    /* 主板也可能是 OEM 占位（"To be filled by O.E.M." 之类），一起过归一化 */
+    r.mb := NormalizeSerial(r.mb)
+    if (r.mb = '' || IsJunkSerial(r.mb)) {
+        g := ''
+        try g := RegRead('HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography', 'MachineGuid')
+        r.mb := NormalizeSerial(g)
+        r.source := 'guid+' (r.source = '' ? 'none' : r.source)
+    }
+    r.disk := NormalizeSerial(r.disk)
+    return r
+}
+
+/* 序列号归一化：去空白、转大写、只留 [A-Z0-9]。
+   各家序列号里混着 - _ . 空格，不同驱动吐出来的分隔符还不一样；
+   不归一化的话，换一次驱动版本机器码就变了。 */
+NormalizeSerial(s) {
+    if (s = '')
+        return ''
+    s := Trim(String(s), ' ' . "`t`r`n")
+    if (s = '')
+        return ''
+    return RegExReplace(StrUpper(s), '[^A-Z0-9]', '')
+}
+
+/* 「这串不是真序列号」的判定。输入可以是原始串，内部先归一化。
+
+   判据都来自实测 / 厂商文档：
+     - 空、太短（< 4）
+     - 全 0，或只有一个 1（NVMe 占位 "0100_0000_0000_0000." 归一化后是
+       0100000000000000）
+     - 全同一个字符（"AAAAAAAA"）
+     - OEM 常见占位串（归一化后连写） */
+IsJunkSerial(s) {
+    u := NormalizeSerial(s)
+    if (u = '')
+        return true
+    if (StrLen(u) < 4)
+        return true
+    if RegExMatch(u, '^0+$')
+        return true
+    if RegExMatch(u, '^0*1?0*$')
+        return true
+    if RegExMatch(u, '^(.)\1+$')
+        return true
+    static JUNK := ['TOBEFILLEDBYOEM', 'DEFAULTSTRING', 'SYSTEMSERIALNUMBER'
+        , 'CHASSISSERIALNUMBER', 'NOTAPPLICABLE', 'NOTSPECIFIED', 'NOTAVAILABLE'
+        , 'INVALID', 'UNKNOWN', 'NONE', 'NIL', 'OEM', 'SERIAL', 'SERIALNUMBER'
+        , '123456789', '1234567890', '0123456789', 'FFFFFFFF']
+    for j in JUNK
+        if (u = j)
+            return true
+    return false
+}
+
+/* PNPDeviceID 取最后一段：SCSI\DISK&VEN_NVME&PROD_ASGARD_AN2+_256N\5&2009A666&0&000000
+   → 5&2009A666&0&000000。前面那段是型号（换同型号盘不变），
+   后面那段才是这台机器上这个设备的实例路径。 */
+PnpInstance(pnp) {
+    p := Trim(pnp = '' ? '' : String(pnp), ' ' . "`t")
+    if (p = '')
+        return ''
+    return RegExReplace(p, '^.*\\', '')
+}
+
+/* 系统卷序列号，8 位十六进制。GetVolumeInformation 的 SerialNumber 是
+   格式化时生成的 32 位值，跟硬件无关 —— 所以它只是第 3 级。 */
+VolumeSerial(root) {
+    serial := 0, maxComp := 0, flags := 0
+    fsBuf := Buffer(64, 0)
+    ok := DllCall('kernel32\GetVolumeInformationW', 'wstr', root
+        , 'ptr', 0, 'uint', 0, 'uint*', &serial, 'uint*', &maxComp
+        , 'uint*', &flags, 'ptr', fsBuf, 'uint', 32, 'int')
+    return ok ? Format('{:08X}', serial) : ''
+}
+
+/* 本机盐：16 字节随机 → 32 hex。作用是让 {{@fp.bound}} 只在这份安装里算得出来 ——
+   算法在页面 JS 里看得见，盐不在，公式里就缺一项。反作弊需求弱，这个强度足够；
+   真拿它做鉴权，还得在服务端再加一层密钥。 */
+FingerSaltNew() {
+    buf := Buffer(16, 0)
+    /* BCryptGenRandom 成功返回 0；非 0 才走 fallback（UuidV4 有 122 bit 熵，够用） */
+    if !DllCall('bcrypt\BCryptGenRandom', 'ptr', 0, 'ptr', buf, 'uint', 16, 'uint', 2) {
+        s := ''
+        Loop 16
+            s .= Format('{:02x}', NumGet(buf, A_Index - 1, 'UChar'))
+        return s
+    }
+    return StrReplace(UuidV4(), '-', '')
+}
+
+/* machine.ini 的初始化。文件不存在就建，只补 salt 不动 code，
+   v 与代码里的 MC_VER 不一致时由 MachineCode 侧重算（这里不管）。 */
+EnsureFingerFile() {
+    global MC_VER, FP_SALT
+    m := FingerAll()
+    FP_SALT := m.Get('salt', '')
+    if (FP_SALT != '')
+        return
+    /* 文件不存在，或老版本留下的文件里没有 salt 那一行：补上，机器码照旧 */
+    FP_SALT := FingerSaltNew()
+    if !m.Has('v')
+        m['v'] := String(MC_VER)
+    m['salt'] := FP_SALT
+    if !m.Has('at')
+        m['at'] := FormatTime(A_Now, 'yyyy-MM-ddTHH:mm:ss')
+    try FingerSave(m)
+}
+
 HdrExpand(line) {
     /* 哨兵：文件内容里的 "{{#" 先换成「哨兵 + #」，循环结束时再还原。
        没有它的话，传一个 Handlebars / Jinja2 模板文件当请求体，第二轮展开
@@ -2906,6 +3233,10 @@ HdrEval(expr) {
             return {ok: true, val: String(DateDiff(A_NowUTC, '19700101000000', 'Seconds') * 1000 + A_MSec)}
         case 'uuid':
             return {ok: true, val: UuidV4()}
+        /* 机器码：{{#machine}} / {{#machine:short}}。
+           走 MachineCode 的进程内缓存，一条请求里出现多次也只算一遍。 */
+        case 'machine':
+            return {ok: true, val: MachineCode(Trim(rest, ' ' . "`t") = 'short')}
         case 'nonce':
             n := (Trim(rest, ' ' . "`t") = '') ? 16 : Integer(Trim(rest, ' ' . "`t"))
             if (n < 1 || n > 128)
@@ -3136,7 +3467,7 @@ HdrInline(s) {
     m := ''
     while RegExMatch(s, '\{([a-z][\w]*)(?::([^{}]*))?\}', &m, pos) {
         name := m[1]
-        if (name = 'ts' || name = 'tsms' || name = 'uuid' || name = 'nonce') {
+        if (name = 'ts' || name = 'tsms' || name = 'uuid' || name = 'nonce' || name = 'machine') {
             r := HdrEval(m[2] = '' ? name : name ':' m[2])
             out .= SubStr(s, pos, m.Pos - pos) . (r.ok ? r.val : m[0])
         } else {

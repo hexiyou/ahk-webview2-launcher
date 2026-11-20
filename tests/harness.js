@@ -5,6 +5,10 @@ const path = require('path');
 
 const APP = path.join(__dirname, '..', 'ui', 'app.js');
 
+/* 设备指纹模块：它把自己挂到全局对象上，app.js 的 fpDesc 就是这么找它的。
+   在这里 require 一次，eval 出来的函数就看得见 globalThis.QLFinger。 */
+require(path.join(__dirname, '..', 'ui', 'fingerprint.js'));
+
 function readSrc() {
   /* 统一换行：Windows 上 git 可能把工作区签出成 CRLF，
      而抽取函数体用的是 "\n  }\n" 这种锚点，CRLF 会让它匹配不到 */
@@ -17,6 +21,13 @@ function grab(src, name) {
   const m = new RegExp('^  function ' + name + '\\(', 'm').exec(src);
   if (!m) throw new Error('找不到函数 ' + name);
   const rest = src.slice(m.index);
+  /* 单行函数（`function f(x) { return …; }`）：只取那一行。
+     不加这个判断的话，"找下一个 \n  }\n" 会一路吞到**下一个多行函数**的结尾，
+     把中间的函数和变量声明一起带进来 —— 踩过：被吞进一段 `let` 声明，
+     生成出来的代码直接报 "Identifier has already been declared"。 */
+  const nl = rest.indexOf('\n');
+  if (nl > 0 && /[;{]\s*\}\s*$/.test(rest.slice(0, nl)))
+    return rest.slice(0, nl + 1);
   const i = rest.search(/\n  \}\n/);
   if (i < 0) throw new Error('函数未闭合 ' + name);
   return rest.slice(0, i + 4);
@@ -40,9 +51,9 @@ const DEFAULT_NAMES = [
   /* 参数取值 */
   'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery',
   'tplVars', 'templateIssues', 'joinTokens', 'applyParams', 'normalizeMultipart',
-  /* 内置模板变量（{{@config}}） */
+  /* 内置模板变量（{{@config}} / {{@fp}}） */
   'isBuiltinKey', 'jsonStr', 'utf8b64', 'builtinValue', 'hasBuiltin', 'isObjBody', 'builtinIssues',
-  'guardHash',
+  'guardHash', 'fpDesc',
   /* 使用记录 */
   'usageRec', 'usageCount', 'historyOf', 'usageBoost',
   /* 补全 */
@@ -61,8 +72,12 @@ function build(state, PY, extra, prelude) {
     grabConst(src, /const TPL_FIELDS = \[[^\]]*\];/, 'TPL_FIELDS'),
     grabConst(src, /const TPL_RE = .*;/, 'TPL_RE'),
     grabConst(src, /const BUILTIN_HELP = .*;/, 'BUILTIN_HELP'),
-    grabConst(src, /const BUILTIN_KEYS = .*;/, 'BUILTIN_KEYS'),
+    grabConst(src, /const BUILTIN_KEYS = new Set\(\[[\s\S]*?\]\);/, 'BUILTIN_KEYS'),
     grabConst(src, /const TPL_GUARD = .*;/, 'TPL_GUARD'),
+    /* 设备指纹的模块级缓存。boot 不抓（源码里是 window.__BOOTSTRAP__），
+       夹具给 null：fpDesc 里的 `boot && …` 本来就要能扛住没有 bootstrap 的情况 */
+    grabConst(src, /let fpCache = null;/, 'fpCache'),
+    'var boot = null;',
     grabConst(src, /const FIELD_W = \{[\s\S]*?\n  \};/, 'FIELD_W'),
     grabConst(src, /const KIND_LABEL = \{[^}]*\};/, 'KIND_LABEL'),
     prelude || ''
