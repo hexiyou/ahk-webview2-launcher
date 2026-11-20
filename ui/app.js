@@ -2200,7 +2200,8 @@
      没有这个键就什么都不发生（现有行为一字不变）。
 
      AHK 只负责两件本地才能做的事：把这块原始 JSON 从正文里切出来（正文在它手上，
-     400KB 截断也发生在切之后），以及弹原生消息框。解析与执行都在这里 —— WebView 的
+     400KB 截断也发生在切之后），以及把提示框画出来（native / custom 两套，见
+     cbCfg 的 popup）。解析与执行都在这里 —— WebView 的
      JSON.parse 稳妥，而"调用某个条目"直接复用 launch()，app / cmd / ahk / url /
      folder / webhook / download / jsonfile 一次性全覆盖，不用在 AHK 里再写一份
      拼 URL、组 multipart 的实现。
@@ -2234,7 +2235,13 @@
       /* 非空 = 只有这些 id 能被回调拉起（远端可控的东西，得留个闸） */
       allow: Array.isArray(c.allow) ? c.allow.map(String) : [],
       /* 定时任务触发的链：默认只托盘提示，不弹模态框 */
-      onQuiet: String(c.onQuiet || '').toLowerCase() === 'popup' ? 'popup' : 'notify'
+      onQuiet: String(c.onQuiet || '').toLowerCase() === 'popup' ? 'popup' : 'notify',
+      /* 弹窗机制：native = 系统消息框（缺省），custom = 自绘窗口。
+         custom 眼下只多一层样式，留着是给将来 —— 回调要返回带样式的文本 / 图片 /
+         HTML 时，MsgBox 装不下。写错的值一律回落 native：少写一个字母不该变成
+         "什么都不弹"。 */
+      popup: ['custom', 'gui', 'window'].indexOf(String(c.popup || '').toLowerCase()) >= 0
+        ? 'custom' : 'native'
     };
   }
 
@@ -2546,7 +2553,9 @@
               text: text,
               timeout: step.timeout,
               /* 定时链路默认不弹模态框：半夜挂一个没人关的对话框是最糟的"成功" */
-              quiet: (quiet && cfg.onQuiet !== 'popup') ? 1 : 0
+              quiet: (quiet && cfg.onQuiet !== 'popup') ? 1 : 0,
+              /* 用哪套弹窗由这里定：AHK 不解析 JSON，config.json 只在这边读一次 */
+              popup: cfg.popup
             });
             cbLog('消息框 ' + step.level + '：' + cbOneLine(text) + '（' + tag + '）');
             return;

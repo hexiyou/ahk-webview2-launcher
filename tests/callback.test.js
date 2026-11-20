@@ -101,17 +101,29 @@ eq('空白与紧贴冒号都认', parsedSlice('whitespace.json').v, { actions: [
 console.log('— callback 配置块（config.json 顶层 callback）');
 
 state.cfg = null;
-eq('不写配置 → 默认开、上限 5/5、不限 id、安静走托盘',
+eq('不写配置 → 默认开、上限 5/5、不限 id、安静走托盘、原生弹窗',
   T.cbCfg(),
-  { enabled: true, max: 5, maxDepth: 5, allow: [], onQuiet: 'notify' });
+  { enabled: true, max: 5, maxDepth: 5, allow: [], onQuiet: 'notify', popup: 'native' });
 
 state.cfg = { callback: { enabled: false, max: 99, maxDepth: 0, allow: ['a', 2], onQuiet: 'POPUP' } };
 eq('显式配置逐项生效（max/maxDepth 夹到 1~20）',
   T.cbCfg(),
-  { enabled: false, max: 20, maxDepth: 1, allow: ['a', '2'], onQuiet: 'popup' });
+  { enabled: false, max: 20, maxDepth: 1, allow: ['a', '2'], onQuiet: 'popup', popup: 'native' });
 
 state.cfg = { items: [] };
 eq('顶层没有 callback 段 → 仍是默认', T.cbCfg().max, 5);
+
+/* 弹窗机制：只认 native / custom，写错回落 native（少写一个字母不该变成不弹） */
+state.cfg = { callback: { popup: 'CUSTOM' } };
+eq('popup 大小写不敏感 → custom', T.cbCfg().popup, 'custom');
+state.cfg = { callback: { popup: 'gui' } };
+eq('popup 的别名 gui → custom', T.cbCfg().popup, 'custom');
+state.cfg = { callback: { popup: 'msgbox' } };
+eq('popup 写不认识的值 → 回落 native', T.cbCfg().popup, 'native');
+state.cfg = { callback: { popup: 1 } };
+eq('popup 写成数字 → 回落 native', T.cbCfg().popup, 'native');
+state.cfg = { callback: { popup: 'native' } };
+eq('popup 显式 native', T.cbCfg().popup, 'native');
 
 /* ---------------------------------------------------------- JS：解析 */
 

@@ -1498,8 +1498,17 @@ CheckHttp() {
 ;         download / jsonfile 全都走同一套实现 —— 连"运行时参数"（args / params）
 ;         和条目自己的 {{参数}} 替换也一并复用。
 ;
-;  提示框为什么自己画而不用 MsgBox：MsgBox 没有置顶选项，而主窗口是 AlwaysOnTop，
-;  框会正好落在它下面（有提示音、看不见内容）。自建窗口固定 +AlwaysOnTop。
+;  提示框两套并存，页面按 config.json 的 callback.popup 决定用哪套（缺省 native）：
+;    native  系统消息框 + Owner<主窗口>。主窗口是 AlwaysOnTop，裸框会落在它下面
+;            （实测低 8 层：z 10 vs 2），所以必须把主窗口当 owner 传进去 —— Windows
+;            规定被拥有窗口永远在 owner 之上，owner 在置顶层，框就被一起抬进置顶层
+;            （实测扩展样式多出 WS_EX_TOPMOST）。顺带白拿系统提示音、Ctrl+C 复制正文、
+;            按 owner 居中、按钮随系统语言。
+;    custom  自绘窗口，固定 +AlwaysOnTop。眼下和 native 只差样式，留着是为了将来：
+;            回调要返回带样式的文本 / 图片 / HTML 时，MsgBox 就装不下了。
+;
+;  ⚠ 早先这里写过"MsgBox 没有置顶选项"—— 那是错的。没有 AlwaysOnTop 选项，
+;    但有 Owner<hwnd>，效果一样（见 CbBoxNative 的实测记录）。
 ;
 ;  为什么不在这里解析 action：run 到一个 webhook 条目要拼 URL、展开模板、组
 ;  multipart —— 在这里再写一份就是第二份实现，早晚和页面那份对不上（这个项目
@@ -1613,7 +1622,7 @@ CbSlice(body) {
 }
 
 /* 消息框走队列 + 定时器，不直接在 WebView2 的消息回调里弹：
-   在 COM 回调栈上建窗口 / 弹模态框是自找麻烦（这里是非模态的，但排队更省心：
+   在 COM 回调栈上弹模态框是自找麻烦（native 那套是模态的，排队也就顺理成章：
    一条响应里连发三个 msg，不该三个框糊在一起）。 */
 DoCallbackMsg(raw) {
     global cbBoxQ
@@ -1622,15 +1631,28 @@ DoCallbackMsg(raw) {
         return
     title := Trim(JsonStr(raw, 'title'), ' `t')
     title := (title = '') ? 'QuickLaunch' : SubStr(title, 1, CB_TITLE_MAX)
+    /* 用哪套弹窗由页面按 config.json 的 callback.popup 决定并带下来。
+       页面是唯一读 config.json 的地方（AHK 不解析 JSON 是本项目的硬约定），
+       所以这里只认它给的值，认不出来就按缺省 native。 */
     cbBoxQ.Push({
         level: (JsonStr(raw, 'level') = 'error') ? 'error' : 'ok',
         title: title,
         text: text,
         timeout: Max(0, Min(600, Floor(JsonNum(raw, 'timeout', 0)))),
-        quiet: JsonNum(raw, 'quiet', 0) ? 1 : 0
+        quiet: JsonNum(raw, 'quiet', 0) ? 1 : 0,
+        popup: CbPopupMode(JsonStr(raw, 'popup'))
     })
-    CbLog('消息框入队（' cbBoxQ[cbBoxQ.Length].level '）：' OneLine(text, 100))
+    CbLog('消息框入队（' cbBoxQ[cbBoxQ.Length].level '/' cbBoxQ[cbBoxQ.Length].popup '）'
+        '：' OneLine(text, 100))
     SetTimer(CallbackPump, -1)
+}
+
+/* 认不出来的值一律回落 native：少写一个字母不该变成"什么都不弹" */
+CbPopupMode(v) {
+    v := Trim(v, ' `t')
+    if (v = 'custom' || v = 'gui' || v = 'window')
+        return 'custom'
+    return 'native'
 }
 
 CallbackPump() {
@@ -1645,14 +1667,77 @@ CallbackPump() {
             TrayTip(a.text, a.title)
             CbLog('安静模式：改用托盘提示（' a.level '）')
             CbBoxDone()
-        } else {
+        } else if (a.popup = 'custom') {
             CbBoxShow(a)
+        } else {
+            CbBoxNative(a)
         }
     } catch as e {
         CbLog('消息框失败：' CleanComError(e.Message))
         cbBoxWin := 0
         CbBoxDone()
     }
+}
+
+/* 原生消息框 + Owner —— 缺省的那套。
+   ★ 为什么裸 MsgBox 不行：主窗口是 AlwaysOnTop，裸框是普通层窗口，实测落在
+     主窗口下面 8 层（z 10 vs 2）—— 有声音、看不见内容，正是用户报的那个 bug。
+   ★ 为什么 Owner 就够：Windows 规定被拥有窗口永远在 owner 之上；owner 在置顶层，
+     框就被一起抬进置顶层（实测扩展样式 0x10101 → 0x10109，多出的 0x8 是
+     WS_EX_TOPMOST，系统自己加的）。同一句话还把 Ctrl+C 复制正文、按 owner 居中、
+     按钮随系统语言一起带回来了。选项串里 Owner 后面直接拼十进制 hwnd（实测可拼）。
+   ★ 代价是模态：这句不返回，队里后面的消息就等着 —— "关一条再放一条"本来就是
+     这队列要的效果。调用点在 SetTimer 拉起的独立线程里，不在 COM 回调栈上。 */
+CbBoxNative(a) {
+    global g
+    /* 主窗口不在屏幕上（ShowOnStart=0 时进程启动就把它摆在 -32000 备着）就不能当 owner：
+       MessageBox 会按 owner 居中，框会跟着跑到看不见的地方 —— 那就不是"置顶"而是
+       "置到屏幕外"了。这种时候退回自绘那套（屏幕居中 + 自己置顶）。 */
+    if !CbOwnerUsable() {
+        CbLog('主窗口不在屏幕上，这条改用自绘框（' a.level '）')
+        CbBoxShow(a)
+        return
+    }
+    text := a.text
+    if (StrLen(text) > CB_TEXT_SHOW)
+        text := SubStr(text, 1, CB_TEXT_SHOW) '…（正文过长，已截断；完整内容见响应面板）'
+    opts := (a.level = 'error') ? 'Iconx' : 'Iconi'      ; 顺带把系统提示音也带出来
+    if a.timeout
+        opts .= ' T' a.timeout
+    opts .= ' Owner' g.Hwnd
+    try
+        MsgBox(text, a.title, opts)
+    catch as e {
+        /* Owner 拼错、选项不认之类：别让一条消息把队列卡死，退到自绘那套 */
+        CbLog('原生消息框失败，改用自绘：' CleanComError(e.Message))
+        CbBoxShow(a)
+        return
+    }
+    CbLog('消息框已关闭（' a.level '，native）')
+    CbBoxDone()
+}
+
+/* 主窗口能不能当 owner：存在、可见、且至少有一部分落在虚拟屏幕里 */
+CbOwnerUsable() {
+    global g
+    if !(IsObject(g) && g.Hwnd)
+        return 0
+    if !DllCall('user32\IsWindowVisible', 'ptr', g.Hwnd, 'int')
+        return 0
+    r := Buffer(16, 0)
+    if !DllCall('user32\GetWindowRect', 'ptr', g.Hwnd, 'ptr', r, 'int')
+        return 0
+    x := NumGet(r, 0, 'int')
+    y := NumGet(r, 4, 'int')
+    w := NumGet(r, 8, 'int') - x
+    h := NumGet(r, 12, 'int') - y
+    if (w <= 0 || h <= 0)
+        return 0
+    vx := DllCall('user32\GetSystemMetrics', 'int', 76, 'int')    ; SM_XVIRTUALSCREEN
+    vy := DllCall('user32\GetSystemMetrics', 'int', 77, 'int')
+    vw := DllCall('user32\GetSystemMetrics', 'int', 78, 'int')    ; SM_CXVIRTUALSCREEN
+    vh := DllCall('user32\GetSystemMetrics', 'int', 79, 'int')
+    return (x < vx + vw && y < vy + vh && x + w > vx && y + h > vy) ? 1 : 0
 }
 
 /* 一条消息处理完了：放行下一条。关窗、超时、建窗失败都走这里，
@@ -1664,14 +1749,18 @@ CbBoxDone() {
         SetTimer(CallbackPump, -1)
 }
 
-/* 回调消息框。
-   ★ 为什么不用 MsgBox：MsgBox 没有置顶选项，而 QuickLaunch 主窗口本身是
-     AlwaysOnTop —— 框弹出来正好落在家窗口**下面**，用户只听见提示音、看不见内容。
-     这里自建一个极简窗口，固定 +AlwaysOnTop。
+/* 自绘回调消息框（callback.popup = "custom" 时用这套；缺省走 CbBoxNative）。
+   ★ 为什么留着：原生框只能放纯文本，回调将来要返回带样式的文本 / 图片 / HTML，
+     MsgBox 装不下，得有个能自己排版的壳。眼下两套的差别只有样式。
+   ★ 为什么自绘还得自己响一声：系统提示音是 MessageBox 按图标标志位放的，自绘窗口
+     没有这一步，只听得到"窗口出现"看不到的那种安静 —— 用 MessageBeep 补，
+     它和 MessageBox 内部是同一个声源（0x40 = Asterisk 对应 Iconi，0x10 = Hand 对应 Iconx）。
+     而任务栏闪烁补不回来也不该补：那颗闪的是"框自己没拿到前台"的补偿，
+     主窗口是 +ToolWindow 本来就没有任务栏按钮（见 README 的回调小节）。
+   ★ 为什么非模态：串行交给 cbBoxBusy —— 关掉一条再放行下一条，不会五个框叠在一起。
 
-   ★ 为什么不用模态：MsgBox 会跑一个嵌套消息循环把线程卡住（虽然消息还能进来，
-     但"谁在跑"就说不清了）。自建窗口是非模态的，串行交给 cbBoxBusy 控制 ——
-     关掉一条再放行下一条，不会五个框叠在一起。 */
+   注意：这里的 g 是**局部变量**（对话框），别在这个函数里写 global g ——
+   那会把主窗口那个 g 抢过来，CbBoxNative 的 Owner 就会指向刚建的这个框。 */
 CbBoxShow(a) {
     global cbBoxWin
 
@@ -1716,6 +1805,10 @@ CbBoxShow(a) {
 
     cbBoxWin := g
     g.Show('AutoSize Center')
+    /* 系统提示音：原生那套由 Iconi/Iconx 标志位自动放，自绘窗口得自己补一声。
+       0x40 = Asterisk（对应 Iconi 的"咚"），0x10 = Hand（对应 Iconx）。响了才算数，
+       失败也不影响显示。 */
+    try DllCall('user32\MessageBeep', 'uint', (a.level = 'error') ? 0x10 : 0x40)
     /* +AlwaysOnTop 已经加过了，这里再压一遍：同层里还有别的置顶窗口时，
        光靠样式位不保证它在最上面。露脸前把焦点也拿过来，别让用户看不见。 */
     try WinSetAlwaysOnTop(1, 'ahk_id ' g.Hwnd)
@@ -1755,21 +1848,42 @@ CbTestArg(argv, &dir) {
     return true
 }
 
-/* 消息框自检：真建一个窗口，验「置顶 / 自动关闭」，然后自己退出。
+/* 消息框自检：两套都真建一个，验「置顶 / 归属 / 自动关闭」，然后自己退出。
    "被主窗口压住" 是肉眼最难发现的一类坏法 —— 有提示音、有日志，就是看不见，
-   所以这条必须由程序自己断言 WS_EX_TOPMOST，不能靠看。 */
+   所以这条必须由程序自己断言 WS_EX_TOPMOST，不能靠看。
+
+   native 那条是模态的，量它只能在它挂着的时候下手：先挂一个定时器，再从当前线程
+   调 CbBoxNative —— MessageBox 有自己的消息循环，定时器在它里面照样会被派发
+   （已经实测过），量完写进共享对象，模态返回后读。 */
 CbMsgTestArg(argv) {
     return (argv.Length >= 1 && argv[1] = '--selftest-cbmsg')
 }
 
 CbMsgTest() {
-    global cbBoxWin, cbBoxBusy, cbSilent
+    global cbBoxWin, cbBoxBusy, cbSilent, g
     cbSilent := true                     ; 自检不写日志
-    a := {level: 'success', title: 'QuickLaunch 自检'
-        , text: '回调消息框自检：这个窗口应该在最上层，并在 1 秒后自动关闭。'
-        , timeout: 1, quiet: 0}
+
+    /* 这个自检跑在主窗口之前（见启动引导），得先造一个 +AlwaysOnTop 的替身当 owner，
+       否则 CbBoxNative 没有 owner 可挂，测不到 "owner 把框抬进置顶层" 这条关键行为。
+       替身用的就是主窗口那套样式（+ToolWindow +AlwaysOnTop）。 */
+    g := Gui('+ToolWindow +AlwaysOnTop', 'QLCB-SELFTEST-MAIN')
+    g.Show('w220 h140 Center')
+
+    ; ---- native：靠定时器在框挂着时量 ----
+    n := {found: 0, top: 0, owner: 0}
+    SetTimer(ProbeNative.Bind(n, 'QLCB-SELFTEST-N'), -350)
+    t := A_TickCount
+    CbBoxNative({level: 'success', title: 'QLCB-SELFTEST-N'
+        , text: '回调消息框自检（native）：应该压在主窗口之上，1 秒后自动关闭。'
+        , timeout: 1, quiet: 0})
+    nms := A_TickCount - t
+    nClosed := (nms >= 800 && nms <= 6000) ? 1 : 0   ; 真的等到 T1 到点才返回
+
+    ; ---- custom：原来的流程 ----
     cbBoxBusy := true
-    CbBoxShow(a)
+    CbBoxShow({level: 'success', title: 'QLCB-SELFTEST-C'
+        , text: '回调消息框自检（custom）：应该在最上层，并在 1 秒后自动关闭。'
+        , timeout: 1, quiet: 0})
 
     Sleep 300
     hwnd := 0
@@ -1782,11 +1896,36 @@ CbMsgTest() {
             break
         Sleep 100
     }
-    closed := cbBoxWin ? 0 : 1
-    top := (ex & 0x8) ? 1 : 0            ; WS_EX_TOPMOST
+    cClosed := cbBoxWin ? 0 : 1
+    cTop := (ex & 0x8) ? 1 : 0           ; WS_EX_TOPMOST
 
-    StdOut('{"exists":' vis ',"topmost":' top ',"closed":' closed '}`n')
-    return (vis && top && closed) ? 0 : 1
+    StdOut('{"n_exists":' n.found ',"n_topmost":' n.top ',"n_owner":' n.owner
+        . ',"n_closed":' nClosed
+        . ',"c_exists":' vis ',"c_topmost":' cTop ',"c_closed":' cClosed '}`n')
+    return (n.found && n.top && n.owner && nClosed && vis && cTop && cClosed) ? 0 : 1
+}
+
+/* 在 native 框还挂着的时候量它：按类名 + 标题找 #32770，读扩展样式与 owner */
+ProbeNative(o, title) {
+    global g
+    h := 0
+    for w in WinGetList('ahk_class #32770') {
+        try {
+            if !InStr(WinGetTitle('ahk_id ' w), title)
+                continue
+            if !DllCall('user32\IsWindowVisible', 'ptr', w, 'int')
+                continue
+            h := w
+            break
+        }
+    }
+    if !h
+        return
+    ex := WinGetExStyle('ahk_id ' h)
+    owner := DllCall('user32\GetWindow', 'ptr', h, 'uint', 4, 'ptr')   ; GW_OWNER
+    o.found := 1
+    o.top := (ex & 0x8) ? 1 : 0
+    o.owner := (IsObject(g) && owner = g.Hwnd) ? 1 : 0
 }
 
 CbTest(dir) {

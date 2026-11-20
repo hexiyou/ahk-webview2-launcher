@@ -209,6 +209,10 @@ async function instancePid() {
   eq('回调真的拉起了一个条目', markCount(), 1);
   ok('日志里有执行记录', has('执行 marker（链 hook-ok→marker）'), readLog().slice(-600));
   ok('日志里有消息框记录', has('消息框 success：ok 分支'), readLog().slice(-600));
+  /* 配置里没写 callback.popup → 缺省 native。沙箱的 ShowOnStart=0 把主窗口摆在
+     屏幕外，native 会判定"没有可用的 owner"并回落自绘 —— 这行日志同时钉住两件事：
+     缺省真的是 native，以及"主窗口不在屏幕上"这条兜底还在。 */
+  ok('缺省 native，主窗口在屏幕外时回落自绘', has('主窗口不在屏幕上，这条改用自绘框'), readLog().slice(-600));
 
   console.log('— 回调：链（webhook 回调另一条 webhook）');
   clearMark();

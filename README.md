@@ -201,14 +201,14 @@ wv2-launcher/
 > node tests/jsonfile.test.js  # 20 条（jsonfile 的 target 原样保留 / 参数校验 / Tab 补全判定）
 > node tests/config-format.test.js # 39 条（YAML/TOML 解析分派、Date 与循环引用、报错行列）
 > node tests/multipart.test.js # 40 条（multipart 三种写法 / 模板替换 / 请求头 / 交给 AHK 的压平格式）
-> node tests/callback.test.js  # 71 条（_ql_callback 的切片 / 解析 / 计划 / args·params / 响应模板）
+> node tests/callback.test.js  # 76 条（_ql_callback 的切片 / 解析 / 计划 / args·params / 响应模板 / 弹窗机制）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
 > node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用与隐藏条目/模板（66 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log；含 hidden 条目）
-> node tools/cb-check.js       # 回调端到端：真请求、真回调、真起进程（28 项，会弹两个 1 秒自动关的提示框）
+> node tools/cb-check.js       # 回调端到端：真请求、真回调、真起进程（29 项，会弹两个 1 秒自动关的提示框；沙箱主窗口在屏幕外，故走自绘那套）
 > node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC/文件与 crypto 对照（58 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
@@ -810,12 +810,29 @@ global SIG_KEYS := Map(
 
 | `type` | 字段 | 行为 |
 |---|---|---|
-| `msg` | `level`：`success` / `error`（也认 `ok` / `fail`）；`title`（默认 QuickLaunch）；`text`（必填，空则忽略）；`timeout`：秒，`0`/缺省 = 不自动关 | 弹出**置顶**提示框：成功绿、失败红，可自动关闭 |
+| `msg` | `level`：`success` / `error`（也认 `ok` / `fail`）；`title`（默认 QuickLaunch）；`text`（必填，空则忽略）；`timeout`：秒，`0`/缺省 = 不自动关 | 弹出**置顶**提示框，可自动关闭。两套实现见下 |
 | `run` | `id`：config.json 里的条目 id；可选 `args` / `params`（见下） | 等同于 `ql run <id> [参数]`：app / cmd / ahk / url / folder / **webhook** / download / jsonfile 都行 |
 
-> 提示框是自己画的，不用 `MsgBox`：`MsgBox` 没有置顶选项，而 QuickLaunch 主窗口本身是
-> AlwaysOnTop —— 框会正好落在家窗口**下面**，用户只听见提示音、看不见内容。
-> 自建窗口固定 `+AlwaysOnTop`，非模态但排队（一条关掉再放下一条，不会五个框叠一起）。
+**提示框有两套，`callback.popup` 选**（缺省 `native`）：
+
+| 值 | 实现 | 说明 |
+|---|---|---|
+| `"native"` | 系统消息框 + `Owner<主窗口>` | 缺省。系统样式、系统提示音、`Ctrl+C` 复制正文、按主窗口居中、按钮随系统语言。**模态**：不关掉就不放下一条。主窗口不在屏幕上时（`ShowOnStart=0` 的启动位在 -32000）自动改走 `custom`，否则框会跟着 owner 跑到屏幕外 |
+| `"custom"` | 自绘窗口（`+AlwaysOnTop`） | 非模态、成功绿/失败红、正文超长屏上截断。眼下和 native 只差样式，留着是给将来：回调要返回带样式的文本 / 图片 / HTML 时 `MsgBox` 装不下 |
+
+> **为什么裸 `MsgBox` 不行**：主窗口是 `AlwaysOnTop`，裸框是普通层窗口，实测落在主窗口
+> 下面 8 层（z 10 vs 2）—— 有声音、看不见内容。所以要把主窗口当 owner 传进去
+> （`"Owner" g.Hwnd`）：Windows 规定被拥有窗口永远在 owner 之上，owner 在置顶层，
+> 框就被一起抬进置顶层（实测扩展样式 `0x10101 → 0x10109`，多出的 `0x8` 是
+> `WS_EX_TOPMOST`，系统自己加的）。
+>
+> 早先文档写过"`MsgBox` 没有置顶选项"—— 那是错的：没有 `AlwaysOnTop` 选项（写进去报
+> `Invalid option.`），但有 `Owner<hwnd>`，效果一样。`SystemModal` / `TaskModal` 在这个
+> build 上同样不认。
+>
+> 自绘那套的提示音是自己补的（`MessageBeep`，与 `MessageBox` 同一声源）。任务栏闪烁
+> 补不回来也不该补：那颗闪的是"框自己没拿到前台"的补偿，而主窗口是 `+ToolWindow`，
+> 本来就没有任务栏按钮。
 
 宽容写法（远端不必为配合我们写得多别扭）：`_ql_callback` 直接是数组 → 当作 `actions`；
 直接是单个动作对象（带 `type`）→ 当作一个动作；`actions` 给成单个对象也认。
@@ -896,7 +913,7 @@ global SIG_KEYS := Map(
 config.json 顶层可选（**不写就是默认值**，老配置不用改）：
 
 ```json
-"callback": { "enabled": true, "max": 5, "maxDepth": 5, "allow": [], "onQuiet": "notify" }
+"callback": { "enabled": true, "max": 5, "maxDepth": 5, "allow": [], "onQuiet": "notify", "popup": "native" }
 ```
 
 | 字段 | 默认 | 说明 |
@@ -906,6 +923,9 @@ config.json 顶层可选（**不写就是默认值**，老配置不用改）：
 | `maxDepth` | `5` | 一条链最多几跳（1~20） |
 | `allow` | `[]` | 非空时**只有列出的 id** 能被回调拉起。远端能间接决定"跑哪条命令"，留个闸 |
 | `onQuiet` | `"notify"` | 定时任务触发的链：`notify` = 托盘提示 + 日志，`popup` = 照常弹框 |
+| `popup` | `"native"` | 用哪套提示框：`native` = 系统消息框 + owner，`custom` = 自绘窗口（也认 `gui` / `window`）。写成别的值一律回落 `native` |
+
+> `popup` 是**配置键**；动作里的 `"type": "popup"` 只是 `msg` 的别名，两处不相干。
 
 "有没有人在看"是沿链继承的：定时任务触发的那条链，第三跳也不会半夜弹模态框；
 你手动点出来的一条链，第二跳照常弹。
@@ -918,7 +938,7 @@ config.json 顶层可选（**不写就是默认值**，老配置不用改）：
 2026-11-19 21:40:46  [cb] 执行 marker（链 hook-ok→marker）
 2026-11-19 21:40:46  [cb] 执行 marker（链 hook-args→marker，args="C:\a b\c.txt"）
 2026-11-19 21:40:46  [cb] 消息框 success：ok 分支（hook-ok / r1-mwnl8v）
-2026-11-19 21:40:46  [cb] 消息框已显示（success，1s 后自动关）
+2026-11-19 21:40:46  [cb] 消息框已关闭（success，native）
 2026-11-19 21:40:51  [cb] 跳过 hook-loop：环已阻断（hook-loop→hook-loop）
 2026-11-19 21:40:54  [cb] 检测到 _ql_callback，但这一块切不出来（响应不是合法 JSON？）—— 已忽略
 2026-11-19 21:40:55  [cb] 模板变量取不到值（按空串处理）：body.data.path（hook-x / r2-…）
@@ -927,15 +947,18 @@ config.json 顶层可选（**不写就是默认值**，老配置不用改）：
 倒数第二条是刻意留的：真出现"说了要弹框却没弹"，先看这行 —— 它把"没有这个键"和
 "有但切坏了"区分开了。最后一条同理：远端字段改名后，参数不会静默变成空串。
 
-提示框是自建窗口（不是 `MsgBox`），"有没有真的置顶"没法靠肉眼确认，所以有自检：
+"有没有真的置顶"没法靠肉眼确认（被主窗口压住时，声音和日志都正常，就是看不见），
+所以两套都有自检：
 
 ```bat
 runtime\AutoHotkey64.exe launcher.ahk --selftest-cbmsg
-:: {"exists":1,"topmost":1,"closed":1}   退出码 0
+:: {"n_exists":1,"n_topmost":1,"n_owner":1,"n_closed":1,"c_exists":1,"c_topmost":1,"c_closed":1}   退出码 0
 ```
 
-它真建一个框、查 `WS_EX_TOPMOST`、等它自动关闭再退 —— 主窗口是置顶的，
-框要是没置顶，就会正好被压在下面。
+`n_` 是 native（系统框）：真弹一条、在它挂着时用定时器查 `#32770` 的 `WS_EX_TOPMOST`
+和 owner 是不是主窗口、再等它自己到点关闭；`c_` 是 custom（自绘框）：查 `Gui` 的
+`WS_EX_TOPMOST` 与自动关闭。自检自己造一个 `+AlwaysOnTop` 的替身窗口当"主窗口"，
+因为这条自检跑在真正的主窗口创建之前。
 
 #### 不生效的地方
 
@@ -2076,8 +2099,9 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
 - 回调只看响应**根对象第一层**，深层同名字段一律不触发（既是防撞也是防误伤）。
 - 回调 `run` 的 `args` 是文本形式：值里带引号就拼不回去（`splitQuoted` 没有转义），
   这种值请走 `params`。响应正文超过 40 万字符被截断时，`{{body.…}}` 也可能取不到。
-- 回调提示框是**非模态**的：它不会挡住主窗口的操作，但也不会阻塞后续代码 ——
-  "弹完框再干下一件事"的时序要靠 `actions` 的顺序，不是靠框关没关。
+- 回调提示框：`custom` 那套是**非模态**的，不挡主窗口操作，也不阻塞后续代码；`native`
+  那套是**模态**的，关掉之前队列里后面的消息都得等着（串行本来就是想要的效果，但别指望
+  它能和后面的动作并行）。两边都别拿"框关没关"当时序，动作顺序看 `actions` 的排列。
 - 防环只管"回调链"内部：回调跑起的 cmd 如果自己再 `ql run …`，那是另一个进程发起的新请求，
   链信息带不过去，任何进程内方案都拦不住 —— 别把脚本写成环。
 - 单跑 `ql --webhook spec.ini` **不执行回调**（那个进程只发一次请求、写完 meta.ini 就退出）。
