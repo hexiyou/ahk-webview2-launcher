@@ -15,12 +15,14 @@ const { build, readSrc, grabConst } = require('./harness');
 const src = readSrc();
 const prelude = [
   grabConst(src, /const CB_TEXT_MAX = \d+;/, 'CB_TEXT_MAX'),
-  grabConst(src, /const CB_TITLE_MAX = \d+;/, 'CB_TITLE_MAX')
+  grabConst(src, /const CB_TITLE_MAX = \d+;/, 'CB_TITLE_MAX'),
+  grabConst(src, /const CB_TPL_RE = .*;/, 'CB_TPL_RE')
 ].join('\n');
 
 const state = { all: [], groups: [], index: {}, usage: {}, cfg: null };
 const T = build(state, null, [
-  'cbCfg', 'cbType', 'cbLevel', 'cbWhy', 'cbParse', 'cbFindItem', 'cbPlan'
+  'cbCfg', 'cbType', 'cbLevel', 'cbWhy', 'cbParse', 'cbFindItem', 'cbPlan',
+  'cbValue', 'cbPick', 'cbFill', 'cbQuoteArg', 'cbActionArgs', 'cbSubstCtx'
 ], prelude);
 
 let pass = 0, fail = 0;
@@ -232,6 +234,68 @@ eq('定时链的 quiet 一直带着',
   T.cbPlan([run('b')], {
     cfg: cfg(), chain: { path: ['a'], depth: 0, quiet: true }, find: T.cbFindItem
   })[0].chain.quiet, true);
+
+/* ---------------------------------------------------------- JS：动作参数 */
+
+console.log('— 回调动作的运行时参数（args / params + 响应模板）');
+
+eq('args 原样带进动作',
+  T.cbParse(JSON.stringify({ actions: [{ type: 'run', id: 'x', args: 'a b' }] })).actions[0].args, 'a b');
+eq('args 也可以是数组（不受空格切分影响）',
+  T.cbParse(JSON.stringify({ actions: [{ type: 'run', id: 'x', args: ['a b', 'c'] }] })).actions[0].args,
+  ['a b', 'c']);
+eq('argv 是 args 的别名',
+  T.cbParse(JSON.stringify({ actions: [{ type: 'run', id: 'x', argv: '-v' }] })).actions[0].args, '-v');
+eq('params 的值统一成字符串',
+  T.cbParse(JSON.stringify({ actions: [{ type: 'run', id: 'x', params: { n: 3, ok: true } }] }))
+    .actions[0].params, { n: '3', ok: 'true' });
+eq('params 写成数组就当没写',
+  T.cbParse(JSON.stringify({ actions: [{ type: 'run', id: 'x', params: ['a'] }] })).actions[0].params,
+  undefined);
+
+const ctx = T.cbSubstCtx(
+  { status: 200, ms: 42, body: JSON.stringify({ data: { path: 'C:\\a b\\c.txt', n: 2, list: ['x', 'y'] } }) },
+  { item: { id: 'hook', name: '钩子' } });
+
+eq('{{body.a.b}} 按点号取值', T.cbFill('{{body.data.path}}', ctx), 'C:\\a b\\c.txt');
+eq('{{body.x}} 数字也转成字符串', T.cbFill('{{body.data.n}}', ctx), '2');
+eq('数组下标 [1] 和 .1 都认',
+  [T.cbFill('{{body.data.list[1]}}', ctx), T.cbFill('{{body.data.list.1}}', ctx)], ['y', 'y']);
+eq('中间节点直接给 JSON', T.cbFill('{{body.data}}', ctx), '{"path":"C:\\\\a b\\\\c.txt","n":2,"list":["x","y"]}');
+eq('{{status}} / {{ms}} / {{error}}', T.cbFill('{{status}}|{{ms}}|{{error}}', ctx), '200|42|');
+eq('{{from.id}} / {{from.name}}', T.cbFill('{{from.id}}/{{from.name}}', ctx), 'hook/钩子');
+eq('{{body}} 给正文原文', T.cbFill('{{body}}', ctx).slice(0, 5), '{"dat');
+eq('{{{{ 与 }}}} 转义成字面量', T.cbFill('{{{{x}}}}', ctx), '{{x}}');
+eq('取不到的变量按空串', T.cbFill('[{{body.nope}}]', ctx), '[]');
+ok('取不到的变量记进 miss（日志要用）', ctx.miss.indexOf('body.nope') >= 0, JSON.stringify(ctx.miss));
+eq('正文不是 JSON 也不抛异常', T.cbFill('{{body.a}}', T.cbSubstCtx({ body: 'not json' }, null)), '');
+
+eq('含空格的值补引号（否则会被拆成两个参数）',
+  T.cbFill('{{body.data.path}}', ctx, { quote: true }), '"C:\\a b\\c.txt"');
+eq('不含空格的值不补引号', T.cbFill('{{status}}', ctx, { quote: true }), '200');
+
+eq('args 字符串里的模板会被填，含空格自动加引号',
+  T.cbActionArgs({ kind: 'run', id: 'x', args: '--dir={{body.data.path}} --n={{body.data.n}}' }, ctx).text,
+  '--dir="C:\\a b\\c.txt" --n=2');
+eq('args 数组逐项加引号',
+  T.cbActionArgs({ kind: 'run', id: 'x', args: ['{{body.data.path}}', 'plain'] }, ctx).text,
+  '"C:\\a b\\c.txt" plain');
+eq('params 填模板但不加引号（按名字给值，不走文本切分）',
+  T.cbActionArgs({ kind: 'run', id: 'x', params: { p: '{{body.data.path}}', k: 'v' } }, ctx).preset,
+  { p: 'C:\\a b\\c.txt', k: 'v' });
+eq('计划里带着 args / params 往下走',
+  plan([{ kind: 'run', id: 'b', args: 'x', params: { k: 'v' } }], ['a']).map(s => [s.args, s.params]),
+  [['x', { k: 'v' }]]);
+
+/* preset 是"按名字给值"的旁路：值里的空格不该被当成参数分隔符 */
+const upItem = {
+  id: 'up', type: 'app', target: 'app.exe', args: '--file={{file}} --mode={{mode}}',
+  params: [{ name: 'file' }, { name: 'mode', default: 'fast' }]
+};
+const w1 = T.applyParams(upItem, '', { file: 'C:\\a b\\c.txt' });
+eq('preset 灌进模板，空格不再被拆开', w1.item.args, '--file=C:\\a b\\c.txt --mode=fast');
+eq('preset 满足了必填，不再算缺参数', w1.missing, []);
+eq('没有 preset 时照旧按文本判缺失', T.applyParams(upItem, '', null).missing, ['file']);
 
 console.log('\n' + (fail ? 'FAIL ' + fail + ' 项' : '全部通过') + '，通过 ' + pass + ' 项');
 process.exit(fail ? 1 : 0);

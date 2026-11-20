@@ -498,8 +498,11 @@
         missing  —— 还缺的必填参数（非网络类型只算模板真的用到的）
         argv     —— 需要追加到末尾的 token（app / ahk 逐项加引号）
         argvRaw  —— 同一批 token 的 cmd 原文（引号、重定向交给 cmd 解析）
-        used     —— 模板里点名过的参数名，这些不再追加 */
-  function applyParams(item, raw) {
+        used     —— 模板里点名过的参数名，这些不再追加
+
+     preset 是「按名字给值」的旁路（回调的 params 用）：它绕过文本切分，
+     所以值里有空格、有引号都不会被拆坏 —— 文本形式表达不了的东西靠它。 */
+  function applyParams(item, raw, preset) {
     const decl = item.params || [];
     const text = raw == null ? '' : String(raw);
     /* jsonfile 也算：路径就是这个功能的主体，必填项缺了必须拦下来，
@@ -516,7 +519,13 @@
     }
 
     const asg = assignTokens(item, text);
-    const r = resolveParamValues(item, asg.values);
+    const values = Object.assign({}, asg.values);
+    if (preset) {
+      Object.keys(preset).forEach(k => {
+        if (preset[k] != null) values[k] = String(preset[k]);
+      });
+    }
+    const r = resolveParamValues(item, values);
     const used = tplVars(TPL_FIELDS.map(f => item[f]));
 
     const filled = Object.assign({}, item, {
@@ -1881,6 +1890,8 @@
        只能记日志、然后跳过 —— 远端不该因为本机少配了一条条目而弹一堆错误 */
     const cb = !!(opts && opts.cb);
     const chain = (opts && opts.chain) || null;
+    /* 回调的 params：按参数名给值，不走文本切分（值里的空格/引号不会被拆坏） */
+    const preset = (opts && opts.preset) || null;
 
     /* 模板里写了个没声明的变量：宁可拒绝，也别悄悄替换成空串跑出个歪结果。
        载入配置时就查过一遍（见 templateIssues），这里是最后一道闸。 */
@@ -1893,7 +1904,7 @@
     }
 
     /* 声明了 params 的条目：先把模板填好，再决定末尾还要追加什么 */
-    const w = applyParams(item, raw);
+    const w = applyParams(item, raw, preset);
 
     if (w.missing.length) {
       /* 点了没填参数的必填条目：别直接报错，把人送进参数态 */
@@ -2201,6 +2212,9 @@
 
   const CB_TEXT_MAX = 2000;     /* 和 launcher.ahk 的 CB_TEXT_MAX 对齐 */
   const CB_TITLE_MAX = 120;
+  /* 回调动作里的响应模板。写法刻意和条目的 {{参数}} 一致（含 {{{{ 转义），
+     只有命名空间不同 —— 见 cbValue。方括号是给数组下标留的：{{body.list[0]}}。 */
+  const CB_TPL_RE = /\{\{\{\{|\}\}\}\}|\{\{\s*([\w.[\]-]+)\s*\}\}/g;
 
   /* 配置块：config.json 顶层的 callback。不写就全用默认值 ——
      老配置一个字都不用改，加完功能立刻能用。 */
@@ -2280,10 +2294,119 @@
         });
       } else if (t === 'run') {
         const id = String(x.id != null ? x.id : (x.cmd != null ? x.cmd : '')).trim();
-        if (id) actions.push({ kind: 'run', id: id });
+        if (!id) return;
+        const a = { kind: 'run', id: id };
+        /* 运行时参数：args 是"你会手打的那串"，params 是按名字给值。
+           两者可以一起用（params 覆盖同名的那一份）。内容先原样收着 ——
+           {{…}} 要等拿到响应正文才填，见 cbFill。 */
+        const raw = (x.args != null) ? x.args : ((x.argv != null) ? x.argv : x.arguments);
+        if (Array.isArray(raw))
+          a.args = raw.map(v => (v == null ? '' : String(v)));
+        else if (raw != null && raw !== '')
+          a.args = String(raw);
+        if (x.params && typeof x.params === 'object' && !Array.isArray(x.params)) {
+          a.params = {};
+          Object.keys(x.params).forEach(k => {
+            const v = x.params[k];
+            if (v == null) return;
+            /* 给对象/数组就按 JSON 传 —— "[object Object]" 进了命令行毫无用处 */
+            a.params[k] = (typeof v === 'object') ? JSON.stringify(v) : String(v);
+          });
+        }
+        actions.push(a);
       }
     });
     return { actions: actions, err: '' };
+  }
+
+  /* ---- 动作里的模板：执行前用「响应内容」填一遍 ----------------------------
+
+     和条目自己的 {{参数}} 是两层，别混：
+       条目那一层 —— 值来自"这次运行时给了什么参数"（applyParams）
+       这一层     —— 值来自"远端这次返回了什么"（cbFill，只作用于回调动作）
+
+       {{body.a.b}}   响应正文按 JSON 解析后取值（点号路径；数组用 .0 或 [0]）
+       {{body}}       正文原文（可能已被 400KB 截断）
+       {{status}}     HTTP 状态码      {{ms}} 耗时毫秒      {{error}} 传输层错误
+       {{from.id}}    {{from.name}}   触发这条回调的条目
+       {{{{  }}}}     转义，输出字面 {{  }}
+
+     用 body. 前缀而不是直接 {{a.b}}：正文里出现 status / ms 这类同名字段是常事，
+     混在一个命名空间里，迟早会"填进去的是 HTTP 状态码，你以为填的是业务字段"。
+     取不到的变量按空串处理并记日志 —— 静默变空串是最难查的一种。 */
+  function cbValue(ctx, key) {
+    const k = String(key);
+    if (k === 'body') return ctx.raw;
+    if (k === 'status') return String(ctx.status | 0);
+    if (k === 'ms') return String(ctx.ms | 0);
+    if (k === 'error') return String(ctx.error || '');
+    if (k === 'from.id') return String((ctx.from && ctx.from.id) || '');
+    if (k === 'from.name') return String((ctx.from && ctx.from.name) || '');
+    if (k.indexOf('body.') === 0) return cbPick(ctx.body, k.slice(5));
+    return null;
+  }
+
+  /* 点号路径取值：body.data.list[0].path 和 body.data.list.0.path 都认。
+     走到对象/数组就 JSON.stringify —— 拼进命令行时至少还是完整的 JSON 片段，
+     比 "[object Object]" 有用。 */
+  function cbPick(root, path) {
+    if (root == null) return null;
+    const parts = String(path).replace(/\[(\d+)\]/g, '.$1').split('.');
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (!p) continue;
+      if (cur == null || typeof cur !== 'object') return null;
+      cur = cur[p];
+    }
+    if (cur == null) return null;
+    if (typeof cur === 'object') {
+      try { return JSON.stringify(cur); } catch (e) { return null; }
+    }
+    return String(cur);
+  }
+
+  /* 文本参数里表达"一个包含空格的值"只有加引号这一条路。splitQuoted 没有转义，
+     值本身带引号就没法保真 —— 那种情况交给 params（按名字给值，不走切分）。 */
+  function cbQuoteArg(v) {
+    const s = String(v == null ? '' : v);
+    if (!s) return '';
+    if (!/\s/.test(s)) return s;
+    if (/["']/.test(s)) return s;
+    return '"' + s + '"';
+  }
+
+  function cbFill(v, ctx, opts) {
+    if (typeof v !== 'string') return v;
+    return v.replace(CB_TPL_RE, (m, key) => {
+      if (m === '{{{{') return '{{';
+      if (m === '}}}}') return '}}';
+      const val = cbValue(ctx, key);
+      if (val == null) {
+        if (ctx.miss.indexOf(key) < 0) ctx.miss.push(key);
+        return '';
+      }
+      if (!opts || !opts.quote) return val;
+      return cbQuoteArg(val);
+    });
+  }
+
+  /* 动作 → 真正交给 launch() 的运行时参数。
+       text   —— 等价于用户手打的那串（args，数组形式逐项加引号）
+       preset —— 按名字给的值（params）；条目声明了 params 时优先走它 */
+  function cbActionArgs(a, ctx) {
+    let text = '';
+    if (Array.isArray(a.args)) {
+      text = a.args.map(v => cbQuoteArg(cbFill(v, ctx))).filter(x => x !== '').join(' ');
+    } else if (typeof a.args === 'string') {
+      text = cbFill(a.args, ctx, { quote: true });
+    }
+    let preset = null;
+    if (a.params) {
+      preset = {};
+      Object.keys(a.params).forEach(k => { preset[k] = cbFill(a.params[k], ctx); });
+    }
+    return { text: text, preset: preset };
   }
 
   /* 按 id 找条目。先精确、再忽略大小写 —— 配置里的 id 都是小写，
@@ -2332,6 +2455,8 @@
       out.push({
         kind: 'run',
         item: item,
+        args: a.args,            /* 原样带过去：{{…}} 要等拿到响应正文才填 */
+        params: a.params,
         /* quiet 一路带下去：定时任务触发的链，第三跳也不该半夜弹框 */
         chain: {
           path: path.concat([item.id]),
@@ -2356,6 +2481,24 @@
     return t.length > (max || 80) ? t.slice(0, max || 80) + '…' : t;
   }
 
+  /* 响应上下文：动作里的模板从这里取值。正文不是 JSON 不算错 —— 有些接口本来
+     就返回纯文本，这时只有 {{body}} / {{status}} 之类可用，{{body.x}} 一律空串
+     并记日志（静默变空串比报错难查得多）。 */
+  function cbSubstCtx(msg, pend) {
+    let body = null;
+    try { body = JSON.parse((msg && msg.body) || ''); } catch (e) { body = null; }
+    return {
+      body: body,
+      raw: (msg && msg.body) || '',
+      status: (msg && msg.status) | 0,
+      ms: (msg && msg.ms) | 0,
+      error: (msg && msg.error) || '',
+      from: (pend && pend.item) || null,
+      truncated: !!(msg && msg.truncated),
+      miss: []
+    };
+  }
+
   function cbDispatch(raw, pend, msg) {
     const cfg = cbCfg();
     if (!cfg.enabled) return;
@@ -2377,8 +2520,12 @@
        点了确定才拿到结果 —— "请求成功没成功"和"要不要弹个框"本来就不该互相堵。 */
     setTimeout(() => {
       try {
+        const ctx = cbSubstCtx(msg, pend);
+
         if (p.actions.length > cfg.max)
           cbLog('动作数超过上限 ' + cfg.max + '，只执行前 ' + cfg.max + ' 个（' + tag + '）');
+        if (ctx.truncated && p.actions.some(a => a.kind === 'run' && a.args))
+          cbLog('响应正文已截断，{{body.…}} 可能取不到值（' + tag + '）');
 
         plan.forEach(step => {
           if (step.kind === 'skip') {
@@ -2386,21 +2533,54 @@
             return;
           }
           if (step.kind === 'msg') {
+            const text = cbFill(step.text, ctx).slice(0, CB_TEXT_MAX);
+            const title = cbFill(step.title, ctx).slice(0, CB_TITLE_MAX);
+            if (!text.trim()) {
+              cbLog('消息框正文填完是空的，跳过（' + tag + '）');
+              return;
+            }
             post({
               type: 'cb-msg',
               level: step.level,
-              title: step.title,
-              text: step.text,
+              title: title,
+              text: text,
               timeout: step.timeout,
               /* 定时链路默认不弹模态框：半夜挂一个没人关的对话框是最糟的"成功" */
               quiet: (quiet && cfg.onQuiet !== 'popup') ? 1 : 0
             });
-            cbLog('消息框 ' + step.level + '：' + cbOneLine(step.text) + '（' + tag + '）');
+            cbLog('消息框 ' + step.level + '：' + cbOneLine(text) + '（' + tag + '）');
             return;
           }
-          cbLog('执行 ' + step.item.id + '（链 ' + step.chain.path.join('→') + '）');
-          launch(step.item, '', { quiet: true, cb: true, chain: step.chain });
+
+          const w = cbActionArgs(step, ctx);
+          const decl = step.item.params || [];
+          if (w.preset) {
+            if (!decl.length) {
+              /* 条目没声明 params：按名字给的值无处安放，按顺序当文本参数用 ——
+                 丢掉比按顺序追加更让人意外。日志里说清楚，别让人以为按名字生效了。 */
+              const extra = Object.keys(w.preset)
+                .map(k => cbQuoteArg(w.preset[k])).filter(x => x !== '').join(' ');
+              if (extra) w.text = (w.text ? w.text + ' ' : '') + extra;
+              cbLog(step.item.id + ' 没有声明 params，params 按顺序当文本参数（' + tag + '）');
+              w.preset = null;
+            } else {
+              const known = decl.map(x => x.name);
+              const unknown = Object.keys(w.preset).filter(k => known.indexOf(k) < 0);
+              if (unknown.length)
+                cbLog(step.item.id + ' 没声明参数 ' + unknown.join('、') + '，已忽略（' + tag + '）');
+            }
+          }
+
+          cbLog('执行 ' + step.item.id
+            + '（链 ' + step.chain.path.join('→')
+            + (w.text ? '，args=' + cbOneLine(w.text, 60) : '') + '）');
+          launch(step.item, w.text, {
+            quiet: true, cb: true, chain: step.chain, preset: w.preset
+          });
         });
+
+        if (ctx.miss.length)
+          cbLog('模板变量取不到值（按空串处理）：' + ctx.miss.join('、') + '（' + tag + '）');
       } catch (e) {
         cbLog('执行回调失败：' + ((e && e.message) || e));
       }

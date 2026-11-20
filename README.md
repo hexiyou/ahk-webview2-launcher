@@ -155,7 +155,7 @@ wv2-launcher/
 │  ├─ jsonfile.test.js  jsonfile 类型：target 原样保留/类型标签/参数校验（20 条）
 │  ├─ config-format.test.js  YAML/TOML：解析分派/Date 与循环引用/报错行列（39 条）
 │  ├─ multipart.test.js multipart 归一化/模板替换/请求头不补 JSON/压平格式（40 条）
-│  ├─ callback.test.js  _ql_callback：AHK 切片夹具 + 解析/计划/防环（46 条）
+│  ├─ callback.test.js  _ql_callback：AHK 切片夹具 + 解析/计划/防环/运行时参数（71 条）
 │  ├─ callback/         切片夹具：根/数组/深层同名/转义引号/字符串里的括号
 │  └─ harness.js         从 app.js 抽取真实函数体的夹具
 ├─ tools/
@@ -175,7 +175,7 @@ wv2-launcher/
 │  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进，并验证 hidden 条目不上界面（45 项）
 │  ├─ jsonfile-check.js  jsonfile 真机全链路：真读盘、真渲染、点刷新时改文件看内容跟不跟（67 项）
 │  ├─ mp-e2e.js          multipart 与模板读文件端到端：本地回显服务逐字节比对包体和文件（36 项）
-│  ├─ cb-check.js        回调端到端：真请求 → 真回调 → 真起进程 / 防环 / 上限 / 回执不被弹框堵（22 项）
+│  ├─ cb-check.js        回调端到端：真请求 → 真回调 → 真起进程 / 防环 / 上限 / 参数与模板 / 回执不被弹框堵（28 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -201,14 +201,14 @@ wv2-launcher/
 > node tests/jsonfile.test.js  # 20 条（jsonfile 的 target 原样保留 / 参数校验 / Tab 补全判定）
 > node tests/config-format.test.js # 39 条（YAML/TOML 解析分派、Date 与循环引用、报错行列）
 > node tests/multipart.test.js # 40 条（multipart 三种写法 / 模板替换 / 请求头 / 交给 AHK 的压平格式）
-> node tests/callback.test.js  # 46 条（_ql_callback 的切片 / 解析 / 计划；含真跑 AHK 切片器）
+> node tests/callback.test.js  # 71 条（_ql_callback 的切片 / 解析 / 计划 / args·params / 响应模板）
 > node tools/e2e.js            # 会弹一个真窗口跑 22 步，跑完自动关
 > node tools/unc-check.js      # 需要本机有可访问的 SMB 共享（脚本里写死 \\localhost\Users\…）
 > node tools/dl-check.js       # 自己起一个临时 HTTP 服务，不联网、不碰仓库里的文件
 > node tools/cli-check.js      # 真进程跑一遍 ql：退出码/stdout/单实例/窗口可见性/停用与隐藏条目/模板（66 项）
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log；含 hidden 条目）
-> node tools/cb-check.js       # 回调端到端：真请求、真回调、真起进程（22 项，会弹两个 1 秒自动关的提示框）
+> node tools/cb-check.js       # 回调端到端：真请求、真回调、真起进程（28 项，会弹两个 1 秒自动关的提示框）
 > node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC/文件与 crypto 对照（58 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
@@ -810,8 +810,12 @@ global SIG_KEYS := Map(
 
 | `type` | 字段 | 行为 |
 |---|---|---|
-| `msg` | `level`：`success` / `error`（也认 `ok` / `fail`）；`title`（默认 QuickLaunch）；`text`（必填，空则忽略）；`timeout`：秒，`0`/缺省 = 不自动关 | 弹出系统消息框：成功用信息图标、错误用错误图标 |
-| `run` | `id`：config.json 里的条目 id | 等同于 `ql run <id>`：app / cmd / ahk / url / folder / **webhook** / download / jsonfile 都行 |
+| `msg` | `level`：`success` / `error`（也认 `ok` / `fail`）；`title`（默认 QuickLaunch）；`text`（必填，空则忽略）；`timeout`：秒，`0`/缺省 = 不自动关 | 弹出**置顶**提示框：成功绿、失败红，可自动关闭 |
+| `run` | `id`：config.json 里的条目 id；可选 `args` / `params`（见下） | 等同于 `ql run <id> [参数]`：app / cmd / ahk / url / folder / **webhook** / download / jsonfile 都行 |
+
+> 提示框是自己画的，不用 `MsgBox`：`MsgBox` 没有置顶选项，而 QuickLaunch 主窗口本身是
+> AlwaysOnTop —— 框会正好落在家窗口**下面**，用户只听见提示音、看不见内容。
+> 自建窗口固定 `+AlwaysOnTop`，非模态但排队（一条关掉再放下一条，不会五个框叠一起）。
 
 宽容写法（远端不必为配合我们写得多别扭）：`_ql_callback` 直接是数组 → 当作 `actions`；
 直接是单个动作对象（带 `type`）→ 当作一个动作；`actions` 给成单个对象也认。
@@ -835,6 +839,43 @@ global SIG_KEYS := Map(
 - `run` 的忽略清单（**静默跳过，只记日志，绝不弹错误**）：id 不存在、条目被 `enabled:false`
   停用、条目还缺必填参数、模板变量写错、允许列表里没有它。
 - 一条链上默认最多 5 跳（见下），一次响应最多 5 个动作，两个上限互相独立。
+
+#### 运行时参数：`args` / `params`
+
+`run` 和命令行一样能吃"这次运行才给的参数"，两种写法，可以一起用（`params` 覆盖同名的那份）：
+
+```json
+{ "type": "run", "id": "open-dir", "args": "{{body.data.path}}" }
+{ "type": "run", "id": "upload",  "params": { "file": "{{body.data.path}}", "mode": "fast" } }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `args` | 等价于你手打的那串（也认数组 `["a b", "c"]`，逐项一个参数）。值里有空格的会自动补引号，不会被拆成两个参数 |
+| `params` | 按**参数名**给值，走条目自己的 `params` 声明。不经文本切分，所以值里有空格、标点都不会被拆坏 |
+
+条目**没声明** `params` 时，`params` 里的值按顺序当文本参数用（日志会说一句）；
+声明了但名字写错，那条值被忽略并记日志 —— 都不会静默消失。
+
+> `args` 是文本形式，`splitQuoted` 没有"引号内转义"这回事：值本身带双引号/单引号时
+> 没法保真地拼回去，这种情况用 `params`（按名字给值，根本不经过切分）。
+
+模板变量写在 `args` / `params` 的值里，**动作执行前**用这次响应填：
+
+| 写法 | 值 |
+|---|---|
+| `{{body.a.b}}` | 响应正文按 JSON 解析后按点号取值；数组用 `{{body.list[0]}}`，`.0` 也认 |
+| `{{body}}` | 正文原文（可能已被 40 万字符截断） |
+| `{{status}}` `{{ms}}` `{{error}}` | HTTP 状态码 / 耗时毫秒 / 传输层错误 |
+| `{{from.id}}` `{{from.name}}` | 触发这次回调的条目 |
+| `{{{{` `}}}}` | 转义成字面 `{{` `}}` |
+
+为什么用 `body.` 前缀而不是直接 `{{a.b}}`：正文里出现 `status`、`ms` 这类同名字段是常事，
+混在一个命名空间里，迟早会"填进去的是 HTTP 状态码，你以为填的是业务字段"。取不到的变量
+按空串处理并在日志里点名 —— 静默变空串是最难查的一种。`msg` 的 `text` / `title` 同样支持这套模板。
+
+这一层和条目自己的 `{{参数}}` 是两层，别混：**条目那层**的值来自"这次给了什么参数"，
+**这一层**的值来自"远端这次返回了什么"。
 
 #### 防环：链上不能调回祖先
 
@@ -875,13 +916,26 @@ config.json 顶层可选（**不写就是默认值**，老配置不用改）：
 
 ```
 2026-11-19 21:40:46  [cb] 执行 marker（链 hook-ok→marker）
+2026-11-19 21:40:46  [cb] 执行 marker（链 hook-args→marker，args="C:\a b\c.txt"）
 2026-11-19 21:40:46  [cb] 消息框 success：ok 分支（hook-ok / r1-mwnl8v）
+2026-11-19 21:40:46  [cb] 消息框已显示（success，1s 后自动关）
 2026-11-19 21:40:51  [cb] 跳过 hook-loop：环已阻断（hook-loop→hook-loop）
 2026-11-19 21:40:54  [cb] 检测到 _ql_callback，但这一块切不出来（响应不是合法 JSON？）—— 已忽略
+2026-11-19 21:40:55  [cb] 模板变量取不到值（按空串处理）：body.data.path（hook-x / r2-…）
 ```
 
-最后那条是刻意留的：真出现"说了要弹框却没弹"，先看这行 —— 它把"没有这个键"和
-"有但切坏了"区分开了。
+倒数第二条是刻意留的：真出现"说了要弹框却没弹"，先看这行 —— 它把"没有这个键"和
+"有但切坏了"区分开了。最后一条同理：远端字段改名后，参数不会静默变成空串。
+
+提示框是自建窗口（不是 `MsgBox`），"有没有真的置顶"没法靠肉眼确认，所以有自检：
+
+```bat
+runtime\AutoHotkey64.exe launcher.ahk --selftest-cbmsg
+:: {"exists":1,"topmost":1,"closed":1}   退出码 0
+```
+
+它真建一个框、查 `WS_EX_TOPMOST`、等它自动关闭再退 —— 主窗口是置顶的，
+框要是没置顶，就会正好被压在下面。
 
 #### 不生效的地方
 
@@ -2020,6 +2074,10 @@ Windows 计划任务或别的工具，让它们调 `ql run <条目>` 就行（�
   按字符算，不是按字节：纯 ASCII 约 400KB，中文正文（3 字节/字）能到 1.2MB 左右。
   回调不受这条影响：`_ql_callback` 是在截断**之前**从完整正文里切的。
 - 回调只看响应**根对象第一层**，深层同名字段一律不触发（既是防撞也是防误伤）。
+- 回调 `run` 的 `args` 是文本形式：值里带引号就拼不回去（`splitQuoted` 没有转义），
+  这种值请走 `params`。响应正文超过 40 万字符被截断时，`{{body.…}}` 也可能取不到。
+- 回调提示框是**非模态**的：它不会挡住主窗口的操作，但也不会阻塞后续代码 ——
+  "弹完框再干下一件事"的时序要靠 `actions` 的顺序，不是靠框关没关。
 - 防环只管"回调链"内部：回调跑起的 cmd 如果自己再 `ql run …`，那是另一个进程发起的新请求，
   链信息带不过去，任何进程内方案都拦不住 —— 别把脚本写成环。
 - 单跑 `ql --webhook spec.ini` **不执行回调**（那个进程只发一次请求、写完 meta.ini 就退出）。

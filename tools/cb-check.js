@@ -63,14 +63,30 @@ function readMark() { try { return fs.readFileSync(MARK, 'utf8').replace(/^\uFEF
 function clearMark() { try { fs.unlinkSync(MARK); } catch (e) {} }
 function markCount() { return readMark() ? readMark().split(/\r?\n/).length : 0; }
 const has = s => readLog().indexOf(s) >= 0;
+let lastUrl = '';                 /* 最近一次收到的请求行，用来验 params 真的灌进了 query */
 
 /* ---------------- 本地服务：每种响应形状一个端点 ---------------- */
 const server = http.createServer((req, res) => {
+  lastUrl = req.url;
   const send = obj => {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(obj));
   };
   switch (req.url.split('?')[0]) {
+    case '/echo':
+      return send({ ok: true });   /* 只是用来接收 query，不带回调 */
+    case '/cb-args':
+      /* 运行时参数：args 走文本（含空格的值要自己加引号），params 按名字给值 */
+      return send({
+        ok: true,
+        data: { who: '张三 4 号', path: 'C:\\a b\\c.txt' },
+        _ql_callback: {
+          actions: [
+            { type: 'run', id: 'marker', args: '{{body.data.path}}' },
+            { type: 'run', id: 'echo', params: { who: '{{body.data.who}}', nope: 'x' } }
+          ]
+        }
+      });
     case '/cb-ok':
       return send({
         ok: true,
@@ -129,7 +145,9 @@ function prep() {
 
   fs.writeFileSync(path.join(SANDBOX, 'mark.ahk'), [
     '#Requires AutoHotkey v2.0',
-    "FileAppend('hit`n', A_ScriptDir '\\mark.log', 'UTF-8')",
+    /* 有参数就记第一个参数，没有就记 hit —— 这样"参数到底有没有传成"能被看见，
+       尤其是含空格的值：真要没加引号，这里会变成 C:\a 而不是 C:\a b\c.txt */
+    "FileAppend((A_Args.Length ? A_Args[1] : 'hit') '`n', A_ScriptDir '\\mark.log', 'UTF-8')",
     'ExitApp(0)'
   ].join('\r\n') + '\r\n');
 
@@ -141,7 +159,11 @@ function prep() {
     groups: [{ id: 't', name: '测试' }],
     items: [
       { id: 'marker', name: '写标记', type: 'ahk', target: 'mark.ahk', group: 't' },
+      /* 声明了运行时参数：回调的 params 应该按名字灌进 query */
+      { id: 'echo', name: '回显', type: 'webhook', target: base + '/echo', group: 't',
+        params: [{ name: 'who' }], query: { who: '{{who}}' } },
       hook('hook-ok', '回调成功', '/cb-ok'),
+      hook('hook-args', '回调带参数', '/cb-args'),
       hook('hook-chain', '回调链', '/cb-chain'),
       hook('hook-loop', '回调环', '/cb-loop'),
       hook('hook-nested', '深层同名', '/cb-nested'),
@@ -234,6 +256,24 @@ async function instancePid() {
   ok('动作数超上限有日志', has('动作数超过上限 5'), readLog().slice(-800));
   ok('不存在的 id 静默跳过', has('跳过 nope-1：config.json 里没有这个 id'), readLog().slice(-800));
   ok('错误提示框也走通了', has('消息框 error：错误提示'), readLog().slice(-800));
+
+  console.log('— 回调：运行时参数（args / params + 响应模板）');
+  clearMark();
+  lastUrl = '';
+  const t6 = await run(['run', 'hook-args', '--wait']);
+  eq('退出码 0', t6.code, 0);
+  await sleep(2000);
+  /* 含空格的值如果没加引号，会被拆成两个参数，这里就会只剩 C:\a */
+  eq('args 里的 {{body.data.path}} 填好了，含空格也还是一个参数',
+    readMark(), 'C:\\a b\\c.txt');
+  ok('params 按名字灌进了条目的 {{who}}（query 里是没被拆开的整串）',
+    lastUrl === '/echo?who=' + encodeURIComponent('张三 4 号'), lastUrl);
+  /* 日志里记的是"填完之后、切分之前"那串原文，所以含空格的值带着引号 ——
+     正好也证明引号是程序补的，不是用户在配置里写的 */
+  ok('日志里带了本次的 args', has('args="C:\\a b\\c.txt"'), readLog().slice(-700));
+  ok('params 里没声明的名字有日志', has('没声明参数 nope'), readLog().slice(-700));
+  ok('模板变量全都填上了（没有"取不到值"的日志）',
+    !/模板变量取不到值/.test(readLog().split('hook-args').pop()), readLog().slice(-700));
 
   console.log('— 回执不被消息框堵住');
   /* 消息框是模态的。回调的副作用必须排在命令行回执后面，否则脚本里的

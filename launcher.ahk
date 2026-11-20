@@ -73,8 +73,11 @@ global dropSeenAt := 0
 global ncDrag := false        ; WebView2 原生非客户区拖拽是否可用
 global httpJobs := Map()      ; 进行中的 webhook 请求：id -> {dir, pid, deadline}
 global cbBoxQ := []           ; 待弹的回调消息框（串行，见 DoCallbackMsg）
-global cbBoxBusy := false     ; 正在弹（MsgBox 会跑嵌套消息循环，可能再进来一条）
+global cbBoxBusy := false     ; 已经有一条挂在屏幕上（串行放行，见 CallbackPump）
+global cbBoxWin := 0          ; 当前那条对话框（Gui 对象；0 = 没有）
+global cbSilent := false      ; 自检期间不写 launcher.log（别把噪音掺进用户日志）
 global CB_TEXT_MAX := 2000    ; 回调消息框正文上限：400KB 的正文不该变成一个巨型对话框
+global CB_TEXT_SHOW := 900    ; 屏上最多显示这么多字，再多就截断 —— 2000 字能顶到屏幕外
 global CB_TITLE_MAX := 120
 global CB_RAW_MAX := 16384    ; _ql_callback 原始片段上限：比这大的不是回调，是事故
 global ipcGui := 0            ; 收件箱窗口（接收命令行请求）
@@ -119,6 +122,11 @@ if CbTestArg(A_Args, &cbTestDir)
 
 ; ---------------------------- 启动引导 --------------------------------------
 SetProcessDpi()
+
+/* 回调消息框的自检：真建窗口，验置顶与自动关闭（不弹 WebView2、不读 config）。
+   放在 SetProcessDpi 之后：它要真的画一个窗口，得按同样的 DPI 口径来。 */
+if CbMsgTestArg(A_Args)
+    ExitApp(CbMsgTest())
 
 ; 命令行参数先只做解析，不产生任何副作用
 CLI := CliParse(A_Args)
@@ -985,7 +993,7 @@ OnWebMessage(sender, args) {
         case 'log':
             FileAppend(JsonStr(raw, 'text') '`n', SCRIPT_DIR '\launcher.log', 'UTF-8')
         /* 回调（_ql_callback）：页面解析动作，本地能做的两件事在这里 ——
-           弹原生消息框、写日志。见文末「回调」小节。 */
+           画置顶提示框、写日志。见文末「回调」小节。 */
         case 'cb-msg':
             DoCallbackMsg(raw)
         case 'cb-log':
@@ -1484,19 +1492,26 @@ CheckHttp() {
 ;
 ;  分工（刻意这么切）：
 ;    AHK  只做本地才能做的两件事 —— 从正文里切出这块原始 JSON（正文和 400KB
-;         截断都在主进程），以及弹原生消息框 / 写日志。
+;         截断都在主进程），以及画那个提示框 / 写日志。
 ;    页面 解析与执行。WebView 里 JSON.parse 天然稳妥；"调用某个条目"直接复用
 ;         用户点条目时那条 launch()，app / cmd / ahk / url / folder / webhook /
-;         download / jsonfile 全都走同一套实现。
+;         download / jsonfile 全都走同一套实现 —— 连"运行时参数"（args / params）
+;         和条目自己的 {{参数}} 替换也一并复用。
+;
+;  提示框为什么自己画而不用 MsgBox：MsgBox 没有置顶选项，而主窗口是 AlwaysOnTop，
+;  框会正好落在它下面（有提示音、看不见内容）。自建窗口固定 +AlwaysOnTop。
 ;
 ;  为什么不在这里解析 action：run 到一个 webhook 条目要拼 URL、展开模板、组
 ;  multipart —— 在这里再写一份就是第二份实现，早晚和页面那份对不上（这个项目
-;  最贵的一课）。AHK 只管"切"，不管"懂"。
+;  最贵的一课）。AHK 只管"切"和"画"，不管"懂"。
 ;
 ;  防环（链）由页面携带，见 ui/app.js 的 cbDispatch：按 id 记祖先 + 深度兜底。
 ; ============================================================================
 
 CbLog(text) {
+    global cbSilent
+    if cbSilent                       ; 自检不该往用户的 launcher.log 里掺噪音
+        return
     line := FormatTime(A_Now, 'yyyy-MM-dd HH:mm:ss') '  [cb] ' text "`n"
     try FileAppend(line, SCRIPT_DIR '\launcher.log', 'UTF-8')
 }
@@ -1598,7 +1613,8 @@ CbSlice(body) {
 }
 
 /* 消息框走队列 + 定时器，不直接在 WebView2 的消息回调里弹：
-   MsgBox 会跑嵌套消息循环，在 COM 回调栈上弹模态框是自找麻烦。 */
+   在 COM 回调栈上建窗口 / 弹模态框是自找麻烦（这里是非模态的，但排队更省心：
+   一条响应里连发三个 msg，不该三个框糊在一起）。 */
 DoCallbackMsg(raw) {
     global cbBoxQ
     text := SubStr(JsonStr(raw, 'text'), 1, CB_TEXT_MAX)
@@ -1618,29 +1634,109 @@ DoCallbackMsg(raw) {
 }
 
 CallbackPump() {
-    global cbBoxQ, cbBoxBusy
+    global cbBoxQ, cbBoxBusy, cbBoxWin
     if (cbBoxBusy || !cbBoxQ.Length)
         return
-    cbBoxBusy := true
     a := cbBoxQ.RemoveAt(1)
+    cbBoxBusy := true
     try {
         if a.quiet {
             /* 定时任务触发的链：没人看着，弹个模态框只会半夜挂在那里 */
             TrayTip(a.text, a.title)
             CbLog('安静模式：改用托盘提示（' a.level '）')
+            CbBoxDone()
         } else {
-            opts := (a.level = 'error') ? 'Iconx' : 'Iconi'
-            if a.timeout
-                opts .= ' T' a.timeout
-            MsgBox(a.text, a.title, opts)
-            CbLog('消息框已关闭（' a.level '）')
+            CbBoxShow(a)
         }
     } catch as e {
         CbLog('消息框失败：' CleanComError(e.Message))
+        cbBoxWin := 0
+        CbBoxDone()
     }
+}
+
+/* 一条消息处理完了：放行下一条。关窗、超时、建窗失败都走这里，
+   免得 cbBoxBusy 卡在 true 上把后面所有消息都堵死。 */
+CbBoxDone() {
+    global cbBoxBusy, cbBoxQ
     cbBoxBusy := false
     if cbBoxQ.Length
         SetTimer(CallbackPump, -1)
+}
+
+/* 回调消息框。
+   ★ 为什么不用 MsgBox：MsgBox 没有置顶选项，而 QuickLaunch 主窗口本身是
+     AlwaysOnTop —— 框弹出来正好落在家窗口**下面**，用户只听见提示音、看不见内容。
+     这里自建一个极简窗口，固定 +AlwaysOnTop。
+
+   ★ 为什么不用模态：MsgBox 会跑一个嵌套消息循环把线程卡住（虽然消息还能进来，
+     但"谁在跑"就说不清了）。自建窗口是非模态的，串行交给 cbBoxBusy 控制 ——
+     关掉一条再放行下一条，不会五个框叠在一起。 */
+CbBoxShow(a) {
+    global cbBoxWin
+
+    text := a.text
+    if (StrLen(text) > CB_TEXT_SHOW)
+        text := SubStr(text, 1, CB_TEXT_SHOW) '…（正文过长，已截断；完整内容见响应面板）'
+    w := CbBoxWidth(text)
+
+    g := Gui('+AlwaysOnTop +ToolWindow -MinimizeBox -MaximizeBox', a.title)
+    g.BackColor := 'FFFFFF'
+    g.MarginX := 18
+    g.MarginY := 14
+
+    /* 首行图标 + 级别：颜色一眼区分成功/失败，不用读正文 */
+    g.SetFont('s12 bold c' (a.level = 'error' ? 'D93025' : '1E8E3E'), 'Microsoft YaHei UI')
+    g.AddText('xm ym', (a.level = 'error' ? '✕ 错误' : '✓ 成功'))
+
+    g.SetFont('s10 c202124', 'Microsoft YaHei UI')
+    g.AddText('xm y+9 w' w, text)
+
+    g.SetFont('s9 c5B6169', 'Microsoft YaHei UI')
+    btn := g.AddButton('x' (18 + w - 84) ' y+18 w84 Default', '确定')
+    if a.timeout {
+        g.SetFont('s9 c8A9099', 'Microsoft YaHei UI')
+        g.AddText('xm yp+5 w' (w - 96), a.timeout ' 秒后自动关闭')
+    }
+
+    close(*) {
+        global cbBoxWin
+        if !cbBoxWin
+            return
+        cbBoxWin := 0
+        try SetTimer(close, 0)
+        try g.Destroy()
+        CbLog('消息框已关闭（' a.level '）')
+        CbBoxDone()
+    }
+
+    g.OnEvent('Close', close)
+    g.OnEvent('Escape', close)
+    btn.OnEvent('Click', close)
+
+    cbBoxWin := g
+    g.Show('AutoSize Center')
+    /* +AlwaysOnTop 已经加过了，这里再压一遍：同层里还有别的置顶窗口时，
+       光靠样式位不保证它在最上面。露脸前把焦点也拿过来，别让用户看不见。 */
+    try WinSetAlwaysOnTop(1, 'ahk_id ' g.Hwnd)
+    try WinActivate('ahk_id ' g.Hwnd)
+    if a.timeout
+        SetTimer(close, -(a.timeout * 1000))
+    CbLog('消息框已显示（' a.level (a.timeout ? '，' a.timeout 's 后自动关' : '') '）')
+}
+
+/* 对话框宽度：中文按 1em 估、ASCII 按 0.55em 估，只求"别太窄也别撑破屏幕"。
+   精确排版交给静态控件自己换行（宽度定了它就按字宽折）。 */
+CbBoxWidth(text) {
+    static MAXW := 560, MINW := 300
+    w := 0
+    for line in StrSplit(text, '`n') {
+        u := 0
+        Loop Parse, line
+            u += (Ord(A_LoopField) > 0x2E80) ? 13.5 : 7.4
+        w := Max(w, u)
+    }
+    return Round(Max(MINW, Min(MAXW, w + 10)))
 }
 
 /* 日志里一行一条：正文里的换行会把一条日志撑成好几行，排障时很难读 */
@@ -1657,6 +1753,40 @@ CbTestArg(argv, &dir) {
         return false
     dir := Trim(argv[2], ' `t"')
     return true
+}
+
+/* 消息框自检：真建一个窗口，验「置顶 / 自动关闭」，然后自己退出。
+   "被主窗口压住" 是肉眼最难发现的一类坏法 —— 有提示音、有日志，就是看不见，
+   所以这条必须由程序自己断言 WS_EX_TOPMOST，不能靠看。 */
+CbMsgTestArg(argv) {
+    return (argv.Length >= 1 && argv[1] = '--selftest-cbmsg')
+}
+
+CbMsgTest() {
+    global cbBoxWin, cbBoxBusy, cbSilent
+    cbSilent := true                     ; 自检不写日志
+    a := {level: 'success', title: 'QuickLaunch 自检'
+        , text: '回调消息框自检：这个窗口应该在最上层，并在 1 秒后自动关闭。'
+        , timeout: 1, quiet: 0}
+    cbBoxBusy := true
+    CbBoxShow(a)
+
+    Sleep 300
+    hwnd := 0
+    try hwnd := cbBoxWin ? cbBoxWin.Hwnd : 0
+    ex := hwnd ? WinGetExStyle('ahk_id ' hwnd) : 0
+    vis := hwnd ? DllCall('user32\IsWindowVisible', 'ptr', hwnd, 'int') : 0
+
+    Loop 50 {                            ; 等自动关闭（1 秒 + 余量）
+        if !cbBoxWin
+            break
+        Sleep 100
+    }
+    closed := cbBoxWin ? 0 : 1
+    top := (ex & 0x8) ? 1 : 0            ; WS_EX_TOPMOST
+
+    StdOut('{"exists":' vis ',"topmost":' top ',"closed":' closed '}`n')
+    return (vis && top && closed) ? 0 : 1
 }
 
 CbTest(dir) {
