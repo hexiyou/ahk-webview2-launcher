@@ -40,6 +40,9 @@ const DEFAULT_NAMES = [
   /* 参数取值 */
   'resolveParamValues', 'assignTokens', 'fillTemplate', 'fillQuery',
   'tplVars', 'templateIssues', 'joinTokens', 'applyParams', 'normalizeMultipart',
+  /* 内置模板变量（{{@config}}） */
+  'isBuiltinKey', 'jsonStr', 'utf8b64', 'builtinValue', 'hasBuiltin', 'isObjBody', 'builtinIssues',
+  'guardHash',
   /* 使用记录 */
   'usageRec', 'usageCount', 'historyOf', 'usageBoost',
   /* 补全 */
@@ -57,6 +60,9 @@ function build(state, PY, extra, prelude) {
     grabConst(src, /const CMD_TYPES = \{[^}]*\};/, 'CMD_TYPES'),
     grabConst(src, /const TPL_FIELDS = \[[^\]]*\];/, 'TPL_FIELDS'),
     grabConst(src, /const TPL_RE = .*;/, 'TPL_RE'),
+    grabConst(src, /const BUILTIN_HELP = .*;/, 'BUILTIN_HELP'),
+    grabConst(src, /const BUILTIN_KEYS = .*;/, 'BUILTIN_KEYS'),
+    grabConst(src, /const TPL_GUARD = .*;/, 'TPL_GUARD'),
     grabConst(src, /const FIELD_W = \{[\s\S]*?\n  \};/, 'FIELD_W'),
     grabConst(src, /const KIND_LABEL = \{[^}]*\};/, 'KIND_LABEL'),
     prelude || ''

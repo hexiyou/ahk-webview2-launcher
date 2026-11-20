@@ -2845,8 +2845,11 @@ HdrExpand(line) {
        会把文件里的 {{#each …}} 当成占位符去算，内容当场变形。
        用私用区字符（U+E000），正常文本里不会出现。 */
     static GUARD := Chr(0xE000)
+    /* 早退也要还原哨兵：{{@config}} 注入的正文可能一个真占位符都没有
+       （配置里写的 {{#hmac:…}} 全被页面用哨兵挡住了），这时直接 return 会把
+       哨兵留在 body 里发出去。 */
     if !InStr(line, '{{#')
-        return line
+        return InStr(line, GUARD) ? StrReplace(line, GUARD, '{') : line
     Loop 4 {                              ; 里层先展开，外层用结果再算一次
         out := '', pos := 1, hit := false
         m := ''

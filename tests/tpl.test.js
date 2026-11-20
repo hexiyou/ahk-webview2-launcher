@@ -183,5 +183,107 @@ console.log('— 动态值 {{#函数:参数}} 完全不进前端的模板逻辑'
   eq('md5 / sha512 都不进模板', T.tplVars(['{{#md5:a}}', '{{#sha512:b}}']).size, 0);
 }
 
+console.log('— 内置变量 {{@config}}');
+{
+  const cfg = '{\n  "items": [\n    { "id": "a", "name": "甲" }\n  ]\n}';
+  state.cfgText = cfg;
+
+  /* 默认形态是「JSON 字符串内容」：塞进 JSON body 必须还是合法 JSON，这是主用法 */
+  {
+    const body = T.fillTemplate('{"snapshot":"{{@config}}","v":2}', {});
+    let ok = true, parsed = null;
+    try { parsed = JSON.parse(body); } catch (e) { ok = false; }
+    eq('转义后仍是合法 JSON', ok, true);
+    eq('取回来就是原文（一个字节不差）', parsed && parsed.snapshot, cfg);
+    eq('同层的其它字段没受影响', parsed && parsed.v, 2);
+  }
+
+  eq('.json 是同一个东西', T.fillTemplate('{{@config.json}}', {}), T.fillTemplate('{{@config}}', {}));
+  eq('.raw 给原文', T.fillTemplate('x{{@config.raw}}y', {}), 'x' + cfg + 'y');
+  eq('.b64 解回来是原文',
+    Buffer.from(T.fillTemplate('{{@config.b64}}', {}), 'base64').toString('utf8'), cfg);
+  eq('.b64 全是 ASCII（能进请求头）',
+    /^[\x20-\x7e]*$/.test(T.fillTemplate('{{@config.b64}}', {})), true);
+  eq('.raw 带换行（所以进不了请求头）', /\n/.test(T.fillTemplate('{{@config.raw}}', {})), true);
+
+  /* 真实的坑：config.json 里会写 "Bearer {{#hmac:demo:{ts}}}"，AHK 发送前对整个
+     body 跑 HdrExpand —— 不躲开的话备份内容会被当场展成签名和时间戳。
+     躲法是 HdrExpand 自己的哨兵（U+E000）：{{# 被切成「哨兵 + {#」，
+     AHK 收尾再把哨兵还原成一个 {。下面这个 restore 就是在模拟那一步。 */
+  {
+    const restore = s => s.split('\uE000{#').join('{{#');
+    state.cfgText = '{"h":"Bearer {{#hmac:demo:{ts}}}"}';
+    const out = T.fillTemplate('{"snapshot":"{{@config}}"}', {});
+    eq('转义结果里没有裸的 {{#', out.indexOf('{{#'), -1);
+    eq('被哨兵挡住了', /\uE000\{#/.test(out), true);
+    eq('JSON.parse + 还原哨兵之后原样回来', restore(JSON.parse(out).snapshot), state.cfgText);
+    eq('.raw 也一样躲（原文语义不变，只是 HdrExpand 那一步绕开）',
+      /\{\{#/.test(T.fillTemplate('{{@config.raw}}', {})), false);
+    eq('.b64 不需要（base64 里没有花括号）',
+      /\uE000/.test(T.fillTemplate('{{@config.b64}}', {})), false);
+  }
+
+  eq('空配置给空串', (state.cfgText = '', T.fillTemplate('a{{@config}}b', {})), 'ab');
+  state.cfgText = cfg;
+
+  /* 内置变量是"环境"不是"参数"：没声明 params 也要生效 */
+  {
+    const restore = s => s.split('\uE000{#').join('{{#');
+    const it = { type: 'webhook', target: 'https://x/', body: { snapshot: '{{@config}}' } };
+    const w = T.applyParams(it, '');
+    /* 对象 body 会被 buildBody 再 JSON.stringify 一次，所以这里给的是原文 ——
+       否则远端解出来是一串带反斜杠的文本（双重转义）。 */
+    eq('对象 body：原文进去，序列化一次才是 JSON',
+      restore(JSON.parse(JSON.stringify(w.item.body)).snapshot), cfg);
+    eq('对象 body 里 {{@config}} 等价 .raw',
+      w.item.body.snapshot, T.builtinValue('@config.raw'));
+    eq('字符串 body 里给转义形（能直接拼进 JSON）',
+      T.applyParams({ type: 'webhook', target: 'https://x/', body: '{"c":"{{@config}}"}' }, '')
+        .item.body, '{"c":"' + T.builtinValue('@config') + '"}');
+    eq('但其它 {{…}} 仍是字面量', (() => {
+      const w2 = T.applyParams({ type: 'webhook', target: 'https://x/', body: '{{other}} {{@config}}' }, '');
+      return w2.item.body.indexOf('{{other}}');
+    })(), 0);
+    const plain = { type: 'cmd', target: 'echo {{x}}' };
+    eq('没用内置变量就仍是原对象（零拷贝）', T.applyParams(plain, '1').item === plain, true);
+  }
+
+  /* 声明了 params 的条目里，内置变量和参数各走各的 */
+  {
+    const it = {
+      type: 'webhook', target: 'https://x/', method: 'POST',
+      body: { who: '{{user}}', snapshot: '{{@config}}' },
+      params: [{ name: 'user' }]
+    };
+    const b = T.applyParams(it, 'alice').item.body;
+    eq('参数照常', b.who, 'alice');
+    eq('内置变量照常', b.snapshot, T.builtinValue('@config.raw'));
+    eq('@config 不算参数（不会被当成缺必填）', T.applyParams(it, 'alice').missing, []);
+    eq('tplVars 不含 @config', Array.from(T.tplVars([it.body])), ['user']);
+    eq('体检不报「没有在 params 里声明」', T.templateIssues(it).err, []);
+  }
+
+  eq('逃生口：四个花括号出字面', T.fillTemplate('{{{{@config}}}}', {}), '{{@config}}');
+  eq('逃生口不算引用', T.builtinIssues('{{{{@config}}}}'), []);
+}
+
+console.log('— 内置变量拼错要报，不静默发出去');
+{
+  state.cfgText = '{"items":[]}';
+  eq('少个字母', T.builtinIssues('{{@confg}}').length, 1);
+  eq('多一段修饰', T.builtinIssues('{{@config.txt}}').length, 1);
+  eq('用冒号分隔（不是支持的形式）', T.builtinIssues('{{@config:json}}').length, 1);
+  eq('提示里列了可用写法', /@config\.raw/.test(T.builtinIssues('{{@confg}}')[0]), true);
+  eq('写对了不报', T.builtinIssues('{{@config}} {{@config.raw}} {{@config.b64}} {{@config.json}}'), []);
+  eq('普通变量不掺和', T.builtinIssues('{{user}}'), []);
+  eq('同一个错写两次只报一条', T.builtinIssues(['{{@bad}}', '{{@bad}}']).length, 1);
+
+  const it = { type: 'webhook', target: 'https://x/', body: '{{@confg}}' };
+  eq('体检把它挂成 err（执行前会被拦）', T.templateIssues(it).err.length, 1);
+  const it2 = { type: 'webhook', target: 'https://x/', body: '{{@confg}}', params: [{ name: 'a' }] };
+  eq('声明了 params 也照样报', T.templateIssues(it2).err.length, 1);
+  eq('原样留着，不换成空串', T.fillTemplate('{{@confg}}', {}), '{{@confg}}');
+}
+
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

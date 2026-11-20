@@ -69,6 +69,7 @@
     usage: {},            /* 使用记录：id -> { n 次数, t 上次时间戳(秒), args 参数历史 } */
     index: {},            /* 搜索索引缓存：id -> [{ t 待匹配文本, w 权重, fz 是否允许模糊 }] */
     cfg: null,            /* 原始配置：定时调度那段要重新解析，所以要留一份 */
+    cfgText: '',          /* config.json 的原文，给 {{@config}} 用（不是重序列化的） */
     vis: [],              /* 界面可见的条目（state.all 去掉 hidden 之后） */
     offCount: 0,          /* 配置里 enabled:false 的条目数（只用于提示，不参与搜索） */
     hidCount: 0,          /* 配置里 hidden:true 的条目数（同上，只在空列表时提示） */
@@ -396,20 +397,127 @@
 
   /* 三种写法：{{{{ 出字面 {{，}}}} 出字面 }}，{{ name }} 才是变量。
      逃生口是给「参数本身就是模板语法」的场景留的（mustache 文件、Jinja2、
-     PowerShell 脚本块），JSON 里直接写四个花括号，不用跟反斜杠搏斗。 */
-  const TPL_RE = /\{\{\{\{|\}\}\}\}|\{\{\s*([\w.-]+)\s*\}\}/g;
+     PowerShell 脚本块），JSON 里直接写四个花括号，不用跟反斜杠搏斗。
+
+     名字前面那个可选的 @ 是内置变量的门牌：{{@config}}。刻意用 @ 而不是普通名字，
+     因为用户声明的 params 是任意 [\w.-]+，撞名只是时间问题；而 # 已经被 {{#ts}}
+     那套发送前展开的动态值占了（见下），@ 两边都不碰。 */
+  const TPL_RE = /\{\{\{\{|\}\}\}\}|\{\{\s*(@?[\w.-]+)\s*\}\}/g;
 
   /* 请求头 / 请求体里的动态值写成 {{#ts}} / {{#hmac:demo:{{#ts}}}}，由 AHK 在发送前展开
-     （launcher.ahk 的 HdrExpand）。这里的 TPL_RE 只认 [\w.-]，# 不在里面，
+     （launcher.ahk 的 HdrExpand）。这里的 TPL_RE 只认 [\w.-] 和 @，# 不在里面，
      所以这类占位符前端从头到尾都不认 —— 既不会被替换成空串，也不会被
      templateIssues 当成"引用了没声明的变量"。 */
+
+  /* ---------------------------------------------------------- 内置模板变量 */
+
+  /* {{@config}}：把 config.json 全文塞进请求，用来做云端备份 / 差分合并。
+        {{@config}}        JSON 字符串内容（已转义，可直接放进 JSON 字符串里）
+        {{@config.raw}}    原文（多行；适合 text/plain 或当文件内容）
+        {{@config.b64}}    UTF-8 → Base64（单行纯 ASCII，唯一能安全放请求头的形式）
+     `.json` 是 `{{@config}}` 的别名，写全一点更好读。 */
+  const BUILTIN_HELP = '{{@config}} / {{@config.raw}} / {{@config.b64}}';
+  const BUILTIN_KEYS = new Set(['config', 'config.json', 'config.raw', 'config.b64']);
+
+  function isBuiltinKey(k) { return !!k && k.charCodeAt(0) === 64; }
+
+  /* JSON 字符串的内容部分（不含两侧引号）。JSON.stringify 顺带把 " \ 和所有
+     控制字符转义掉，这是把多行文本塞进 JSON body 唯一可靠的办法。 */
+  function jsonStr(text) {
+    return JSON.stringify(text == null ? '' : String(text)).slice(1, -1);
+  }
+
+  /* TextEncoder 先切成 UTF-8 字节再 btoa：btoa 只吃 Latin-1，直接喂中文会抛
+     InvalidCharacterError。分块是为了绕开 String.fromCharCode 的参数个数上限。 */
+  function utf8b64(text) {
+    const bytes = new TextEncoder().encode(text == null ? '' : String(text));
+    let bin = '';
+    const step = 0x2000;
+    for (let i = 0; i < bytes.length; i += step)
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    return btoa(bin);
+  }
+
+  /* 内置变量注入的正文里，`{{#` 必须躲开 AHK 的 HdrExpand —— 它在发送前会对整个
+     body 跑一遍，而 config.json 里写 `"Authorization": "Bearer {{#hmac:demo:{ts}}"`
+     是常事，备份里那一行会被当场换成签名 / 时间戳。这里借用 HdrExpand 自己的
+     哨兵（U+E000，见 launcher.ahk）：把 `{{#` 切一刀成「哨兵 + {#」，正则不再匹配，
+     AHK 收尾时再把哨兵还原成一个 `{`，字节级复原。比换成 \u0023 好在
+     两种 body 形态（字符串 / 对象）都能用，且不依赖 JSON 转义。 */
+  const TPL_GUARD = '\uE000';
+
+  function guardHash(s) {
+    return s.indexOf('{{#') < 0 ? s : s.split('{{#').join(TPL_GUARD + '{#');
+  }
+
+  /* 不认识的内置变量返回 null：调用方原样保留，体检那边报错拦下来。
+     绝不悄悄换成空串 —— 远端收到一段空 body 比收到一段 {{@confg}} 更难查。
+
+     rawDefault：body 写成**对象**时由调用方打开。那种 body 最后还要过一遍
+     JSON.stringify，值里的 " 和换行会被它正确转义一次；这里要是再抢先转义，
+     远端 JSON.parse 出来就是一串带反斜杠的文本（双重转义）。所以对象 body
+     给原文，字符串 body 才给转义形。 */
+  function builtinValue(k, rawDefault) {
+    const name = k.slice(1);                 /* '@config.raw' → 'config.raw' */
+    if (!BUILTIN_KEYS.has(name)) return null;
+    const text = state.cfgText || '';
+    if (name === 'config.b64') return utf8b64(text);
+    if (name === 'config.raw' || (name === 'config' && rawDefault)) return guardHash(text);
+    return guardHash(jsonStr(text));
+  }
+
+  /* 这个条目有没有用到内置变量。没有就一个字节都不动（见 applyParams）。 */
+  function hasBuiltin(v) {
+    if (typeof v === 'string') return /\{\{\s*@/.test(v);
+    if (Array.isArray(v)) return v.some(hasBuiltin);
+    if (v && typeof v === 'object') return Object.keys(v).some(k => hasBuiltin(v[k]));
+    return false;
+  }
+
+  /* body 是对象还是现成的字符串。对象的正文最后还要 JSON.stringify 一次，
+     内置变量在这里要按原文给（见 builtinValue 的 rawDefault）。 */
+  function isObjBody(b) { return b != null && typeof b === 'object'; }
+
+  /* 内置变量写错的清单。比 tplVars 的正则宽一点（@ 后面认到 }} 为止），
+     这样 {{@config:json}} / {{@confg}} 这类「形似但不合法」的也能逮住 ——
+     否则它们会被 TPL_RE 漏掉，原样发出去，远端只看到一段占位符。 */
+  function builtinIssues(srcs) {
+    const out = new Set();
+    const scan = (v) => {
+      if (typeof v === 'string') {
+        /* 先把逃生口挖掉，免得 "{{{{@config}}}}" 被当成引用 */
+        const s = v.replace(/\{\{\{\{|\}\}\}\}/g, '');
+        const re = /\{\{\s*(@[^{}]*?)\s*\}\}/g;
+        let m;
+        while ((m = re.exec(s))) {
+          if (!BUILTIN_KEYS.has(m[1].slice(1)))
+            out.add('{{' + m[1] + '}} 不认识（可用 ' + BUILTIN_HELP + '）');
+        }
+        return;
+      }
+      if (Array.isArray(v)) { v.forEach(scan); return; }
+      if (v && typeof v === 'object') Object.keys(v).forEach(k => scan(v[k]));
+    };
+    (Array.isArray(srcs) ? srcs : [srcs]).forEach(scan);
+    return Array.from(out);
+  }
 
   function fillTemplate(v, args, opts) {
     if (typeof v === 'string')
       return v.replace(TPL_RE, (m, k, off, whole) => {
+        const builtin = isBuiltinKey(k);
+        /* keepUnknown：没声明 params 的条目只换内置变量，其余 {{…}} 连逃生口
+           （{{{{ / }}}}）都原样留着 —— 它们在这些条目上的语义是字面量。 */
+        if (opts && opts.keepUnknown && !builtin) return m;
         if (m === '{{{{') return '{{';
         if (m === '}}}}') return '}}';
-        const val = args[k] == null ? '' : String(args[k]);
+        let val;
+        if (builtin) {
+          val = builtinValue(k, opts && opts.rawDefault);
+          if (val === null) return m;        /* 拼错的留给 tplErr 拦，不静默变空 */
+        } else {
+          val = args[k] == null ? '' : String(args[k]);
+        }
         if (!opts || !opts.quote || !/\s/.test(val)) return val;
         /* app / ahk 的 args 是拼成一整条命令的，值里有空格就必须自己补引号，
            否则 "C:\my dir\a.txt" 会被拆成两个参数。
@@ -429,7 +537,9 @@
     return v;
   }
 
-  /* 扫出模板里真的用到了哪些变量（去重）。转义写法不算，query 只看值不看键。 */
+  /* 扫出模板里真的用到了哪些变量（去重）。转义写法不算，query 只看值不看键。
+     内置变量（{{@config}}）不算参数，不进这个集合 —— 它不该影响
+     「被模板消耗掉的参数不再追加」和「有没有缺必填参数」这两条判断。 */
   function tplVars(srcs) {
     const out = new Set();
     const scan = (v) => {
@@ -437,7 +547,7 @@
         const re = new RegExp(TPL_RE.source, 'g');
         let m;
         while ((m = re.exec(v))) {
-          if (m[1]) out.add(m[1]);
+          if (m[1] && !isBuiltinKey(m[1])) out.add(m[1]);
         }
         return;
       }
@@ -454,10 +564,11 @@
                也可能它本来就是给别的工具用的字面量，所以只提示不拦） */
   function templateIssues(item) {
     const decl = item.params || [];
-    const vars = tplVars(TPL_FIELDS.map(f => item[f]));
+    const srcs = TPL_FIELDS.map(f => item[f]);
+    const vars = tplVars(srcs);
     /* multipart 写坏了也要报 —— 它不会让 templateIssues 自己发现问题，
        但「静默退化成普通 body」比报错难查得多 */
-    const pre = item.mpErr ? [item.mpErr] : [];
+    const pre = (item.mpErr ? [item.mpErr] : []).concat(builtinIssues(srcs));
     if (!decl.length) return { err: pre, warn: Array.from(vars) };
 
     const known = new Set(decl.map(p => p.name));
@@ -472,13 +583,13 @@
   }
 
   /* query 里"纯模板且替换为空"的键直接丢掉，避免拼出 ?lang= 这种空参 */
-  function fillQuery(q, args) {
-    if (Array.isArray(q)) return q.map(x => fillTemplate(x, args)).filter(x => x !== '');
+  function fillQuery(q, args, opts) {
+    if (Array.isArray(q)) return q.map(x => fillTemplate(x, args, opts)).filter(x => x !== '');
     if (q && typeof q === 'object') {
       const o = {};
       Object.keys(q).forEach(k => {
         const src = q[k];
-        const v = fillTemplate(src, args);
+        const v = fillTemplate(src, args, opts);
         if (v === '' && typeof src === 'string' && /^\s*\{\{[\w.-]+\}\}\s*$/.test(src)) return;
         o[k] = v;
       });
@@ -510,10 +621,31 @@
     const isNet = item.type === 'webhook' || item.type === 'download' || item.type === 'jsonfile';
 
     /* 没声明 params：整条不参与替换，参数照旧原样追加。
-       这是「老配置零影响」的兜底 —— 也是 {{ }} 在这些条目上的语义：字面量。 */
+       这是「老配置零影响」的兜底 —— 也是 {{ }} 在这些条目上的语义：字面量。
+
+       唯一例外是内置变量 {{@config}}：它是"环境"而不是"参数"，不该逼着用户
+       为了备份凭空加一条用不上的 params 声明。所以配置里真的出现了 {{@ 才做
+       副本，只换内置的那几个；一个都没有就原样返回（下面那条 w.item === cmd
+       的用例就是钉这个的）。 */
     if (!decl.length) {
+      const usesBuiltin = TPL_FIELDS.some(f => hasBuiltin(item[f]));
+      let out = item;
+      if (usesBuiltin) {
+        const o = { keepUnknown: true };
+        const ob = { keepUnknown: true, rawDefault: isObjBody(item.body) };
+        out = Object.assign({}, item, {
+          target: fillTemplate(item.target, {}, o),
+          args: fillTemplate(item.args, {}, o),
+          query: fillQuery(item.query, {}, o),
+          headers: fillTemplate(item.headers, {}, o),
+          body: fillTemplate(item.body, {}, ob),
+          savePath: fillTemplate(item.savePath, {}, o),
+          fileName: fillTemplate(item.fileName, {}, o),
+          multipart: fillTemplate(item.multipart, {}, o)
+        });
+      }
       return {
-        item: item, missing: [], args: {},
+        item: out, missing: [], args: {},
         argv: splitQuoted(text), argvRaw: text.trim(), used: new Set()
       };
     }
@@ -536,7 +668,8 @@
         (item.type === 'app' || item.type === 'ahk') ? { quote: true } : null),
       query: fillQuery(item.query, r.args),
       headers: fillTemplate(item.headers, r.args),
-      body: fillTemplate(item.body, r.args),
+      /* 对象 body 的正文还会被 JSON.stringify 转义一次，内置变量按原文给 */
+      body: fillTemplate(item.body, r.args, isObjBody(item.body) ? { rawDefault: true } : null),
       /* download 的保存位置也能模板化：「下载 {{name}}」直接把远端文件名当本地文件名 */
       savePath: fillTemplate(item.savePath, r.args),
       fileName: fillTemplate(item.fileName, r.args),
@@ -783,6 +916,11 @@
   }
 
   function applyConfig(cfg) {
+    /* {{@config}} 要的是「磁盘上的原文」：AHK 注入的和「拉取在线配置后重载」
+       送进来的都是原文字符串，直接留一份就对。只有预览 / 测试这种拿到对象
+       的情况才退化成重新序列化（缩进 2 空格，和仓库里的文件一致）。 */
+    state.cfgText = typeof cfg === 'string' ? cfg
+      : (cfg && typeof cfg === 'object' ? JSON.stringify(cfg, null, 2) : '');
     if (typeof cfg === 'string') {
       try { cfg = JSON.parse(cfg); } catch (e) { cfg = { items: [] }; }
     }
@@ -4069,6 +4207,7 @@
     normalizeSchedules: normalizeSchedules,
     visibleOf: visibleOf, sourceFor: sourceFor,
     fillTemplate: fillTemplate, tplVars: tplVars, templateIssues: templateIssues,
+    builtinValue: builtinValue, builtinIssues: builtinIssues, hasBuiltin: hasBuiltin,
     applyParams: applyParams, joinTokens: joinTokens
   };
 

@@ -175,7 +175,8 @@ wv2-launcher/
 │  ├─ jsonui-check.js    JSON 树真机渲染：注入 JS 点折叠/搜索/量缩进，并验证 hidden 条目不上界面（45 项）
 │  ├─ jsonfile-check.js  jsonfile 真机全链路：真读盘、真渲染、点刷新时改文件看内容跟不跟（67 项）
 │  ├─ mp-e2e.js          multipart 与模板读文件端到端：本地回显服务逐字节比对包体和文件（36 项）
-│  ├─ cb-check.js        回调端到端：真请求 → 真回调 → 真起进程 / 防环 / 上限 / 参数与模板 / 回执不被弹框堵（28 项）
+│  ├─ cb-check.js        回调端到端：真请求 → 真回调 → 真起进程 / 防环 / 上限 / 参数与模板 / 回执不被弹框堵（29 项）
+│  ├─ cfg-e2e.js         内置变量 {{@config}} 端到端：真发请求，服务端逐字节比对快照（18 项）
 │  └─ build-exe.js       编译成 dist\QuickLaunch.exe 并按需组装运行目录（见「九、编译成 exe」）
 ├─ dist/                 编译产物（node tools/build-exe.js 生成，不入库）
 ├─ docs/screenshot.png
@@ -194,7 +195,7 @@ wv2-launcher/
 > node tests/sched.test.js     # 62 条（定时任务配置解析，含 runOnStart）
 > node tests/enabled.test.js   # 13 条（条目 enabled 归一化）
 > node tests/hidden.test.js    # 27 条（条目 hidden 归一化 + 交互池/命令行池分界）
-> node tests/tpl.test.js       # 56 条（模板变量四条边界）
+> node tests/tpl.test.js       # 92 条（模板变量四条边界 + 内置变量 {{@config}}）
 > node tests/json.test.js      # 60 条（JSON 树的行模型）
 > node tests/keys.test.js      # 14 条（空格认高亮行 / 切范围保选择，见踩坑 50）
 > node tests/drop.test.js      # 14 条（file:// URI → 本地路径，见踩坑 51）
@@ -209,6 +210,7 @@ wv2-launcher/
 > node tools/out-check.js      # 造一个真控制台验证输出（管道测不出控制台的坑，见踩坑 43）
 > node tools/sched-check.js    # 真等一次定时触发，约 1 分钟（配了 schedules 才会写 sched.log；含 hidden 条目）
 > node tools/cb-check.js       # 回调端到端：真请求、真回调、真起进程（29 项，会弹两个 1 秒自动关的提示框；沙箱主窗口在屏幕外，故走自绘那套）
+> node tools/cfg-e2e.js        # {{@config}} 端到端：对象体 / 字符串体 / b64 头 / 与参数混用 / 拼错拦截（18 项）
 > node tools/hdr-check.js      # 请求头动态值：时间戳/随机/环境变量/md5~sha512/Base64/HMAC/文件与 crypto 对照（58 项）
 > node tools/hdr-e2e.js        # 真发一次请求，看服务端收到的签名头（加 --exe 测编译版）
 > node tools/wh-cli-check.js   # --webhook --json/--body：真进程跑一遍，验输出与退出码（加 --exe 测编译版）
@@ -508,12 +510,12 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 
 | # | 规则 | 为什么 |
 |---|---|---|
-| 1 | **只有声明了 `params` 的条目才替换**；没声明就整条不替换，`{{x}}` 原样直传 | 老配置一个字节都不变；`{{ }}` 也可能是给别的工具用的字面量（mustache、Jinja2、PowerShell） |
+| 1 | **只有声明了 `params` 的条目才替换**；没声明就整条不替换，`{{x}}` 原样直传（内置变量 `{{@config}}` 除外，见下） | 老配置一个字节都不变；`{{ }}` 也可能是给别的工具用的字面量（mustache、Jinja2、PowerShell） |
 | 2 | **被模板用掉的参数不再追加到末尾**；没用到的照旧按声明顺序追加 | 否则 `msg` 会既出现在你指定的位置、又在尾巴上再出现一次 |
 | 3 | **引用了没声明的变量 → 拒绝执行**，不静默替换成空串 | 拼错一个字母就静默跑出个歪结果，比直接报错难查一百倍 |
 | 4 | **`{{{{` 输出字面 `{{`，`}}}}` 输出字面 `}}`** | 给"参数本身就是模板语法"留逃生口，JSON 里也不用跟反斜杠搏斗 |
 
-生效字段：`target` / `args` / `query` / `headers` / `body` / `savePath` / `fileName`。
+生效字段：`target` / `args` / `query` / `headers` / `body` / `savePath` / `fileName` / `multipart`。
 `query` 的键不参与（只替换值）。
 
 `workdir` **不在里面**，这是有意的：它在载入配置时就按"相对脚本目录"展开成绝对路径了，
@@ -532,6 +534,55 @@ ql run cmd-echo --args "你好"   →  echo in cmd && echo 你好
 - **没声明 `params` 却写了 `{{x}}` 只警告不拦**（重载配置时的提示会带上条数）—— 因为分不清
   你是忘了写 `params`，还是它本来就该是字面量。
 - 面板参数态的第二行会直接告诉你「这些变量会被替换进 target / args：`{{msg}}`」。
+
+#### 内置变量 `{{@config}}`：把整份配置发出去
+
+配合云端接口做备份、差分合并时，最省事的做法是**把 config.json 全文当成请求体的一部分**。
+`{{@config}}` 就是这个：
+
+```json
+{
+  "id": "backup", "name": "备份配置", "type": "webhook",
+  "target": "https://example.com/api/ql/snapshot", "method": "POST",
+  "body": { "device": "办公机", "snapshot": "{{@config}}" }
+}
+```
+
+三种形态，按**放在哪里**挑：
+
+| 写法 | 出来的是什么 | 用在哪 |
+|---|---|---|
+| `{{@config}}` | **JSON 字符串内容**：引号、反斜杠、换行都已转义 | 字符串 body（手写的 `"{\"c\":\"{{@config}}\"}"`） |
+| `{{@config.raw}}` | 原文，多行原样 | 对象 body、`text/plain` 请求体、要按字节比对的地方 |
+| `{{@config.b64}}` | UTF-8 → Base64，**单行纯 ASCII** | 请求头（`X-Config: {{@config.b64}}`） |
+
+`{{@config.json}}` 是第一种的别名，写全一点更好读。
+
+不带修饰的 `{{@config}}` 会**按 body 的形态自己选**：
+
+- `"body"` 是**对象**（`{"snapshot": "{{@config}}"`）→ 给原文。因为这个 body 最后还要过一遍
+  `JSON.stringify`，它会把 `"` 和换行正确转义一次；这里再抢先转义就成了**双重转义**，
+  远端 `JSON.parse` 出来是一串带反斜杠的文本。
+- `"body"` 是**字符串**（自己手写 JSON）→ 给转义形。原样发出去，必须已经是合法 JSON。
+
+几条要知道的：
+
+- **不需要声明 `params`**。它是"环境"不是"参数"，不该逼着你为了备份凭空加一条用不上的声明。
+  （没声明 `params` 的条目本来整条不替换，内置变量是唯一的例外；配置里一个 `{{@` 都没有时，
+  整条仍然一个字节都不动。）
+- **它不会被二次展开**。config 全文是一次性塞进去的，里面就算有 `{{x}}` 也不会再被当模板跑一遍。
+- **全文外发**：包里有什么就发什么，包括你自己的接口地址、token、路径。目标地址要可信。
+- **请求头只能用 `.b64`**：头值不能带换行，大配置还可能撞上服务端的头长度上限（常见 8 KB），
+  大配置走 body。
+- **别用在 `multipart` 字段里**：那一路不走 HdrExpand，哨兵字符会留在内容里；而且原文的换行
+  会破坏 boundary。要用就给 `.b64`。
+- 拼错（`{{@confg}}` / `{{@config.txt}}` / `{{@config:json}}`）会在执行前报错拦下来，
+  不会把一段占位符原样发给服务端。
+
+> 有个不显眼的坑：config.json 里写 `"Authorization": "Bearer {{#hmac:demo:{ts}}"` 是常事，
+> 而 AHK 在发送前会对**整个 body** 跑一遍 `HdrExpand` —— 直接把原文塞进去，备份里那一行
+> 会被当场换成签名和时间戳。所以内置变量注入时会把 `{{#` 换成「哨兵 + `{#`」躲开正则，
+> AHK 收尾再把哨兵还原成 `{`，字节级复原（用的就是 `{{#file:…}}` 那套哨兵）。
 
 > 为什么不做更复杂的东西（`{{a || b}}`、默认值表达式、条件块）：一旦有了条件，
 > 就得分清"配置语言"和"命令行原文"的界限，这层一破，配置就很难一眼看懂。
